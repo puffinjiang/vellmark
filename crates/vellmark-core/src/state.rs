@@ -27,9 +27,12 @@ pub enum DocState {
 }
 
 /// Immutable snapshot of a disk version (`base` or `theirs`, PRD 4.5.1 A).
+/// When the external disk file is undecodable/binary, `raw_bytes` stores the exact
+/// original bytes so historical backups ("Keep My Version") can restore it byte-for-byte without lossy corruption.
 #[derive(Debug, Clone)]
 pub struct DiskSnapshot {
     pub rope: Rope,
+    pub raw_bytes: Option<Arc<[u8]>>,
     pub crc32: u32,
     pub len_bytes: usize,
 }
@@ -43,6 +46,7 @@ impl DiskSnapshot {
         let len_bytes = rope.len_bytes();
         Self {
             rope,
+            raw_bytes: None,
             crc32: hasher.finalize(),
             len_bytes,
         }
@@ -52,14 +56,16 @@ impl DiskSnapshot {
         Self::from_rope(Rope::from_str(text))
     }
 
-    /// Create a placeholder snapshot when the external file was modified into undecodable/binary bytes,
-    /// preserving the raw-byte CRC32 and length so conflict state and diagnostics remain accurate.
+    /// Create a snapshot when the external file was modified into undecodable/binary bytes,
+    /// preserving the exact raw bytes (`Arc<[u8]>`) as well as a lossy Rope for preview/diff,
+    /// so overwriting it in "Keep My Version" writes the exact original bytes to the recovery backup.
     pub fn from_undecodable_bytes(raw: &[u8]) -> Self {
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(raw);
         let lossy = String::from_utf8_lossy(raw);
         Self {
             rope: Rope::from_str(&lossy),
+            raw_bytes: Some(Arc::from(raw)),
             crc32: hasher.finalize(),
             len_bytes: raw.len(),
         }
@@ -67,6 +73,15 @@ impl DiskSnapshot {
 
     pub fn content_string(&self) -> String {
         self.rope.to_string()
+    }
+
+    /// Return the exact bytes to persist when backing up this snapshot to `recovery/`.
+    pub fn to_backup_bytes(&self) -> Vec<u8> {
+        if let Some(raw) = &self.raw_bytes {
+            raw.to_vec()
+        } else {
+            self.rope.to_string().into_bytes()
+        }
     }
 }
 
@@ -224,14 +239,16 @@ fn worker_loop(
                             if deadline.is_none() {
                                 deadline = Some(Instant::now() + throttle_window);
                             }
-                            handle_non_schedule_cmd(
+                            if handle_non_schedule_cmd(
                                 other,
                                 &recovery_dir,
                                 &mut active_slot,
                                 &mut pending,
                                 &mut deadline,
                                 &degraded,
-                            );
+                            ) {
+                                return;
+                            }
                             break;
                         }
                         Err(TryRecvError::Empty) => {
@@ -588,10 +605,10 @@ impl DocumentSession {
             );
         }
 
-        // 2. Precondition: save `theirs` to historical recovery backup BEFORE overwriting (PRD 4.5.1 D)
-        if let Err(e) = self.write_historical_backup(
+        // 2. Precondition: save `theirs` exact bytes to historical recovery backup BEFORE overwriting (PRD 4.5.1 D)
+        if let Err(e) = self.write_historical_backup_bytes(
             "conflict-overwritten-theirs",
-            &expected_theirs.content_string(),
+            &expected_theirs.to_backup_bytes(),
         ) {
             self.recovery_degraded = true;
             return ConflictActionOutcome::AbortedStillConflict(format!(
@@ -785,13 +802,17 @@ impl DocumentSession {
     }
 
     fn write_historical_backup(&self, reason: &str, content: &str) -> std::io::Result<()> {
+        self.write_historical_backup_bytes(reason, content.as_bytes())
+    }
+
+    fn write_historical_backup_bytes(&self, reason: &str, bytes: &[u8]) -> std::io::Result<()> {
         let Some(dir) = &self.recovery_dir else {
             return Ok(());
         };
         fs::create_dir_all(dir)?;
         let rev = self.buffer.revision();
         let backup_path = dir.join(format!("history-{reason}-rev{rev}.bak"));
-        atomic_write_file(&backup_path, content.as_bytes())
+        atomic_write_file(&backup_path, bytes)
     }
 
     fn clear_current_recovery_snapshot(&mut self) {
@@ -1210,6 +1231,91 @@ mod tests {
         let snap = DocumentSession::read_latest_intact_snapshot(&rec_dir).unwrap();
         assert_eq!(snap.revision, 20);
         assert_eq!(snap.content, "x".repeat(20));
+
+        drop(session);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_schedule_immediately_followed_by_shutdown_does_not_hang_and_flushes() {
+        // Regression test: scheduling snapshots with a long throttle window (60s) and immediately
+        // dropping the session must NOT hang in `JoinHandle::join()` when `Shutdown` is coalesced
+        // inside the inner `try_recv` loop, and must flush the pending snapshot before exiting.
+        let dir = unique_temp_dir("immediate-shutdown");
+        let file_path = dir.join("shutdown.md");
+        let rec_dir = dir.join("recovery");
+        fs::write(&file_path, "Start\n").unwrap();
+
+        let start_time = Instant::now();
+        {
+            let mut session = DocumentSession::open_file_with_throttle(
+                &file_path,
+                Some(rec_dir.clone()),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+            session.edit(
+                ByteRange::new(6, 6),
+                "Edited before immediate drop\n",
+                Selection::caret(6),
+                Selection::caret(35),
+                EditKind::Typing,
+            );
+            // Drop happens immediately here while `Schedule` is still in the channel or inner loop
+        }
+        assert!(
+            start_time.elapsed() < Duration::from_secs(2),
+            "Dropping session hung waiting for background recovery worker"
+        );
+
+        let snap = DocumentSession::read_latest_intact_snapshot(&rec_dir).unwrap();
+        assert_eq!(snap.content, "Start\nEdited before immediate drop\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_keep_mine_preserves_exact_undecodable_bytes_in_recovery_backup() {
+        // Regression test: When disk is modified into undecodable/binary bytes (invalid UTF-8 + NUL)
+        // and user chooses "Keep My Version", the historical backup file must preserve the exact
+        // original bytes rather than a lossy UTF-8 replacement string.
+        let dir = unique_temp_dir("keep-mine-raw-bytes");
+        let file_path = dir.join("raw.md");
+        let rec_dir = dir.join("recovery");
+        fs::write(&file_path, "Base\n").unwrap();
+
+        let mut session = DocumentSession::open_file(&file_path, Some(rec_dir.clone())).unwrap();
+        session.edit(
+            ByteRange::new(5, 5),
+            "My local version\n",
+            Selection::caret(5),
+            Selection::caret(22),
+            EditKind::Typing,
+        );
+        let rev = session.buffer.revision();
+        let rope = session.buffer.snapshot_rope();
+
+        // External process writes invalid UTF-8 + NUL bytes
+        let undecodable_theirs: Vec<u8> = vec![0xFF, 0xFE, 0xFD, 0x00, 0x80, 0x9F, 0x41];
+        fs::write(&file_path, &undecodable_theirs).unwrap();
+
+        // Save triggers pre-write check -> Conflict with undecodable `theirs`
+        assert_eq!(session.save(), SaveOutcome::EnteredConflict);
+        assert_eq!(session.state, DocState::Conflict);
+
+        // Resolve with "Keep My Version"
+        let outcome = session.resolve_conflict_keep_mine(rev, rope);
+        assert_eq!(outcome, ConflictActionOutcome::ResolvedClean);
+        assert_eq!(
+            fs::read_to_string(&file_path).unwrap(),
+            "Base\nMy local version\n"
+        );
+
+        // Historical backup must match `undecodable_theirs` byte-for-byte
+        let backup_path = rec_dir.join(format!("history-conflict-overwritten-theirs-rev{rev}.bak"));
+        let backed_up_bytes = fs::read(&backup_path).unwrap();
+        assert_eq!(backed_up_bytes, undecodable_theirs);
 
         drop(session);
         let _ = fs::remove_dir_all(&dir);

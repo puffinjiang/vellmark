@@ -20,20 +20,48 @@ pub fn sanitize_html_fragment(html: &str, mode: HtmlExportMode) -> String {
 
 fn strip_script_elements(html: &str) -> String {
     let mut out = html.to_string();
-    while let Some(start) = out.to_ascii_lowercase().find("<script") {
-        // Ensure `<script` is followed by whitespace, `>`, or `/` (or end of string)
+    let mut search_from = 0usize;
+    while search_from < out.len() {
+        let Some(rel_start) = out[search_from..].to_ascii_lowercase().find("<script") else {
+            break;
+        };
+        let start = search_from + rel_start;
+        // Ensure `<script` is followed by whitespace, `>`, or `/` (or end of string),
+        // rather than a longer tag name prefix like `<scripture>`.
         let after = out.as_bytes().get(start + 7).copied();
-        if matches!(after, None | Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')) {
-            if let Some(end_rel) = out[start..].to_ascii_lowercase().find("</script") {
-                if let Some(close_gt) = out[start + end_rel..].find('>') {
-                    out.replace_range(start..start + end_rel + close_gt + 1, "");
-                    continue;
+        if matches!(
+            after,
+            None | Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        ) {
+            // Find matching closing `</script>` where `</script` is followed by whitespace or `>`
+            let mut close_search = start + 7;
+            let mut removed = false;
+            while close_search < out.len() {
+                if let Some(end_rel) = out[close_search..].to_ascii_lowercase().find("</script") {
+                    let close_pos = close_search + end_rel;
+                    let after_close = out.as_bytes().get(close_pos + 8).copied();
+                    if matches!(
+                        after_close,
+                        Some(b'>') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+                    ) {
+                        if let Some(close_gt) = out[close_pos + 8..].find('>') {
+                            out.replace_range(start..close_pos + 8 + close_gt + 1, "");
+                            removed = true;
+                            break;
+                        }
+                    }
+                    close_search = close_pos + 8;
+                } else {
+                    break;
                 }
             }
-            out.replace_range(start.., "");
-            break;
+            if !removed {
+                out.replace_range(start.., "");
+                break;
+            }
         } else {
-            break;
+            // Not a `<script>` tag (e.g. `<scripture>`): advance `search_from` and continue scanning!
+            search_from = start + 7;
         }
     }
     out
@@ -240,5 +268,12 @@ mod tests {
         assert!(safe.contains(r#"src="x.png""#));
         assert!(safe.contains(r#"title="link""#));
         assert_eq!(sanitize_html_fragment(raw, HtmlExportMode::Raw), raw);
+    }
+
+    #[test]
+    fn test_script_prefix_tag_like_scripture_does_not_bypass_subsequent_script_removal() {
+        let raw = "<scripture>keep me</scripture><script>alert(1)</script><p>after</p>";
+        let safe = sanitize_html_fragment(raw, HtmlExportMode::Safe);
+        assert_eq!(safe, "<scripture>keep me</scripture><p>after</p>");
     }
 }
