@@ -1,0 +1,43 @@
+/* Vellmark Default Light Theme (CSS Subset v1.0) */
+:root {
+    --text-color: #1f2328;
+    --bg-color: #ffffff;
+    --code-bg: #f6f8fa;
+    --quote-border: #d0d7de;
+}
+
+#write {
+    max-width: 860px;
+    color: var(--text-color);
+    background-color: var(--bg-color);
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 16px;
+    line-height: 1.75;
+    padding: 32px;
+}
+
+h1 {
+    font-size: 2em;
+    font-weight: 700;
+    margin-top: 24px;
+    margin-bottom: 16px;
+}
+
+h2 {
+    font-size: 1.5em;
+    font-weight: 600;
+    margin-top: 24px;
+    margin-bottom: 16px;
+}
+
+code {
+    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    background-color: var(--code-bg);
+    padding: 2px 4px;
+    border-radius: 4px;
+}
+
+blockquote {
+    border: 4px solid var(--quote-border);
+    padding-left: 16px;
+}

@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vellmark-core",
+    "crates/vellmark-parser",
+    "crates/vellmark-theme",
+    "crates/vellmark-render",
+    "crates/vellmark-export",
+    "crates/vellmark-app",
+    "crates/vellmark-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/puffinjiang/vellmark"
+rust-version = "1.85"
+
+[workspace.dependencies]
+ropey = "1.6.1"
+crc32fast = "1.4.2"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+
+vellmark-core = { path = "crates/vellmark-core" }
+vellmark-parser = { path = "crates/vellmark-parser" }
+vellmark-theme = { path = "crates/vellmark-theme" }
+vellmark-render = { path = "crates/vellmark-render" }
+vellmark-export = { path = "crates/vellmark-export" }

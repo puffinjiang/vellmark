@@ -1,0 +1,12 @@
+[package]
+name = "vellmark-cli"
+description = "Command-line interface for Vellmark (PRD P-03)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vellmark-core.workspace = true
+vellmark-parser.workspace = true
+vellmark-export.workspace = true

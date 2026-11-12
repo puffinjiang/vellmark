@@ -1,0 +1,13 @@
+[package]
+name = "vellmark-core"
+description = "Core document buffer, transactions, undo stack, encoding detection, and file conflict state machine for Vellmark."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ropey.workspace = true
+crc32fast.workspace = true
+serde.workspace = true
+thiserror.workspace = true

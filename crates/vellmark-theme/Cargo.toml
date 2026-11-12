@@ -1,0 +1,10 @@
+[package]
+name = "vellmark-theme"
+description = "Vellmark CSS subset parser, selector matcher, and theme diagnostics (PRD 6.6)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true

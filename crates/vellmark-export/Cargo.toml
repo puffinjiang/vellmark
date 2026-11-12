@@ -1,0 +1,12 @@
+[package]
+name = "vellmark-export"
+description = "HTML (Raw and Safe modes), PDF, and DOCX exporters for Vellmark (PRD 4.2.1 & 4.6)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vellmark-core.workspace = true
+vellmark-parser.workspace = true
+vellmark-theme.workspace = true

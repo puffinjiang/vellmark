@@ -1,0 +1,12 @@
+[package]
+name = "vellmark-render"
+description = "Native block layout, inline marker visibility, and viewport anchor stabilization for Vellmark."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vellmark-core.workspace = true
+vellmark-parser.workspace = true
+vellmark-theme.workspace = true

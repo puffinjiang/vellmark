@@ -1,0 +1,14 @@
+[package]
+name = "vellmark-app"
+description = "Cross-platform native GUI application entry point for Vellmark."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vellmark-core.workspace = true
+vellmark-parser.workspace = true
+vellmark-theme.workspace = true
+vellmark-render.workspace = true
+vellmark-export.workspace = true
