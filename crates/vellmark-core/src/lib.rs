@@ -16,7 +16,7 @@ pub use encoding::{
     detect_and_decode, encode_for_save,
 };
 pub use state::{
-    ConflictActionOutcome, DiskSnapshot, DocState, DocumentSession, RecoverySlotReport,
-    SaveOutcome,
+    ConflictActionOutcome, DiskSnapshot, DocState, DocumentSession, RecoveryPayload,
+    RecoverySlotReport, RecoveryWorker, SaveOutcome,
 };
 pub use undo::{EditKind, EditOp, Transaction, UndoHistory, syntax_conversion_escape_op};

@@ -1,6 +1,13 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
@@ -45,6 +52,19 @@ impl DiskSnapshot {
         Self::from_rope(Rope::from_str(text))
     }
 
+    /// Create a placeholder snapshot when the external file was modified into undecodable/binary bytes,
+    /// preserving the raw-byte CRC32 and length so conflict state and diagnostics remain accurate.
+    pub fn from_undecodable_bytes(raw: &[u8]) -> Self {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(raw);
+        let lossy = String::from_utf8_lossy(raw);
+        Self {
+            rope: Rope::from_str(&lossy),
+            crc32: hasher.finalize(),
+            len_bytes: raw.len(),
+        }
+    }
+
     pub fn content_string(&self) -> String {
         self.rope.to_string()
     }
@@ -56,7 +76,7 @@ pub enum SaveOutcome {
     SavedClean,
     /// Saved snapshot `written_revision`, but user edited during write -> base updated, stays Dirty.
     SavedButStillDirty { written_revision: u64 },
-    /// Pre-write check failed because disk != base -> transitioned to Conflict.
+    /// Pre-write check failed because disk != base (or became undecodable/binary) -> transitioned to Conflict.
     EnteredConflict,
     /// Write failed (I/O error) -> stays Dirty.
     WriteFailed(String),
@@ -81,6 +101,236 @@ pub struct RecoverySlotReport {
     pub crc32: u32,
 }
 
+/// Lightweight O(1) Rope-cloned payload sent from the UI/editor thread to the background recovery worker (PRD 4.5.1 F).
+#[derive(Debug, Clone)]
+pub struct RecoveryPayload {
+    pub revision: u64,
+    pub state: DocState,
+    pub content_rope: Rope,
+    pub base_rope: Rope,
+    pub theirs_rope: Option<Rope>,
+}
+
+enum WorkerCommand {
+    Schedule(RecoveryPayload),
+    FlushNow(RecoveryPayload, Sender<Result<(), String>>),
+    Clear(Sender<()>),
+    Shutdown,
+}
+
+/// Background recovery snapshot worker with <= 1s throttling and dual-slot atomic `fsync` writes,
+/// ensuring `DocumentSession::edit` never blocks the UI thread on serialization or disk I/O (PRD 4.5.1 F).
+pub struct RecoveryWorker {
+    tx: Sender<WorkerCommand>,
+    degraded: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RecoveryWorker {
+    pub fn spawn(recovery_dir: PathBuf, throttle_window: Duration) -> Self {
+        let (tx, rx) = mpsc::channel::<WorkerCommand>();
+        let degraded = Arc::new(AtomicBool::new(false));
+        let degraded_clone = Arc::clone(&degraded);
+
+        let handle = thread::spawn(move || {
+            worker_loop(recovery_dir, throttle_window, rx, degraded_clone);
+        });
+
+        Self {
+            tx,
+            degraded,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn schedule(&self, payload: RecoveryPayload) {
+        let _ = self.tx.send(WorkerCommand::Schedule(payload));
+    }
+
+    pub fn flush_sync(&self, payload: RecoveryPayload) -> Result<(), SessionError> {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let _ = self.tx.send(WorkerCommand::FlushNow(payload, ack_tx));
+        match ack_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(msg)) => Err(SessionError::Io(std::io::Error::other(msg))),
+            Err(_) => Err(SessionError::Io(std::io::Error::other(
+                "recovery worker disconnected",
+            ))),
+        }
+    }
+
+    pub fn clear_sync(&self) {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let _ = self.tx.send(WorkerCommand::Clear(ack_tx));
+        let _ = ack_rx.recv();
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for RecoveryWorker {
+    fn drop(&mut self) {
+        let _ = self.tx.send(WorkerCommand::Shutdown);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn worker_loop(
+    recovery_dir: PathBuf,
+    throttle_window: Duration,
+    rx: Receiver<WorkerCommand>,
+    degraded: Arc<AtomicBool>,
+) {
+    let mut active_slot: u8 = 0;
+    let mut pending: Option<RecoveryPayload> = None;
+    let mut deadline: Option<Instant> = None;
+
+    loop {
+        let cmd = if let Some(dl) = deadline {
+            let now = Instant::now();
+            if now >= dl {
+                if let Some(p) = pending.take() {
+                    let ok = write_payload_to_next_slot(&recovery_dir, &mut active_slot, &p).is_ok();
+                    degraded.store(!ok, Ordering::Release);
+                }
+                deadline = None;
+                continue;
+            }
+            match rx.recv_timeout(dl - now) {
+                Ok(c) => c,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(c) => c,
+                Err(_) => break,
+            }
+        };
+
+        match cmd {
+            WorkerCommand::Schedule(mut latest) => {
+                // Coalesce any additional queued Schedule commands immediately
+                loop {
+                    match rx.try_recv() {
+                        Ok(WorkerCommand::Schedule(newer)) => latest = newer,
+                        Ok(other) => {
+                            // Write or queue `latest` before handling `other`
+                            pending = Some(latest);
+                            if deadline.is_none() {
+                                deadline = Some(Instant::now() + throttle_window);
+                            }
+                            handle_non_schedule_cmd(
+                                other,
+                                &recovery_dir,
+                                &mut active_slot,
+                                &mut pending,
+                                &mut deadline,
+                                &degraded,
+                            );
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => {
+                            pending = Some(latest);
+                            if deadline.is_none() {
+                                deadline = Some(Instant::now() + throttle_window);
+                            }
+                            break;
+                        }
+                        Err(TryRecvError::Disconnected) => return,
+                    }
+                }
+            }
+            other => {
+                if handle_non_schedule_cmd(
+                    other,
+                    &recovery_dir,
+                    &mut active_slot,
+                    &mut pending,
+                    &mut deadline,
+                    &degraded,
+                ) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn handle_non_schedule_cmd(
+    cmd: WorkerCommand,
+    recovery_dir: &Path,
+    active_slot: &mut u8,
+    pending: &mut Option<RecoveryPayload>,
+    deadline: &mut Option<Instant>,
+    degraded: &Arc<AtomicBool>,
+) -> bool {
+    match cmd {
+        WorkerCommand::FlushNow(payload, ack) => {
+            *pending = None;
+            *deadline = None;
+            let res = write_payload_to_next_slot(recovery_dir, active_slot, &payload)
+                .map_err(|e| e.to_string());
+            degraded.store(res.is_err(), Ordering::Release);
+            let _ = ack.send(res);
+            false
+        }
+        WorkerCommand::Clear(ack) => {
+            *pending = None;
+            *deadline = None;
+            for slot in [0u8, 1u8] {
+                let _ = fs::remove_file(recovery_dir.join(format!("current.slot{slot}.rec")));
+            }
+            let _ = ack.send(());
+            false
+        }
+        WorkerCommand::Shutdown => {
+            if let Some(p) = pending.take() {
+                let _ = write_payload_to_next_slot(recovery_dir, active_slot, &p);
+            }
+            true
+        }
+        WorkerCommand::Schedule(_) => false,
+    }
+}
+
+fn write_payload_to_next_slot(
+    dir: &Path,
+    active_slot: &mut u8,
+    payload: &RecoveryPayload,
+) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let next_slot = 1 - *active_slot;
+    let content = payload.content_rope.to_string();
+    let base_content = payload.base_rope.to_string();
+    let theirs_content = payload.theirs_rope.as_ref().map(|r| r.to_string());
+
+    let crc32 = compute_snapshot_crc(
+        payload.revision,
+        &content,
+        &base_content,
+        theirs_content.as_deref(),
+    );
+    let report = RecoverySlotReport {
+        slot: next_slot,
+        revision: payload.revision,
+        state: payload.state,
+        content,
+        base_content,
+        theirs_content,
+        crc32,
+    };
+    let encoded = serialize_slot_report(&report);
+    let target = dir.join(format!("current.slot{next_slot}.rec"));
+    atomic_write_file(&target, encoded.as_bytes())?;
+    *active_slot = next_slot;
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error("I/O error: {0}")]
@@ -92,7 +342,7 @@ pub enum SessionError {
 }
 
 /// Complete document session managing buffer, undo stack, `base` / `theirs` snapshots,
-/// state transitions, and dual-slot atomic crash recovery (PRD 4.5.1).
+/// state transitions, and non-blocking throttled dual-slot atomic crash recovery (PRD 4.5.1).
 pub struct DocumentSession {
     pub path: Option<PathBuf>,
     pub buffer: TextBuffer,
@@ -102,18 +352,37 @@ pub struct DocumentSession {
     pub base: DiskSnapshot,
     pub theirs: Option<DiskSnapshot>,
     pub recovery_dir: Option<PathBuf>,
-    active_recovery_slot: u8,
+    recovery_worker: Option<RecoveryWorker>,
     pub recovery_degraded: bool,
+    /// Revision whose recovery snapshot has been scheduled/dirty since last flush.
+    pending_recovery_revision: Option<u64>,
 }
 
 impl DocumentSession {
     /// Open an existing file from disk following PRD 4.5.2 encoding rules.
-    pub fn open_file(path: impl AsRef<Path>, recovery_dir: Option<PathBuf>) -> Result<Self, SessionError> {
+    /// Spawns a background recovery worker with a 200ms throttle window (<= 1s per PRD 4.5.1 F)
+    /// so `edit()` never blocks the UI thread on disk I/O.
+    pub fn open_file(
+        path: impl AsRef<Path>,
+        recovery_dir: Option<PathBuf>,
+    ) -> Result<Self, SessionError> {
+        Self::open_file_with_throttle(path, recovery_dir, Duration::from_millis(200))
+    }
+
+    pub fn open_file_with_throttle(
+        path: impl AsRef<Path>,
+        recovery_dir: Option<PathBuf>,
+        throttle_window: Duration,
+    ) -> Result<Self, SessionError> {
         let path = path.as_ref().to_path_buf();
         let raw = fs::read(&path)?;
         let (text, format) = detect_and_decode(&raw)?;
         let buffer = TextBuffer::from_str(&text);
         let base = DiskSnapshot::from_rope(buffer.snapshot_rope());
+        let recovery_worker = recovery_dir
+            .clone()
+            .map(|dir| RecoveryWorker::spawn(dir, throttle_window));
+
         Ok(Self {
             path: Some(path),
             buffer,
@@ -123,12 +392,15 @@ impl DocumentSession {
             base,
             theirs: None,
             recovery_dir,
-            active_recovery_slot: 0,
+            recovery_worker,
             recovery_degraded: false,
+            pending_recovery_revision: None,
         })
     }
 
     /// Perform a local edit and transition state per PRD 4.5.1 C.
+    /// Non-blocking: schedules an O(1) Rope-snapshot recovery payload on the background worker
+    /// instead of performing synchronous serialization or `fsync` on the input thread.
     pub fn edit(
         &mut self,
         range: ByteRange,
@@ -146,7 +418,7 @@ impl DocumentSession {
                 has_local_edits: true,
             },
         };
-        let _ = self.write_current_recovery_snapshot();
+        self.schedule_recovery_snapshot();
     }
 
     /// Handle external file modification event per PRD 4.5.1 C.
@@ -162,13 +434,13 @@ impl DocumentSession {
                 if disk_snap.crc32 != self.base.crc32 || disk_snap.len_bytes != self.base.len_bytes {
                     self.theirs = Some(disk_snap);
                     self.state = DocState::Conflict;
-                    let _ = self.write_current_recovery_snapshot();
+                    self.schedule_recovery_snapshot();
                 }
             }
             DocState::Conflict => {
                 // Disk modified again during Conflict: refresh `theirs`, stay Conflict (PRD 4.5.1 C).
                 self.theirs = Some(disk_snap);
-                let _ = self.write_current_recovery_snapshot();
+                self.schedule_recovery_snapshot();
             }
             DocState::Missing { has_local_edits } => {
                 // Original path reappeared (PRD 4.5.1 C).
@@ -187,6 +459,7 @@ impl DocumentSession {
                 } else {
                     self.theirs = Some(disk_snap);
                     self.state = DocState::Conflict;
+                    self.schedule_recovery_snapshot();
                 }
             }
         }
@@ -201,7 +474,7 @@ impl DocumentSession {
         };
         self.theirs = None;
         self.state = DocState::Missing { has_local_edits };
-        let _ = self.write_current_recovery_snapshot();
+        self.schedule_recovery_snapshot();
     }
 
     /// Execute a version-bound save: snapshots `written_revision` and `written_rope`,
@@ -216,14 +489,26 @@ impl DocumentSession {
             return SaveOutcome::WriteFailed("no file path bound".to_string());
         };
 
-        // Pre-write verification against `base` (PRD 4.5.1 C)
+        // Pre-write verification against `base` (PRD 4.5.1 C).
+        // Issue 1 fix: If disk file was modified into undecodable/binary bytes (e.g. containing NUL),
+        // `detect_and_decode` returns `Err` — we MUST treat this as a conflict and refuse to overwrite!
         if let Ok(disk_bytes) = fs::read(&path) {
-            if let Ok((disk_text, _)) = detect_and_decode(&disk_bytes) {
-                let disk_snap = DiskSnapshot::from_str(&disk_text);
-                if disk_snap.crc32 != self.base.crc32 || disk_snap.len_bytes != self.base.len_bytes {
-                    self.theirs = Some(disk_snap);
+            match detect_and_decode(&disk_bytes) {
+                Ok((disk_text, _)) => {
+                    let disk_snap = DiskSnapshot::from_str(&disk_text);
+                    if disk_snap.crc32 != self.base.crc32
+                        || disk_snap.len_bytes != self.base.len_bytes
+                    {
+                        self.theirs = Some(disk_snap);
+                        self.state = DocState::Conflict;
+                        let _ = self.flush_current_recovery_snapshot();
+                        return SaveOutcome::EnteredConflict;
+                    }
+                }
+                Err(_) => {
+                    self.theirs = Some(DiskSnapshot::from_undecodable_bytes(&disk_bytes));
                     self.state = DocState::Conflict;
-                    let _ = self.write_current_recovery_snapshot();
+                    let _ = self.flush_current_recovery_snapshot();
                     return SaveOutcome::EnteredConflict;
                 }
             }
@@ -254,7 +539,7 @@ impl DocumentSession {
             SaveOutcome::SavedClean
         } else {
             self.state = DocState::Dirty;
-            let _ = self.write_current_recovery_snapshot();
+            let _ = self.flush_current_recovery_snapshot();
             SaveOutcome::SavedButStillDirty { written_revision }
         }
     }
@@ -267,7 +552,8 @@ impl DocumentSession {
     }
 
     /// Conflict resolution: "Keep My Version" (PRD 4.5.1 D).
-    /// Precondition: persists `theirs` to recovery backup FIRST; if backup fails, aborts and stays Conflict.
+    /// Precondition: verifies disk still matches `theirs` (and is decodable), then persists `theirs`
+    /// to recovery backup FIRST; if backup fails, aborts and stays Conflict.
     pub fn resolve_conflict_keep_mine(
         &mut self,
         captured_revision: u64,
@@ -288,20 +574,25 @@ impl DocumentSession {
                 return ConflictActionOutcome::TransitionedToMissing;
             }
         };
-        if let Ok((disk_text, _)) = detect_and_decode(&disk_bytes) {
-            let latest_disk = DiskSnapshot::from_str(&disk_text);
-            if latest_disk.crc32 != expected_theirs.crc32
-                || latest_disk.len_bytes != expected_theirs.len_bytes
-            {
-                self.theirs = Some(latest_disk);
-                return ConflictActionOutcome::AbortedStillConflict(
-                    "disk changed again; refreshed theirs".to_string(),
-                );
-            }
+        let latest_disk = match detect_and_decode(&disk_bytes) {
+            Ok((disk_text, _)) => DiskSnapshot::from_str(&disk_text),
+            Err(_) => DiskSnapshot::from_undecodable_bytes(&disk_bytes),
+        };
+        if latest_disk.crc32 != expected_theirs.crc32
+            || latest_disk.len_bytes != expected_theirs.len_bytes
+        {
+            self.theirs = Some(latest_disk);
+            let _ = self.flush_current_recovery_snapshot();
+            return ConflictActionOutcome::AbortedStillConflict(
+                "disk changed again; refreshed theirs".to_string(),
+            );
         }
 
         // 2. Precondition: save `theirs` to historical recovery backup BEFORE overwriting (PRD 4.5.1 D)
-        if let Err(e) = self.write_historical_backup("conflict-overwritten-theirs", &expected_theirs.content_string()) {
+        if let Err(e) = self.write_historical_backup(
+            "conflict-overwritten-theirs",
+            &expected_theirs.content_string(),
+        ) {
             self.recovery_degraded = true;
             return ConflictActionOutcome::AbortedStillConflict(format!(
                 "recovery backup failed ({e}); refusing to overwrite disk version"
@@ -328,14 +619,17 @@ impl DocumentSession {
             ConflictActionOutcome::ResolvedClean
         } else {
             self.state = DocState::Dirty;
-            let _ = self.write_current_recovery_snapshot();
+            let _ = self.flush_current_recovery_snapshot();
             ConflictActionOutcome::ResolvedDirty
         }
     }
 
     /// Conflict resolution: "Use Disk Version" (PRD 4.5.1 D).
-    /// Precondition: persists my version at `captured_revision` to recovery backup FIRST;
-    /// if new edits occurred before replacement completes, aborts reload so new input is never lost.
+    /// Precondition:
+    /// 1. Persists my version at `captured_revision` to recovery backup FIRST;
+    /// 2. Re-reads disk and verifies it is still decodable and matches the `expected_theirs` snapshot
+    ///    (Issue 2 fix: if disk changed from A to B before file watcher delivered event, refreshes `theirs` to B and aborts);
+    /// 3. Verifies no new local edits occurred since `captured_revision`.
     pub fn resolve_conflict_use_theirs(&mut self, captured_revision: u64) -> ConflictActionOutcome {
         let Some(path) = self.path.clone() else {
             return ConflictActionOutcome::AbortedStillConflict("no path".to_string());
@@ -345,9 +639,35 @@ impl DocumentSession {
         };
 
         // Check if file still exists on disk
-        if !path.exists() {
-            self.on_external_deleted();
-            return ConflictActionOutcome::TransitionedToMissing;
+        let initial_disk_bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => {
+                self.on_external_deleted();
+                return ConflictActionOutcome::TransitionedToMissing;
+            }
+        };
+
+        // Verify disk before backup
+        match detect_and_decode(&initial_disk_bytes) {
+            Ok((disk_text, _)) => {
+                let latest_disk = DiskSnapshot::from_str(&disk_text);
+                if latest_disk.crc32 != expected_theirs.crc32
+                    || latest_disk.len_bytes != expected_theirs.len_bytes
+                {
+                    self.theirs = Some(latest_disk);
+                    let _ = self.flush_current_recovery_snapshot();
+                    return ConflictActionOutcome::AbortedStillConflict(
+                        "disk content changed again before reload; refreshed theirs".to_string(),
+                    );
+                }
+            }
+            Err(e) => {
+                self.theirs = Some(DiskSnapshot::from_undecodable_bytes(&initial_disk_bytes));
+                let _ = self.flush_current_recovery_snapshot();
+                return ConflictActionOutcome::AbortedStillConflict(format!(
+                    "disk content is not valid text ({e}); cannot load disk version"
+                ));
+            }
         }
 
         // 1. Precondition: save my version to historical backup first
@@ -359,11 +679,40 @@ impl DocumentSession {
             ));
         }
 
-        // 2. Verify no new edits occurred since user triggered the action (PRD 4.5.1 D)
+        // 2. Re-verify both local revision AND disk content after backup completes (PRD 4.5.1 D)
         if self.buffer.revision() != captured_revision {
             return ConflictActionOutcome::AbortedStillConflict(
                 "new edits occurred while saving backup; aborted reload".to_string(),
             );
+        }
+
+        let post_backup_bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => {
+                self.on_external_deleted();
+                return ConflictActionOutcome::TransitionedToMissing;
+            }
+        };
+        match detect_and_decode(&post_backup_bytes) {
+            Ok((disk_text, _)) => {
+                let latest_disk = DiskSnapshot::from_str(&disk_text);
+                if latest_disk.crc32 != expected_theirs.crc32
+                    || latest_disk.len_bytes != expected_theirs.len_bytes
+                {
+                    self.theirs = Some(latest_disk);
+                    let _ = self.flush_current_recovery_snapshot();
+                    return ConflictActionOutcome::AbortedStillConflict(
+                        "disk content changed while saving backup; refreshed theirs".to_string(),
+                    );
+                }
+            }
+            Err(e) => {
+                self.theirs = Some(DiskSnapshot::from_undecodable_bytes(&post_backup_bytes));
+                let _ = self.flush_current_recovery_snapshot();
+                return ConflictActionOutcome::AbortedStillConflict(format!(
+                    "disk content became undecodable ({e}); aborted reload"
+                ));
+            }
         }
 
         let theirs_text = expected_theirs.content_string();
@@ -383,50 +732,39 @@ impl DocumentSession {
         ConflictActionOutcome::ResolvedClean
     }
 
-    /// Dual-slot atomic current recovery snapshot writer (PRD 4.5.1 F).
-    /// Alternates between `current.slot0.rec` and `current.slot1.rec` via temp-file + fsync + atomic rename,
-    /// so an interrupted write never corrupts the previous intact snapshot.
-    pub fn write_current_recovery_snapshot(&mut self) -> Result<(), SessionError> {
-        let Some(dir) = self.recovery_dir.clone() else {
-            return Ok(());
-        };
-        if let Err(e) = fs::create_dir_all(&dir) {
-            self.recovery_degraded = true;
-            return Err(SessionError::Io(e));
-        }
-
-        let next_slot = 1 - self.active_recovery_slot;
-        let content = self.buffer.to_string();
-        let base_content = self.base.content_string();
-        let theirs_content = self.theirs.as_ref().map(|t| t.content_string());
-
-        let crc32 = compute_snapshot_crc(
-            self.buffer.revision(),
-            &content,
-            &base_content,
-            theirs_content.as_deref(),
-        );
-        let report = RecoverySlotReport {
-            slot: next_slot,
+    fn build_recovery_payload(&self) -> RecoveryPayload {
+        RecoveryPayload {
             revision: self.buffer.revision(),
             state: self.state,
-            content,
-            base_content,
-            theirs_content,
-            crc32,
-        };
-        let encoded = serialize_slot_report(&report);
-        let target = dir.join(format!("current.slot{next_slot}.rec"));
-        match atomic_write_file(&target, encoded.as_bytes()) {
-            Ok(()) => {
-                self.active_recovery_slot = next_slot;
-                self.recovery_degraded = false;
-                Ok(())
+            content_rope: self.buffer.snapshot_rope(),
+            base_rope: self.base.rope.clone(),
+            theirs_rope: self.theirs.as_ref().map(|t| t.rope.clone()),
+        }
+    }
+
+    /// Non-blocking: schedules a throttled recovery snapshot on the background worker thread.
+    pub fn schedule_recovery_snapshot(&mut self) {
+        if let Some(worker) = &self.recovery_worker {
+            let payload = self.build_recovery_payload();
+            self.pending_recovery_revision = Some(payload.revision);
+            worker.schedule(payload);
+            self.recovery_degraded = worker.is_degraded();
+        }
+    }
+
+    /// Synchronously flush the current recovery snapshot to disk via the background worker
+    /// (used in tests, explicit flushes, or state boundaries).
+    pub fn flush_current_recovery_snapshot(&mut self) -> Result<(), SessionError> {
+        if let Some(worker) = &self.recovery_worker {
+            let payload = self.build_recovery_payload();
+            let res = worker.flush_sync(payload);
+            self.recovery_degraded = worker.is_degraded();
+            if res.is_ok() {
+                self.pending_recovery_revision = None;
             }
-            Err(e) => {
-                self.recovery_degraded = true;
-                Err(SessionError::Io(e))
-            }
+            res
+        } else {
+            Ok(())
         }
     }
 
@@ -456,8 +794,11 @@ impl DocumentSession {
         atomic_write_file(&backup_path, content.as_bytes())
     }
 
-    fn clear_current_recovery_snapshot(&self) {
-        if let Some(dir) = &self.recovery_dir {
+    fn clear_current_recovery_snapshot(&mut self) {
+        self.pending_recovery_revision = None;
+        if let Some(worker) = &self.recovery_worker {
+            worker.clear_sync();
+        } else if let Some(dir) = &self.recovery_dir {
             for slot in [0u8, 1u8] {
                 let _ = fs::remove_file(dir.join(format!("current.slot{slot}.rec")));
             }
@@ -689,6 +1030,8 @@ mod tests {
             Selection::caret(12),
             EditKind::Typing,
         );
+        session.flush_current_recovery_snapshot().unwrap(); // Writes to slot 1
+
         session.edit(
             ByteRange::new(12, 12),
             "Edit 2\n",
@@ -696,9 +1039,13 @@ mod tests {
             Selection::caret(19),
             EditKind::Typing,
         );
+        session.flush_current_recovery_snapshot().unwrap(); // Writes to slot 0
+
+        let latest_before = DocumentSession::read_latest_intact_snapshot(&rec_dir).unwrap();
+        assert_eq!(latest_before.content, "Base\nEdit 1\nEdit 2\n");
+        let newest_slot = latest_before.slot;
 
         // Corrupt the latest slot file to simulate power loss mid-write
-        let newest_slot = session.active_recovery_slot;
         fs::write(
             rec_dir.join(format!("current.slot{newest_slot}.rec")),
             "CORRUPTED_PARTIAL_WRITE",
@@ -709,6 +1056,7 @@ mod tests {
         let recovered = DocumentSession::read_latest_intact_snapshot(&rec_dir).unwrap();
         assert_eq!(recovered.content, "Base\nEdit 1\n");
 
+        drop(session);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -749,6 +1097,121 @@ mod tests {
         assert_eq!(session.state, DocState::Conflict);
         assert_eq!(session.buffer.to_string(), "Base\nMine\n!");
 
+        drop(session);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_issue_1_undecodable_binary_disk_change_blocks_save_and_enters_conflict() {
+        // Issue 1: External process overwrites file with binary NUL bytes while local doc is Dirty.
+        // Save must NOT let the pre-write check pass; it must enter Conflict and preserve disk bytes.
+        let dir = unique_temp_dir("binary-disk-conflict");
+        let file_path = dir.join("doc.md");
+        let rec_dir = dir.join("recovery");
+        fs::write(&file_path, "Base\n").unwrap();
+
+        let mut session = DocumentSession::open_file(&file_path, Some(rec_dir)).unwrap();
+        session.edit(
+            ByteRange::new(5, 5),
+            "Local edit\n",
+            Selection::caret(5),
+            Selection::caret(16),
+            EditKind::Typing,
+        );
+
+        // External program writes binary content containing NUL byte
+        let binary_disk = b"corrupted\x00binary\x00payload";
+        fs::write(&file_path, binary_disk).unwrap();
+
+        let outcome = session.save();
+        assert_eq!(outcome, SaveOutcome::EnteredConflict);
+        assert_eq!(session.state, DocState::Conflict);
+        // Disk file must NOT have been overwritten
+        assert_eq!(fs::read(&file_path).unwrap(), binary_disk);
+
+        drop(session);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_issue_2_use_theirs_rechecks_disk_and_aborts_if_disk_changed_from_a_to_b() {
+        // Issue 2: Cached `theirs` is version A, but disk has already changed to version B before
+        // file watcher event arrived. `resolve_conflict_use_theirs` must re-verify disk, update `theirs` to B,
+        // and stay in Conflict rather than loading stale A and marking Clean.
+        let dir = unique_temp_dir("use-theirs-stale");
+        let file_path = dir.join("conflict.md");
+        let rec_dir = dir.join("recovery");
+        fs::write(&file_path, "Base\n").unwrap();
+
+        let mut session = DocumentSession::open_file(&file_path, Some(rec_dir)).unwrap();
+        session.edit(
+            ByteRange::new(5, 5),
+            "Mine\n",
+            Selection::caret(5),
+            Selection::caret(10),
+            EditKind::Typing,
+        );
+        let captured_rev = session.buffer.revision();
+
+        // External modification A arrives via watcher
+        fs::write(&file_path, "Theirs A\n").unwrap();
+        session.on_external_modified("Theirs A\n");
+        assert_eq!(session.state, DocState::Conflict);
+
+        // Disk changes again to "Theirs B\n" BEFORE watcher notifies session
+        fs::write(&file_path, "Theirs B\n").unwrap();
+
+        let outcome = session.resolve_conflict_use_theirs(captured_rev);
+        assert!(matches!(
+            outcome,
+            ConflictActionOutcome::AbortedStillConflict(_)
+        ));
+        assert_eq!(session.state, DocState::Conflict);
+        assert_eq!(
+            session.theirs.as_ref().unwrap().content_string(),
+            "Theirs B\n"
+        );
+        // Local buffer must still hold "Base\nMine\n"
+        assert_eq!(session.buffer.to_string(), "Base\nMine\n");
+
+        drop(session);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_issue_3_throttled_background_recovery_coalesces_rapid_edits() {
+        // Issue 3: Rapid edits are coalesced by the background worker within the throttle window
+        // without blocking the caller thread on every keystroke, and flushed within the window.
+        let dir = unique_temp_dir("throttled-worker");
+        let file_path = dir.join("fast.md");
+        let rec_dir = dir.join("recovery");
+        fs::write(&file_path, "").unwrap();
+
+        let mut session = DocumentSession::open_file_with_throttle(
+            &file_path,
+            Some(rec_dir.clone()),
+            Duration::from_millis(60),
+        )
+        .unwrap();
+
+        for i in 0..20usize {
+            session.edit(
+                ByteRange::new(i, i),
+                "x",
+                Selection::caret(i),
+                Selection::caret(i + 1),
+                EditKind::Typing,
+            );
+        }
+
+        // Wait for the 60ms throttle timer to fire on the background worker
+        thread::sleep(Duration::from_millis(120));
+
+        let snap = DocumentSession::read_latest_intact_snapshot(&rec_dir).unwrap();
+        assert_eq!(snap.revision, 20);
+        assert_eq!(snap.content, "x".repeat(20));
+
+        drop(session);
         let _ = fs::remove_dir_all(&dir);
     }
 }
