@@ -6,11 +6,13 @@
 //!   and dual-slot atomic crash recovery (`state`, PRD 4.5.1)
 
 pub mod buffer;
+pub mod editor;
 pub mod encoding;
 pub mod state;
 pub mod undo;
 
 pub use buffer::{ByteOffset, ByteRange, Selection, TextBuffer};
+pub use editor::{EditorAction, EditorController, ViewMode};
 pub use encoding::{
     DetectedEncoding, EncodingDecision, EncodingError, FileFormatMeta, LineEnding,
     detect_and_decode, encode_for_save,

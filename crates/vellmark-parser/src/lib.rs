@@ -1,8 +1,26 @@
 //! `vellmark-parser` provides block-level incremental Markdown parsing, exact source byte spans,
+//! CommonMark 0.31.2 / GFM 0.29-gfm spec-compliant parsing & HTML rendering (PRD 4.2.1),
 //! and the two-level marker expansion rule (`block prefix + active inline span`, PRD 4.1.1 A).
 
+use pulldown_cmark::{Options, Parser, html};
 use serde::{Deserialize, Serialize};
 use vellmark_core::{ByteOffset, ByteRange, Selection};
+
+/// Render Markdown to spec-compliant HTML using CommonMark + GFM extensions
+/// (tables, tasklists, strikethrough, YAML frontmatter) per PRD 4.2.1.
+pub fn render_markdown_to_html(markdown: &str) -> String {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_FOOTNOTES);
+    opts.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+
+    let parser = Parser::new_ext(markdown, opts);
+    let mut html_output = String::with_capacity(markdown.len() * 3 / 2);
+    html::push_html(&mut html_output, parser);
+    html_output
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockKind {
@@ -364,5 +382,16 @@ mod tests {
         let src = "\\*\\*粗体**";
         let blocks = parse_blocks(src);
         assert!(blocks[0].inlines.is_empty());
+    }
+
+    #[test]
+    fn test_commonmark_and_gfm_html_rendering_compliance() {
+        // PRD 4.2.1: CommonMark + GFM tables, tasklists, strikethrough
+        let md = "# Title\n\n- [x] Done\n- [ ] Todo\n\n| A | B |\n| --- | --- |\n| 1 | ~~2~~ |\n";
+        let out = render_markdown_to_html(md);
+        assert!(out.contains("<h1>Title</h1>"));
+        assert!(out.contains("type=\"checkbox\""));
+        assert!(out.contains("<table>"));
+        assert!(out.contains("<del>2</del>"));
     }
 }

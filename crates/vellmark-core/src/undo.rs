@@ -170,8 +170,9 @@ impl UndoHistory {
                     let esc_op = syntax_conversion_escape_op(esc_pos);
                     buf.replace_bytes(esc_op.range, &esc_op.inserted);
 
-                    // Also fold the inserted `\` into the preceding Typing transaction on the undo stack
-                    // so that a 2nd Undo removes both the `\` and the user's continuous input (PRD 4.1.1 B.1 Rule 3).
+                    // Always fold the inserted `\` into the preceding Typing transaction on the undo stack
+                    // so that a 2nd Undo removes both the `\` AND the user's typed text cleanly, even when
+                    // `esc_pos` was before `first_op.range.start` (e.g. file opened with `##` and user typed ` ` at offset 2).
                     if let Some(prev) = self.undo_stack.last_mut() {
                         if let Some(first_op) = prev.ops.first_mut() {
                             if esc_pos >= first_op.range.start
@@ -179,9 +180,24 @@ impl UndoHistory {
                             {
                                 let rel = esc_pos - first_op.range.start;
                                 first_op.inserted.insert(rel, '\\');
-                                prev.selection_after = Selection::caret(
-                                    prev.selection_after.head + 1,
-                                );
+                                prev.selection_after =
+                                    Selection::caret(prev.selection_after.head + 1);
+                            } else if esc_pos < first_op.range.start {
+                                // Shift any already-recorded ops after `esc_pos` right by 1 byte,
+                                // and prepend the `\` insertion op so 2nd Undo reverts both the `\` and the user's typing!
+                                for op in &mut prev.ops {
+                                    if op.range.start >= esc_pos {
+                                        op.range.start += 1;
+                                        op.range.end += 1;
+                                    }
+                                }
+                                prev.ops.insert(0, esc_op);
+                                prev.selection_after =
+                                    Selection::caret(prev.selection_after.head + 1);
+                            } else {
+                                prev.ops.push(esc_op);
+                                prev.selection_after =
+                                    Selection::caret(prev.selection_after.head + 1);
                             }
                         }
                     }
@@ -315,5 +331,33 @@ mod tests {
         // 2nd Undo: back to empty
         hist.undo(&mut buf);
         assert_eq!(buf.to_string(), "");
+    }
+
+    #[test]
+    fn test_p1_undo_heading_when_hashes_existed_before_typing_space() {
+        // P1 regression test: Open file containing `##`, move caret to end (offset 2),
+        // type space ` `, then undo twice -> must restore exact original `##` (not `\#`).
+        let mut buf = TextBuffer::from_str("##");
+        let mut hist = UndoHistory::new();
+
+        hist.apply_edit(
+            &mut buf,
+            ByteRange::empty(2),
+            " ",
+            Selection::caret(2),
+            Selection::caret(3),
+            EditKind::Typing,
+        );
+        hist.record_syntax_trigger(0, Selection::caret(3));
+        assert_eq!(buf.to_string(), "## ");
+
+        // 1st Undo -> `\## `
+        hist.undo(&mut buf);
+        assert_eq!(buf.to_string(), "\\## ");
+
+        // 2nd Undo -> must restore original `##`
+        let sel2 = hist.undo(&mut buf).unwrap();
+        assert_eq!(buf.to_string(), "##");
+        assert_eq!(sel2, Selection::caret(2));
     }
 }

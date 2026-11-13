@@ -8,4 +8,5 @@ repository.workspace = true
 
 [dependencies]
 vellmark-core.workspace = true
+pulldown-cmark.workspace = true
 serde.workspace = true
