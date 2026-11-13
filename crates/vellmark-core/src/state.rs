@@ -112,6 +112,7 @@ pub enum ConflictActionOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoverySlotReport {
     pub slot: u8,
+    pub sequence: u64,
     pub revision: u64,
     pub state: DocState,
     pub content: String,
@@ -123,6 +124,7 @@ pub struct RecoverySlotReport {
 /// Lightweight O(1) Rope-cloned payload sent from the UI/editor thread to the background recovery worker (PRD 4.5.1 F).
 #[derive(Debug, Clone)]
 pub struct RecoveryPayload {
+    pub source_path: Option<PathBuf>,
     pub revision: u64,
     pub state: DocState,
     pub content_rope: Rope,
@@ -198,13 +200,21 @@ impl Drop for RecoveryWorker {
     }
 }
 
+fn initial_worker_slot_state(recovery_dir: &Path) -> (u8, u64) {
+    if let Some(latest) = DocumentSession::read_latest_intact_snapshot(recovery_dir) {
+        (latest.slot, latest.sequence)
+    } else {
+        (0, 0)
+    }
+}
+
 fn worker_loop(
     recovery_dir: PathBuf,
     throttle_window: Duration,
     rx: Receiver<WorkerCommand>,
     degraded: Arc<AtomicBool>,
 ) {
-    let mut active_slot: u8 = 0;
+    let (mut active_slot, mut write_seq) = initial_worker_slot_state(&recovery_dir);
     let mut pending: Option<RecoveryPayload> = None;
     let mut deadline: Option<Instant> = None;
 
@@ -213,7 +223,13 @@ fn worker_loop(
             let now = Instant::now();
             if now >= dl {
                 if let Some(p) = pending.take() {
-                    let ok = write_payload_to_next_slot(&recovery_dir, &mut active_slot, &p).is_ok();
+                    let ok = write_payload_to_next_slot(
+                        &recovery_dir,
+                        &mut active_slot,
+                        &mut write_seq,
+                        &p,
+                    )
+                    .is_ok();
                     degraded.store(!ok, Ordering::Release);
                 }
                 deadline = None;
@@ -247,6 +263,7 @@ fn worker_loop(
                                 other,
                                 &recovery_dir,
                                 &mut active_slot,
+                                &mut write_seq,
                                 &mut pending,
                                 &mut deadline,
                                 &degraded,
@@ -271,6 +288,7 @@ fn worker_loop(
                     other,
                     &recovery_dir,
                     &mut active_slot,
+                    &mut write_seq,
                     &mut pending,
                     &mut deadline,
                     &degraded,
@@ -286,6 +304,7 @@ fn handle_non_schedule_cmd(
     cmd: WorkerCommand,
     recovery_dir: &Path,
     active_slot: &mut u8,
+    write_seq: &mut u64,
     pending: &mut Option<RecoveryPayload>,
     deadline: &mut Option<Instant>,
     degraded: &Arc<AtomicBool>,
@@ -294,7 +313,7 @@ fn handle_non_schedule_cmd(
         WorkerCommand::FlushNow(payload, ack) => {
             *pending = None;
             *deadline = None;
-            let res = write_payload_to_next_slot(recovery_dir, active_slot, &payload)
+            let res = write_payload_to_next_slot(recovery_dir, active_slot, write_seq, &payload)
                 .map_err(|e| e.to_string());
             degraded.store(res.is_err(), Ordering::Release);
             let _ = ack.send(res);
@@ -303,15 +322,13 @@ fn handle_non_schedule_cmd(
         WorkerCommand::Clear(ack) => {
             *pending = None;
             *deadline = None;
-            for slot in [0u8, 1u8] {
-                let _ = fs::remove_file(recovery_dir.join(format!("current.slot{slot}.rec")));
-            }
+            remove_recovery_dir_files(recovery_dir);
             let _ = ack.send(());
             false
         }
         WorkerCommand::Shutdown => {
             if let Some(p) = pending.take() {
-                let _ = write_payload_to_next_slot(recovery_dir, active_slot, &p);
+                let _ = write_payload_to_next_slot(recovery_dir, active_slot, write_seq, &p);
             }
             true
         }
@@ -322,22 +339,27 @@ fn handle_non_schedule_cmd(
 fn write_payload_to_next_slot(
     dir: &Path,
     active_slot: &mut u8,
+    write_seq: &mut u64,
     payload: &RecoveryPayload,
 ) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     let next_slot = 1 - *active_slot;
+    *write_seq = write_seq.saturating_add(1);
+    let sequence = *write_seq;
     let content = payload.content_rope.to_string();
     let base_content = payload.base_rope.to_string();
     let theirs_content = payload.theirs_rope.as_ref().map(|r| r.to_string());
 
     let crc32 = compute_snapshot_crc(
         payload.revision,
+        Some(sequence),
         &content,
         &base_content,
         theirs_content.as_deref(),
     );
     let report = RecoverySlotReport {
         slot: next_slot,
+        sequence,
         revision: payload.revision,
         state: payload.state,
         content,
@@ -348,6 +370,12 @@ fn write_payload_to_next_slot(
     let encoded = serialize_slot_report(&report);
     let target = dir.join(format!("current.slot{next_slot}.rec"));
     atomic_write_file(&target, encoded.as_bytes())?;
+    let meta = RecoveryMeta {
+        source_path: payload.source_path.clone(),
+        updated_unix_secs: current_unix_secs(),
+    };
+    let meta_json = serialize_recovery_meta_json(&meta);
+    atomic_write_file(&dir.join(RECOVERY_META_FILENAME), meta_json.as_bytes())?;
     *active_slot = next_slot;
     Ok(())
 }
@@ -397,7 +425,7 @@ impl DocumentSession {
         recovery_dir: Option<PathBuf>,
         throttle_window: Duration,
     ) -> Result<Self, SessionError> {
-        let path = path.as_ref().to_path_buf();
+        let path = normalize_session_path(path.as_ref());
         let raw = fs::read(&path)?;
         let (text, format) = detect_and_decode(&raw)?;
         let buffer = TextBuffer::from_str(&text);
@@ -633,7 +661,7 @@ impl DocumentSession {
             return SaveOutcome::WriteFailed(e.to_string());
         }
 
-        self.path = Some(target);
+        self.path = Some(normalize_session_path(&target));
         self.base = DiskSnapshot::from_rope(written_rope);
         self.theirs = None;
 
@@ -1056,6 +1084,7 @@ impl DocumentSession {
 
     fn build_recovery_payload(&self) -> RecoveryPayload {
         RecoveryPayload {
+            source_path: self.path.as_ref().map(|p| normalize_session_path(p)),
             revision: self.buffer.revision(),
             state: self.state,
             content_rope: self.buffer.snapshot_rope(),
@@ -1103,7 +1132,9 @@ impl DocumentSession {
                 }
             }
         }
-        valid_slots.into_iter().max_by_key(|r| r.revision)
+        valid_slots
+            .into_iter()
+            .max_by_key(|r| (r.sequence, r.revision))
     }
 
     fn write_historical_backup(&self, reason: &str, content: &str) -> std::io::Result<()> {
@@ -1125,9 +1156,7 @@ impl DocumentSession {
         if let Some(worker) = &self.recovery_worker {
             worker.clear_sync();
         } else if let Some(dir) = &self.recovery_dir {
-            for slot in [0u8, 1u8] {
-                let _ = fs::remove_file(dir.join(format!("current.slot{slot}.rec")));
-            }
+            remove_recovery_dir_files(dir);
         }
     }
 }
@@ -1145,6 +1174,21 @@ fn canonicalize_lossy(p: &Path) -> PathBuf {
         return resolved_parent.join(name);
     }
     p.to_path_buf()
+}
+
+fn normalize_session_path(p: &Path) -> PathBuf {
+    let has_relative_segments = p.is_relative()
+        || p.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        });
+    if has_relative_segments {
+        canonicalize_lossy(p)
+    } else {
+        p.to_path_buf()
+    }
 }
 
 fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
@@ -1169,12 +1213,18 @@ pub fn atomic_write_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 fn compute_snapshot_crc(
     revision: u64,
+    sequence: Option<u64>,
     content: &str,
     base: &str,
     theirs: Option<&str>,
 ) -> u32 {
     let mut h = crc32fast::Hasher::new();
     h.update(&revision.to_le_bytes());
+    if let Some(seq) = sequence {
+        h.update(b"seq=");
+        h.update(&seq.to_le_bytes());
+        h.update(b"\0");
+    }
     h.update(content.as_bytes());
     h.update(b"\0");
     h.update(base.as_bytes());
@@ -1200,8 +1250,9 @@ fn serialize_slot_report(r: &RecoverySlotReport) -> String {
     let theirs_len = r.theirs_content.as_ref().map(|s| s.len()).unwrap_or(0);
     let has_theirs = u8::from(r.theirs_content.is_some());
     let mut out = format!(
-        "VELLMARK_REC_V1\nslot={}\nrev={}\nstate={}\ncrc32={}\ncontent_len={}\nbase_len={}\nhas_theirs={}\ntheirs_len={}\n---\n",
+        "VELLMARK_REC_V1\nslot={}\nseq={}\nrev={}\nstate={}\ncrc32={}\ncontent_len={}\nbase_len={}\nhas_theirs={}\ntheirs_len={}\n---\n",
         r.slot,
+        r.sequence,
         r.revision,
         state_tag,
         r.crc32,
@@ -1225,6 +1276,7 @@ fn deserialize_and_verify_slot_report(raw: &str) -> Option<RecoverySlotReport> {
         return None;
     }
     let mut slot = 0u8;
+    let mut seq: Option<u64> = None;
     let mut revision = 0u64;
     let mut state = DocState::Dirty;
     let mut crc32 = 0u32;
@@ -1237,6 +1289,7 @@ fn deserialize_and_verify_slot_report(raw: &str) -> Option<RecoverySlotReport> {
         let (k, v) = line.split_once('=')?;
         match k {
             "slot" => slot = v.parse().ok()?,
+            "seq" => seq = Some(v.parse().ok()?),
             "rev" => revision = v.parse().ok()?,
             "state" => {
                 state = match v {
@@ -1277,6 +1330,7 @@ fn deserialize_and_verify_slot_report(raw: &str) -> Option<RecoverySlotReport> {
 
     let expected_crc = compute_snapshot_crc(
         revision,
+        seq,
         &content,
         &base_content,
         theirs_content.as_deref(),
@@ -1287,6 +1341,7 @@ fn deserialize_and_verify_slot_report(raw: &str) -> Option<RecoverySlotReport> {
 
     Some(RecoverySlotReport {
         slot,
+        sequence: seq.unwrap_or(0),
         revision,
         state,
         content,
@@ -1294,6 +1349,754 @@ fn deserialize_and_verify_slot_report(raw: &str) -> Option<RecoverySlotReport> {
         theirs_content,
         crc32,
     })
+}
+
+/// Sidecar JSON filename stored alongside `current.slot{0,1}.rec` inside each recovery dir.
+pub const RECOVERY_META_FILENAME: &str = "recovery-meta.json";
+
+/// Metadata sidecar identifying the document path and last recovery snapshot timestamp (PRD 4.5.1 F).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryMeta {
+    pub source_path: Option<PathBuf>,
+    pub updated_unix_secs: u64,
+}
+
+/// Unrecovered crash snapshot discovered under `recovery_root` on application startup (PRD 4.5.1 F).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRecoveryEntry {
+    pub recovery_dir: PathBuf,
+    pub source_path: Option<PathBuf>,
+    pub updated_unix_secs: Option<u64>,
+    pub report: RecoverySlotReport,
+}
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn remove_recovery_dir_files(dir: &Path) {
+    for slot in [0u8, 1u8] {
+        let _ = fs::remove_file(dir.join(format!("current.slot{slot}.rec")));
+    }
+    let _ = fs::remove_file(dir.join(RECOVERY_META_FILENAME));
+}
+
+fn json_escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn serialize_recovery_meta_json(meta: &RecoveryMeta) -> String {
+    let path_json = match &meta.source_path {
+        Some(p) => json_escape_str(&p.to_string_lossy()),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"source_path\":{path_json},\"updated_unix_secs\":{}}}\n",
+        meta.updated_unix_secs
+    )
+}
+
+fn parse_json_string_at(raw: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = raw.as_bytes();
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut i = start + 1;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            return Some((out, i + 1));
+        }
+        if b == b'\\' {
+            i += 1;
+            let esc = *bytes.get(i)?;
+            match esc {
+                b'"' => out.push('"'),
+                b'\\' => out.push('\\'),
+                b'/' => out.push('/'),
+                b'n' => out.push('\n'),
+                b'r' => out.push('\r'),
+                b't' => out.push('\t'),
+                b'b' => out.push('\u{0008}'),
+                b'f' => out.push('\u{000C}'),
+                b'u' => {
+                    let hex = raw.get(i + 1..i + 5)?;
+                    let code = u32::from_str_radix(hex, 16).ok()?;
+                    let ch = char::from_u32(code)?;
+                    out.push(ch);
+                    i += 4;
+                }
+                _ => return None,
+            }
+            i += 1;
+            continue;
+        }
+        let ch = raw[i..].chars().next()?;
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    None
+}
+
+fn deserialize_recovery_meta_json(raw: &str) -> Option<RecoveryMeta> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let mut i = 1usize;
+    let end = bytes.len() - 1;
+    let mut source_path: Option<PathBuf> = None;
+    let mut updated_unix_secs: Option<u64> = None;
+
+    while i < end {
+        while i < end && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= end {
+            break;
+        }
+        let (key, after_key) = parse_json_string_at(trimmed, i)?;
+        i = after_key;
+        while i < end && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        i += 1;
+        while i < end && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if trimmed[i..end].starts_with("null") {
+            if key == "source_path" {
+                source_path = None;
+            }
+            i += 4;
+        } else if bytes.get(i) == Some(&b'"') {
+            let (val, after_val) = parse_json_string_at(trimmed, i)?;
+            if key == "source_path" {
+                source_path = Some(PathBuf::from(val));
+            }
+            i = after_val;
+        } else {
+            let num_start = i;
+            while i < end && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == num_start {
+                return None;
+            }
+            let num = trimmed[num_start..i].parse::<u64>().ok()?;
+            if key == "updated_unix_secs" {
+                updated_unix_secs = Some(num);
+            }
+        }
+    }
+
+    Some(RecoveryMeta {
+        source_path,
+        updated_unix_secs: updated_unix_secs.unwrap_or(0),
+    })
+}
+
+/// Recursively scan `recovery_root` for unrecovered crash snapshots (`current.slot*.rec` +
+/// optional `recovery-meta.json`) up to bounded subdirectory depth (PRD 4.5.1 F).
+pub fn scan_recovery_root(recovery_root: impl AsRef<Path>) -> Vec<PendingRecoveryEntry> {
+    let mut out = Vec::new();
+    scan_recovery_dir_recursive(recovery_root.as_ref(), 0, &mut out);
+    out.sort_by(|a, b| {
+        b.updated_unix_secs
+            .unwrap_or(0)
+            .cmp(&a.updated_unix_secs.unwrap_or(0))
+            .then_with(|| a.recovery_dir.cmp(&b.recovery_dir))
+    });
+    out
+}
+
+fn scan_recovery_dir_recursive(dir: &Path, depth: usize, out: &mut Vec<PendingRecoveryEntry>) {
+    if depth > 4 || !dir.is_dir() {
+        return;
+    }
+    if let Some(report) = DocumentSession::read_latest_intact_snapshot(dir) {
+        let meta = fs::read_to_string(dir.join(RECOVERY_META_FILENAME))
+            .ok()
+            .and_then(|s| deserialize_recovery_meta_json(&s));
+        let (source_path, updated_unix_secs) = match meta {
+            Some(m) => (m.source_path, Some(m.updated_unix_secs)),
+            None => (None, None),
+        };
+        out.push(PendingRecoveryEntry {
+            recovery_dir: dir.to_path_buf(),
+            source_path,
+            updated_unix_secs,
+            report,
+        });
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            scan_recovery_dir_recursive(&entry.path(), depth + 1, out);
+        }
+    }
+}
+
+/// A line-level conflicting region where local and disk edits overlapped relative to `base`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeConflictHunk {
+    /// 0-based starting line index in `base`.
+    pub base_start_line: usize,
+    /// 0-based exclusive ending line index in `base`.
+    pub base_end_line: usize,
+    /// Conflicting line content from the local editor buffer.
+    pub ours_lines: Vec<String>,
+    /// Conflicting line content from the external disk file.
+    pub theirs_lines: Vec<String>,
+}
+
+/// Outcome of attempting automatic three-way conflict resolution (PRD 4.5.1 D).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoMergeOutcome {
+    /// Non-overlapping three-way merge succeeded and produced dirty local buffer state.
+    MergedDirty { merged_bytes: usize },
+    /// Both sides converged identically to disk; session returned to `Clean`.
+    MergedClean,
+    /// Overlapping changes detected; buffer and `DocState::Conflict` left untouched.
+    HasOverlappingConflicts {
+        conflicting_hunks: Vec<MergeConflictHunk>,
+    },
+    /// File disappeared on disk; transitioned to `MissingFile`.
+    TransitionedToMissing,
+    /// Precondition, TOCTOU, encoding, or I/O failure; remains in `Conflict`.
+    AbortedStillConflict(String),
+}
+
+impl DocumentSession {
+    /// Attempt line-level three-way auto-merge between `self.base`, current buffer (`ours`),
+    /// and live disk (`theirs`) per PRD 4.5.1 D.
+    ///
+    /// Succeeds cleanly when hunks do not overlap; aborts without altering the buffer and returns
+    /// `HasOverlappingConflicts` (staying in `Conflict`) if any hunks conflict.
+    pub fn resolve_conflict_auto_merge(&mut self, captured_revision: u64) -> AutoMergeOutcome {
+        if self.buffer.revision() != captured_revision {
+            return AutoMergeOutcome::AbortedStillConflict(
+                "document changed before auto-merge executed".to_string(),
+            );
+        }
+        let Some(path) = self.path.clone() else {
+            return AutoMergeOutcome::AbortedStillConflict("no path".to_string());
+        };
+        if self.state != DocState::Conflict {
+            return AutoMergeOutcome::AbortedStillConflict("not in conflict".to_string());
+        }
+        let Some(expected_theirs) = self.theirs.clone() else {
+            return AutoMergeOutcome::AbortedStillConflict("missing external snapshot".to_string());
+        };
+
+        let disk_bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => {
+                self.on_external_deleted();
+                return AutoMergeOutcome::TransitionedToMissing;
+            }
+        };
+
+        let disk_text = match detect_and_decode(&disk_bytes) {
+            Ok((text, _)) => text,
+            Err(e) => {
+                self.theirs = Some(DiskSnapshot::from_undecodable_bytes(&disk_bytes));
+                let _ = self.flush_current_recovery_snapshot();
+                return AutoMergeOutcome::AbortedStillConflict(format!(
+                    "disk content is not valid text ({e}); cannot auto-merge"
+                ));
+            }
+        };
+
+        let latest_disk = DiskSnapshot::from_str(&disk_text);
+        if expected_theirs.raw_bytes.is_some()
+            || latest_disk.crc32 != expected_theirs.crc32
+            || latest_disk.len_bytes != expected_theirs.len_bytes
+        {
+            self.theirs = Some(latest_disk);
+            let _ = self.flush_current_recovery_snapshot();
+            return AutoMergeOutcome::AbortedStillConflict(
+                "disk content changed again before auto-merge; refreshed theirs".to_string(),
+            );
+        }
+
+        let base_text = self.base.rope.to_string();
+        let ours_text = self.buffer.to_string();
+        match three_way_merge_lines(&base_text, &ours_text, &disk_text) {
+            Ok(merged) => {
+                if let Err(e) = self.write_historical_backup("conflict-pre-merge-mine", &ours_text)
+                {
+                    return AutoMergeOutcome::AbortedStillConflict(format!(
+                        "failed to write historical backup: {e}"
+                    ));
+                }
+                let old_len = self.buffer.len_bytes();
+                let merged_len = merged.len();
+                self.undo.apply_edit(
+                    &mut self.buffer,
+                    ByteRange::new(0, old_len),
+                    &merged,
+                    Selection::caret(0),
+                    Selection::caret(merged_len),
+                    EditKind::Structural,
+                );
+                self.base = latest_disk;
+                self.theirs = None;
+                if merged == disk_text {
+                    self.state = DocState::Clean;
+                    self.clear_current_recovery_snapshot();
+                    AutoMergeOutcome::MergedClean
+                } else {
+                    self.state = DocState::Dirty;
+                    let _ = self.flush_current_recovery_snapshot();
+                    AutoMergeOutcome::MergedDirty {
+                        merged_bytes: merged_len,
+                    }
+                }
+            }
+            Err(conflicting_hunks) => AutoMergeOutcome::HasOverlappingConflicts {
+                conflicting_hunks,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiffHunk {
+    base_start: usize,
+    base_end: usize,
+    side_start: usize,
+    side_end: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MergeLine<'a> {
+    content: &'a str,
+    eol: &'a str,
+    raw: &'a str,
+}
+
+fn split_lines_with_eol(text: &str) -> Vec<MergeLine<'_>> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' {
+            let content_end = if i > start && bytes[i - 1] == b'\r' {
+                i - 1
+            } else {
+                i
+            };
+            out.push(MergeLine {
+                content: &text[start..content_end],
+                eol: &text[content_end..i + 1],
+                raw: &text[start..i + 1],
+            });
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if start < bytes.len() {
+        out.push(MergeLine {
+            content: &text[start..],
+            eol: "",
+            raw: &text[start..],
+        });
+    }
+    out
+}
+
+fn lcs_matching_lines<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    let min_len = a.len().min(b.len());
+    let mut prefix = 0usize;
+    while prefix < min_len && a[prefix] == b[prefix] {
+        pairs.push((prefix, prefix));
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while prefix + suffix < min_len && a[a.len() - 1 - suffix] == b[b.len() - 1 - suffix] {
+        suffix += 1;
+    }
+
+    let a_end = a.len() - suffix;
+    let b_end = b.len() - suffix;
+    if prefix < a_end && prefix < b_end {
+        let anchors = unique_line_anchors(&a[prefix..a_end], &b[prefix..b_end]);
+        let mut prev_a = prefix;
+        let mut prev_b = prefix;
+        for (rel_a, rel_b) in anchors {
+            let abs_a = prefix + rel_a;
+            let abs_b = prefix + rel_b;
+            lcs_small_gap(a, prev_a, abs_a, b, prev_b, abs_b, &mut pairs);
+            pairs.push((abs_a, abs_b));
+            prev_a = abs_a + 1;
+            prev_b = abs_b + 1;
+        }
+        lcs_small_gap(a, prev_a, a_end, b, prev_b, b_end, &mut pairs);
+    }
+
+    for k in (0..suffix).rev() {
+        pairs.push((a.len() - 1 - k, b.len() - 1 - k));
+    }
+    pairs
+}
+
+fn unique_line_anchors<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(usize, usize)> {
+    use std::collections::HashMap;
+    let mut count_a: HashMap<&'a str, usize> = HashMap::with_capacity(a.len());
+    let mut pos_a: HashMap<&'a str, usize> = HashMap::with_capacity(a.len());
+    for (idx, &line) in a.iter().enumerate() {
+        *count_a.entry(line).or_insert(0) += 1;
+        pos_a.entry(line).or_insert(idx);
+    }
+    let mut count_b: HashMap<&'a str, usize> = HashMap::with_capacity(b.len());
+    let mut pos_b: HashMap<&'a str, usize> = HashMap::with_capacity(b.len());
+    for (idx, &line) in b.iter().enumerate() {
+        *count_b.entry(line).or_insert(0) += 1;
+        pos_b.entry(line).or_insert(idx);
+    }
+
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
+    for (line, &ca) in &count_a {
+        if ca == 1 && count_b.get(line) == Some(&1) {
+            candidates.push((pos_a[line], pos_b[line]));
+        }
+    }
+    candidates.sort_unstable_by_key(|&(ai, _)| ai);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    // Standard O(K log K) LIS by `bi`
+    let mut tails: Vec<usize> = Vec::new();
+    let mut tail_indices: Vec<usize> = Vec::new();
+    let mut prev = vec![usize::MAX; candidates.len()];
+    for (idx, &(_, bi)) in candidates.iter().enumerate() {
+        let pos = tails.partition_point(|&x| x < bi);
+        if pos == tails.len() {
+            tails.push(bi);
+            tail_indices.push(idx);
+        } else {
+            tails[pos] = bi;
+            tail_indices[pos] = idx;
+        }
+        if pos > 0 {
+            prev[idx] = tail_indices[pos - 1];
+        }
+    }
+
+    let mut lis = Vec::new();
+    let mut cur = *tail_indices.last().unwrap();
+    while cur != usize::MAX {
+        lis.push(candidates[cur]);
+        cur = prev[cur];
+    }
+    lis.reverse();
+    lis
+}
+
+fn lcs_small_gap<'a>(
+    a: &[&'a str],
+    mut a_lo: usize,
+    mut a_hi: usize,
+    b: &[&'a str],
+    mut b_lo: usize,
+    mut b_hi: usize,
+    out: &mut Vec<(usize, usize)>,
+) {
+    while a_lo < a_hi && b_lo < b_hi && a[a_lo] == b[b_lo] {
+        out.push((a_lo, b_lo));
+        a_lo += 1;
+        b_lo += 1;
+    }
+    let mut suffix_pairs = Vec::new();
+    while a_lo < a_hi && b_lo < b_hi && a[a_hi - 1] == b[b_hi - 1] {
+        a_hi -= 1;
+        b_hi -= 1;
+        suffix_pairs.push((a_hi, b_hi));
+    }
+
+    let m = a_hi - a_lo;
+    let n = b_hi - b_lo;
+    if m > 0 && n > 0 && m.saturating_mul(n) <= 2_500_000 {
+        let cols = n + 1;
+        let mut dp = vec![0u32; (m + 1) * cols];
+        for i in (0..m).rev() {
+            for j in (0..n).rev() {
+                dp[i * cols + j] = if a[a_lo + i] == b[b_lo + j] {
+                    dp[(i + 1) * cols + (j + 1)] + 1
+                } else {
+                    dp[(i + 1) * cols + j].max(dp[i * cols + (j + 1)])
+                };
+            }
+        }
+        let mut i = 0usize;
+        let mut j = 0usize;
+        while i < m && j < n {
+            if a[a_lo + i] == b[b_lo + j] {
+                out.push((a_lo + i, b_lo + j));
+                i += 1;
+                j += 1;
+            } else if dp[(i + 1) * cols + j] >= dp[i * cols + (j + 1)] {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+    }
+
+    while let Some(pair) = suffix_pairs.pop() {
+        out.push(pair);
+    }
+}
+
+fn diff_line_hunks(base: &[MergeLine<'_>], side: &[MergeLine<'_>]) -> Vec<DiffHunk> {
+    let base_raw: Vec<&str> = base.iter().map(|l| l.raw).collect();
+    let side_raw: Vec<&str> = side.iter().map(|l| l.raw).collect();
+    let mut matches = lcs_matching_lines(&base_raw, &side_raw);
+    matches.push((base.len(), side.len()));
+
+    let mut hunks = Vec::new();
+    let mut cur_b = 0usize;
+    let mut cur_s = 0usize;
+    for (mb, ms) in matches {
+        if cur_b < mb || cur_s < ms {
+            hunks.push(DiffHunk {
+                base_start: cur_b,
+                base_end: mb,
+                side_start: cur_s,
+                side_end: ms,
+            });
+        }
+        cur_b = mb + 1;
+        cur_s = ms + 1;
+    }
+    hunks
+}
+
+fn hunks_conflict_or_touch(
+    a: DiffHunk,
+    b: DiffHunk,
+    side_a: &[MergeLine<'_>],
+    side_b: &[MergeLine<'_>],
+) -> Option<bool> {
+    // Returns Some(true) if strictly conflict, Some(false) if identical changes, None if disjoint.
+    let a_empty = a.base_start == a.base_end;
+    let b_empty = b.base_start == b.base_end;
+    let overlaps = if a_empty && b_empty {
+        a.base_start == b.base_start
+    } else if a_empty {
+        b.base_start < a.base_start && a.base_start < b.base_end
+    } else if b_empty {
+        a.base_start < b.base_start && b.base_start < a.base_end
+    } else {
+        a.base_start < b.base_end && b.base_start < a.base_end
+    };
+
+    if !overlaps {
+        return None;
+    }
+    let same = a.base_start == b.base_start
+        && a.base_end == b.base_end
+        && side_a[a.side_start..a.side_end]
+            .iter()
+            .map(|l| l.raw)
+            .eq(side_b[b.side_start..b.side_end].iter().map(|l| l.raw));
+    Some(!same)
+}
+
+fn hunk_before(a: DiffHunk, b: DiffHunk) -> bool {
+    if a.base_start != b.base_start {
+        return a.base_start < b.base_start;
+    }
+    // Same start: pure insertion at `pos` precedes replacement `[pos..end)` when not overlapping
+    a.base_start == a.base_end && b.base_start < b.base_end
+}
+
+fn reconstruct_side_slice_in_span(
+    base: &[MergeLine<'_>],
+    side: &[MergeLine<'_>],
+    hunks: &[DiffHunk],
+    span_start: usize,
+    span_end: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cursor = span_start;
+    for &h in hunks {
+        while cursor < h.base_start {
+            lines.push(base[cursor].content.to_string());
+            cursor += 1;
+        }
+        for l in &side[h.side_start..h.side_end] {
+            lines.push(l.content.to_string());
+        }
+        cursor = h.base_end;
+    }
+    while cursor < span_end {
+        lines.push(base[cursor].content.to_string());
+        cursor += 1;
+    }
+    lines
+}
+
+fn three_way_merge_lines(
+    base_str: &str,
+    ours_str: &str,
+    theirs_str: &str,
+) -> Result<String, Vec<MergeConflictHunk>> {
+    let base = split_lines_with_eol(base_str);
+    let ours = split_lines_with_eol(ours_str);
+    let theirs = split_lines_with_eol(theirs_str);
+    let dominant_eol = crate::encoding::LineEnding::detect_dominant(base_str).as_str();
+
+    let ours_hunks = diff_line_hunks(&base, &ours);
+    let theirs_hunks = diff_line_hunks(&base, &theirs);
+
+    let mut merged_lines: Vec<MergeLine<'_>> = Vec::new();
+    let mut conflicts: Vec<MergeConflictHunk> = Vec::new();
+    let mut base_cursor = 0usize;
+    let mut oi = 0usize;
+    let mut ti = 0usize;
+
+    while oi < ours_hunks.len() || ti < theirs_hunks.len() {
+        match (ours_hunks.get(oi).copied(), theirs_hunks.get(ti).copied()) {
+            (Some(oh), None) => {
+                merged_lines.extend_from_slice(&base[base_cursor..oh.base_start]);
+                merged_lines.extend_from_slice(&ours[oh.side_start..oh.side_end]);
+                base_cursor = oh.base_end;
+                oi += 1;
+            }
+            (None, Some(th)) => {
+                merged_lines.extend_from_slice(&base[base_cursor..th.base_start]);
+                merged_lines.extend_from_slice(&theirs[th.side_start..th.side_end]);
+                base_cursor = th.base_end;
+                ti += 1;
+            }
+            (Some(oh), Some(th)) => match hunks_conflict_or_touch(oh, th, &ours, &theirs) {
+                None => {
+                    if hunk_before(oh, th) {
+                        merged_lines.extend_from_slice(&base[base_cursor..oh.base_start]);
+                        merged_lines.extend_from_slice(&ours[oh.side_start..oh.side_end]);
+                        base_cursor = oh.base_end;
+                        oi += 1;
+                    } else {
+                        merged_lines.extend_from_slice(&base[base_cursor..th.base_start]);
+                        merged_lines.extend_from_slice(&theirs[th.side_start..th.side_end]);
+                        base_cursor = th.base_end;
+                        ti += 1;
+                    }
+                }
+                Some(false) => {
+                    // Identical modification in both `ours` and `theirs`
+                    merged_lines.extend_from_slice(&base[base_cursor..oh.base_start]);
+                    merged_lines.extend_from_slice(&ours[oh.side_start..oh.side_end]);
+                    base_cursor = oh.base_end;
+                    oi += 1;
+                    ti += 1;
+                }
+                Some(true) => {
+                    // Grow transitive overlapping conflict cluster
+                    let c_start = oh.base_start.min(th.base_start);
+                    let mut c_end = oh.base_end.max(th.base_end);
+                    let oi_start = oi;
+                    let ti_start = ti;
+                    oi += 1;
+                    ti += 1;
+                    loop {
+                        let mut extended = false;
+                        if let Some(&next_o) = ours_hunks.get(oi) {
+                            if next_o.base_start < c_end {
+                                c_end = c_end.max(next_o.base_end);
+                                oi += 1;
+                                extended = true;
+                            }
+                        }
+                        if let Some(&next_t) = theirs_hunks.get(ti) {
+                            if next_t.base_start < c_end {
+                                c_end = c_end.max(next_t.base_end);
+                                ti += 1;
+                                extended = true;
+                            }
+                        }
+                        if !extended {
+                            break;
+                        }
+                    }
+                    conflicts.push(MergeConflictHunk {
+                        base_start_line: c_start,
+                        base_end_line: c_end,
+                        ours_lines: reconstruct_side_slice_in_span(
+                            &base,
+                            &ours,
+                            &ours_hunks[oi_start..oi],
+                            c_start,
+                            c_end,
+                        ),
+                        theirs_lines: reconstruct_side_slice_in_span(
+                            &base,
+                            &theirs,
+                            &theirs_hunks[ti_start..ti],
+                            c_start,
+                            c_end,
+                        ),
+                    });
+                    base_cursor = c_end;
+                }
+            },
+            (None, None) => break,
+        }
+    }
+
+    if !conflicts.is_empty() {
+        return Err(conflicts);
+    }
+
+    merged_lines.extend_from_slice(&base[base_cursor..]);
+    let mut out = String::new();
+    for (idx, line) in merged_lines.iter().enumerate() {
+        out.push_str(line.content);
+        if idx + 1 < merged_lines.len() {
+            if line.eol.is_empty() {
+                out.push_str(dominant_eol);
+            } else {
+                out.push_str(line.eol);
+            }
+        } else if !line.eol.is_empty() {
+            out.push_str(line.eol);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1886,5 +2689,236 @@ mod tests {
 
         drop(session);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prd_4_5_1_f_recovery_meta_and_scan_recovery_root() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("vellmark_rec_scan_{nanos}"));
+        let rec_root = root.join("recovery");
+        let docs_dir = root.join("docs");
+        fs::create_dir_all(&docs_dir).unwrap();
+
+        let note_a = docs_dir.join("a \"draft\"\\note.md");
+        fs::create_dir_all(note_a.parent().unwrap()).unwrap();
+        fs::write(&note_a, "Original A").unwrap();
+
+        let note_clean = docs_dir.join("clean.md");
+        fs::write(&note_clean, "Clean").unwrap();
+
+        // Session 1 (crashed file-backed doc) + Session 2 (crashed untitled) + Session 3 (cleanly saved)
+        {
+            let mut s1 = DocumentSession::open_file(&note_a, Some(rec_root.join("s1-tab-1"))).unwrap();
+            let mut v1 = EditorViewState::default();
+            s1.with_editor_view(&mut v1, |ctx| ctx.insert_text("Unsaved edit A")).unwrap();
+            s1.flush_current_recovery_snapshot().unwrap();
+
+            let mut s2 = DocumentSession::new_untitled(Some(rec_root.join("nested").join("s2-tab-1")));
+            let mut v2 = EditorViewState::default();
+            s2.with_editor_view(&mut v2, |ctx| ctx.insert_text("Untitled crash draft")).unwrap();
+            s2.flush_current_recovery_snapshot().unwrap();
+
+            let mut s3 = DocumentSession::open_file(&note_clean, Some(rec_root.join("s3-tab-1"))).unwrap();
+            let mut v3 = EditorViewState::default();
+            s3.with_editor_view(&mut v3, |ctx| ctx.insert_text(" saved")).unwrap();
+            s3.flush_current_recovery_snapshot().unwrap();
+            assert_eq!(s3.save(), SaveOutcome::SavedClean);
+        }
+
+        let found = scan_recovery_root(&rec_root);
+        assert_eq!(found.len(), 2);
+        let file_entry = found
+            .iter()
+            .find(|e| e.source_path.as_ref() == Some(&note_a))
+            .expect("file-backed recovery entry must preserve exact source_path");
+        assert!(file_entry.report.content.contains("Unsaved edit A"));
+        assert!(file_entry.updated_unix_secs.unwrap_or(0) > 0);
+
+        let untitled_entry = found
+            .iter()
+            .find(|e| e.source_path.is_none())
+            .expect("untitled recovery entry must be discovered with source_path: None");
+        assert_eq!(untitled_entry.report.content, "Untitled crash draft");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_prd_4_5_1_d_three_way_auto_merge_disjoint_and_overlapping_conflicts() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("vellmark_3way_merge_{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+
+        // 1. Disjoint CRLF modifications auto-merge cleanly
+        let merge_path = dir.join("disjoint.md");
+        let base_text = "# Header\r\nLine 1 base\r\nLine 2 shared\r\nLine 3 base\r\n";
+        fs::write(&merge_path, base_text).unwrap();
+
+        let mut session = DocumentSession::open_file(&merge_path, Some(dir.join("rec1"))).unwrap();
+        let mut view = EditorViewState::default();
+        // Local edit on Line 1
+        session
+            .with_editor_view(&mut view, |ctx| {
+                ctx.set_caret("# Header\r\n".len());
+                ctx.insert_text("Local ");
+            })
+            .unwrap();
+        // External disk edit on Line 3
+        let theirs_text = "# Header\r\nLine 1 base\r\nLine 2 shared\r\nLine 3 from disk\r\n";
+        fs::write(&merge_path, theirs_text).unwrap();
+
+        assert_eq!(session.save(), SaveOutcome::EnteredConflict);
+        let rev = session.buffer.revision();
+        let outcome = session.resolve_conflict_auto_merge(rev);
+        assert!(matches!(outcome, AutoMergeOutcome::MergedDirty { .. }));
+        assert_eq!(session.state, DocState::Dirty);
+        assert!(session.theirs.is_none());
+        assert_eq!(
+            session.buffer.to_string(),
+            "# Header\r\nLocal Line 1 base\r\nLine 2 shared\r\nLine 3 from disk\r\n"
+        );
+        assert_eq!(session.save(), SaveOutcome::SavedClean);
+
+        // 2. Overlapping edits stay in Conflict and report conflicting hunk
+        let conflict_path = dir.join("overlap.md");
+        fs::write(&conflict_path, "Line 0\nTarget base\nLine 2\n").unwrap();
+        let mut s_overlap =
+            DocumentSession::open_file(&conflict_path, Some(dir.join("rec2"))).unwrap();
+        let mut v_overlap = EditorViewState::default();
+        let pos = "Line 0\n".len();
+        s_overlap
+            .with_editor_view(&mut v_overlap, |ctx| {
+                ctx.set_caret(pos);
+                ctx.insert_text("Ours: ");
+            })
+            .unwrap();
+        fs::write(&conflict_path, "Line 0\nTheirs edit\nLine 2\n").unwrap();
+        assert_eq!(s_overlap.save(), SaveOutcome::EnteredConflict);
+        let snap_before = s_overlap.buffer.to_string();
+        let rev2 = s_overlap.buffer.revision();
+
+        let err_outcome = s_overlap.resolve_conflict_auto_merge(rev2);
+        match err_outcome {
+            AutoMergeOutcome::HasOverlappingConflicts { conflicting_hunks } => {
+                assert_eq!(conflicting_hunks.len(), 1);
+                assert_eq!(conflicting_hunks[0].base_start_line, 1);
+                assert_eq!(conflicting_hunks[0].base_end_line, 2);
+                assert_eq!(conflicting_hunks[0].ours_lines, vec!["Ours: Target base"]);
+                assert_eq!(conflicting_hunks[0].theirs_lines, vec!["Theirs edit"]);
+            }
+            other => panic!("expected HasOverlappingConflicts, got {other:?}"),
+        }
+        assert_eq!(s_overlap.state, DocState::Conflict);
+        assert_eq!(s_overlap.buffer.to_string(), snap_before);
+
+        drop(session);
+        drop(s_overlap);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_three_way_merge_preserves_trailing_newline_deletion_and_eol_changes() {
+        // Local edits line 1 while external disk deletes trailing newline: merge must NOT restore `\n`.
+        let merged = three_way_merge_lines(
+            "Line 1 base\nLine 2 base\n",
+            "Line 1 edited\nLine 2 base\n",
+            "Line 1 base\nLine 2 base",
+        )
+        .expect("disjoint edit + trailing newline deletion must merge cleanly");
+        assert_eq!(merged, "Line 1 edited\nLine 2 base");
+
+        // External disk adds missing trailing newline while local edits line 1.
+        let merged_added = three_way_merge_lines(
+            "Line 1 base\nLine 2 base",
+            "Line 1 edited\nLine 2 base",
+            "Line 1 base\nLine 2 base\n",
+        )
+        .expect("disjoint edit + trailing newline addition must merge cleanly");
+        assert_eq!(merged_added, "Line 1 edited\nLine 2 base\n");
+
+        // Conflicting edit vs trailing newline deletion on the same line reports conflict rather than silent drop.
+        let conflict = three_way_merge_lines("Only line\n", "Only line", "Only line\r\n");
+        assert!(conflict.is_err());
+    }
+
+    #[test]
+    fn test_recovery_scan_prefers_conflict_over_earlier_dirty_with_same_revision() {
+        let dir = unique_temp_dir("same-rev-slot-order");
+        let file_path = dir.join("doc.md");
+        let rec_dir = dir.join("recovery");
+        fs::write(&file_path, "Base\n").unwrap();
+
+        let mut session = DocumentSession::open_file(&file_path, Some(rec_dir.clone())).unwrap();
+        session.edit(
+            ByteRange::new(5, 5),
+            "Mine\n",
+            Selection::caret(5),
+            Selection::caret(10),
+            EditKind::Typing,
+        );
+        let rev_after_edit = session.buffer.revision();
+        // Flush 1: Dirty snapshot written to slot 1
+        session.flush_current_recovery_snapshot().unwrap();
+        let snap1 = DocumentSession::read_latest_intact_snapshot(&rec_dir).unwrap();
+        assert_eq!(snap1.slot, 1);
+        assert_eq!(snap1.state, DocState::Dirty);
+        assert_eq!(snap1.revision, rev_after_edit);
+
+        // External modification moves session to Conflict with the exact same buffer revision
+        session.on_external_modified("Base\nDisk version\n");
+        assert_eq!(session.state, DocState::Conflict);
+        assert_eq!(session.buffer.revision(), rev_after_edit);
+        session.flush_current_recovery_snapshot().unwrap(); // Written to slot 0
+
+        let latest = DocumentSession::read_latest_intact_snapshot(&rec_dir).unwrap();
+        assert_eq!(latest.slot, 0);
+        assert_eq!(latest.state, DocState::Conflict);
+        assert_eq!(latest.theirs_content.as_deref(), Some("Base\nDisk version\n"));
+
+        let scanned = scan_recovery_root(&rec_dir);
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].report.state, DocState::Conflict);
+        assert!(scanned[0].report.sequence > snap1.sequence);
+
+        drop(session);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_recovery_meta_stabilizes_relative_source_path() {
+        let root = unique_temp_dir("rel-recovery-path");
+        let rec_root = root.join("recovery");
+        let rec_dir = rec_root.join("tab-1");
+        let rel_path = Path::new("src/../Cargo.toml");
+        let expected_canonical = fs::canonicalize("Cargo.toml").unwrap();
+
+        let mut session = DocumentSession::open_file(rel_path, Some(rec_dir)).unwrap();
+        assert!(
+            session.path.as_ref().unwrap().is_absolute(),
+            "relative open path must normalize to stable absolute path"
+        );
+        assert_eq!(session.path.as_ref().unwrap(), &expected_canonical);
+
+        session.edit(
+            ByteRange::empty(0),
+            "# draft\n",
+            Selection::caret(0),
+            Selection::caret(8),
+            EditKind::Typing,
+        );
+        session.flush_current_recovery_snapshot().unwrap();
+
+        let scanned = scan_recovery_root(&rec_root);
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].source_path.as_ref(), Some(&expected_canonical));
+
+        drop(session);
+        let _ = fs::remove_dir_all(&root);
     }
 }

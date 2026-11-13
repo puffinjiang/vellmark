@@ -16,6 +16,11 @@ pub enum EditKind {
         /// `None` for conversions like table separator insertion where removing the auto-inserted text suffices.
         escape_insert_at: Option<ByteOffset>,
     },
+    /// Automatic syntax conversion requiring multiple backslash escapes (e.g., `**bold**` -> `\*\*bold**`).
+    SyntaxConversionEscapes {
+        /// Up to 4 pre-escape byte offsets where `\` should be inserted on undo.
+        escape_insert_positions: [Option<ByteOffset>; 4],
+    },
     /// Structural edit, paste, table alignment, or external reload.
     Structural,
 }
@@ -133,6 +138,28 @@ impl UndoHistory {
         });
     }
 
+    /// Record a marker-only syntax conversion requiring multiple `\` escapes on 1st Undo
+    /// (for example `**bold**` -> `\*\*bold**` or `~~strike~~` -> `\~\~strike~~`).
+    pub fn record_syntax_trigger_offsets(
+        &mut self,
+        escape_positions: impl IntoIterator<Item = ByteOffset>,
+        selection: Selection,
+    ) {
+        self.redo_stack.clear();
+        let mut slots = [None; 4];
+        for (slot, pos) in slots.iter_mut().zip(escape_positions) {
+            *slot = Some(pos);
+        }
+        self.undo_stack.push(Transaction {
+            ops: Vec::new(),
+            selection_before: selection,
+            selection_after: selection,
+            kind: EditKind::SyntaxConversionEscapes {
+                escape_insert_positions: slots,
+            },
+        });
+    }
+
     pub fn record_transaction(&mut self, tx: Transaction) {
         self.redo_stack.clear();
 
@@ -162,66 +189,15 @@ impl UndoHistory {
 
         match tx.kind {
             EditKind::SyntaxConversion { escape_insert_at } => {
-                // First revert any auto-inserted companion text (e.g. closing fence or table separator row).
-                tx.apply_inverse(buf);
-
-                if let Some(esc_pos) = escape_insert_at {
-                    // Insert `\` at `esc_pos` in the buffer.
-                    let esc_op = syntax_conversion_escape_op(esc_pos);
-                    buf.replace_bytes(esc_op.range, &esc_op.inserted);
-
-                    // Always fold the inserted `\` into the preceding Typing transaction on the undo stack
-                    // so that a 2nd Undo removes both the `\` AND the user's typed text cleanly, even when
-                    // `esc_pos` was before `first_op.range.start` (e.g. file opened with `##` and user typed ` ` at offset 2).
-                    if let Some(prev) = self.undo_stack.last_mut() {
-                        if let Some(first_op) = prev.ops.first_mut() {
-                            if esc_pos >= first_op.range.start
-                                && esc_pos <= first_op.range.start + first_op.inserted.len()
-                            {
-                                let rel = esc_pos - first_op.range.start;
-                                first_op.inserted.insert(rel, '\\');
-                                prev.selection_after =
-                                    Selection::caret(prev.selection_after.head + 1);
-                            } else if esc_pos < first_op.range.start {
-                                // Shift any already-recorded ops after `esc_pos` right by 1 byte,
-                                // and prepend the `\` insertion op so 2nd Undo reverts both the `\` and the user's typing!
-                                for op in &mut prev.ops {
-                                    if op.range.start >= esc_pos {
-                                        op.range.start += 1;
-                                        op.range.end += 1;
-                                    }
-                                }
-                                prev.ops.insert(0, esc_op);
-                                prev.selection_after =
-                                    Selection::caret(prev.selection_after.head + 1);
-                            } else {
-                                prev.ops.push(esc_op);
-                                prev.selection_after =
-                                    Selection::caret(prev.selection_after.head + 1);
-                            }
-                        }
-                    }
-
-                    // Push an inverse transaction onto redo_stack so Redo restores the unescaped conversion.
-                    let mut redo_ops = vec![EditOp {
-                        range: ByteRange::new(esc_pos, esc_pos + 1),
-                        deleted: "\\".to_string(),
-                        inserted: String::new(),
-                    }];
-                    redo_ops.extend(tx.ops.clone());
-                    let new_sel = Selection::caret(tx.selection_before.head + 1);
-                    self.redo_stack.push(Transaction {
-                        ops: redo_ops,
-                        selection_before: new_sel,
-                        selection_after: tx.selection_after,
-                        kind: EditKind::Structural,
-                    });
-                    Some(new_sel)
-                } else {
-                    let sel = tx.selection_before;
-                    self.redo_stack.push(tx);
-                    Some(sel)
-                }
+                let positions: Vec<ByteOffset> = escape_insert_at.into_iter().collect();
+                Some(self.undo_syntax_conversion(buf, tx, positions))
+            }
+            EditKind::SyntaxConversionEscapes {
+                escape_insert_positions,
+            } => {
+                let positions: Vec<ByteOffset> =
+                    escape_insert_positions.into_iter().flatten().collect();
+                Some(self.undo_syntax_conversion(buf, tx, positions))
             }
             _ => {
                 tx.apply_inverse(buf);
@@ -232,12 +208,102 @@ impl UndoHistory {
         }
     }
 
+    fn undo_syntax_conversion(
+        &mut self,
+        buf: &mut TextBuffer,
+        tx: Transaction,
+        escape_positions: Vec<ByteOffset>,
+    ) -> Selection {
+        // First revert any auto-inserted companion text (e.g. closing fence or table separator row).
+        tx.apply_inverse(buf);
+
+        if escape_positions.is_empty() {
+            let sel = tx.selection_before;
+            self.redo_stack.push(tx);
+            return sel;
+        }
+
+        let mut descending = escape_positions;
+        descending.sort_unstable_by(|a, b| b.cmp(a));
+        descending.dedup();
+
+        // Insert backslashes from right to left so earlier byte offsets stay valid.
+        let mut standalone_escape_ops = Vec::new();
+        for &esc_pos in &descending {
+            let esc_op = syntax_conversion_escape_op(esc_pos);
+            buf.replace_bytes(esc_op.range, &esc_op.inserted);
+            if let Some(prev) = self.undo_stack.last_mut() {
+                fold_escape_into_prev_tx(prev, esc_pos, esc_op);
+            } else {
+                standalone_escape_ops.push(esc_op);
+            }
+        }
+
+        // Redo deletes backslashes left-to-right; each preceding deletion shifts later
+        // backslashes back to their original pre-escape offsets.
+        let mut redo_ops: Vec<EditOp> = descending
+            .iter()
+            .rev()
+            .map(|&esc_pos| EditOp {
+                range: ByteRange::new(esc_pos, esc_pos + 1),
+                deleted: "\\".to_string(),
+                inserted: String::new(),
+            })
+            .collect();
+        redo_ops.extend(tx.ops);
+        let shift = descending
+            .iter()
+            .filter(|&&p| p <= tx.selection_before.head)
+            .count();
+        let new_sel = Selection::caret(tx.selection_before.head + shift);
+        if !standalone_escape_ops.is_empty() {
+            self.undo_stack.push(Transaction {
+                ops: standalone_escape_ops,
+                selection_before: tx.selection_before,
+                selection_after: new_sel,
+                kind: EditKind::Structural,
+            });
+        }
+        self.redo_stack.push(Transaction {
+            ops: redo_ops,
+            selection_before: new_sel,
+            selection_after: tx.selection_after,
+            kind: EditKind::Structural,
+        });
+        new_sel
+    }
+
     pub fn redo(&mut self, buf: &mut TextBuffer) -> Option<Selection> {
         let tx = self.redo_stack.pop()?;
         tx.apply(buf);
         let sel = tx.selection_after;
         self.undo_stack.push(tx);
         Some(sel)
+    }
+}
+
+fn fold_escape_into_prev_tx(prev: &mut Transaction, esc_pos: ByteOffset, esc_op: EditOp) {
+    let Some(first_op) = prev.ops.first_mut() else {
+        prev.ops.push(esc_op);
+        prev.selection_after = Selection::caret(prev.selection_after.head + 1);
+        return;
+    };
+    if esc_pos >= first_op.range.start && esc_pos <= first_op.range.start + first_op.inserted.len() {
+        let rel = esc_pos - first_op.range.start;
+        first_op.inserted.insert(rel, '\\');
+        prev.selection_after = Selection::caret(prev.selection_after.head + 1);
+    } else if esc_pos < first_op.range.start {
+        for op in &mut prev.ops {
+            if op.range.start >= esc_pos {
+                op.range.start += 1;
+                op.range.end += 1;
+            }
+        }
+        prev.ops.insert(0, esc_op);
+        prev.selection_after = Selection::caret(prev.selection_after.head + 1);
+    } else {
+        prev.ops.push(esc_op);
+        prev.selection_after = Selection::caret(prev.selection_after.head + 1);
     }
 }
 
@@ -359,5 +425,45 @@ mod tests {
         let sel2 = hist.undo(&mut buf).unwrap();
         assert_eq!(buf.to_string(), "##");
         assert_eq!(sel2, Selection::caret(2));
+    }
+
+    #[test]
+    fn test_open_existing_code_fence_enter_then_two_undos_leaves_no_backslash() {
+        // Opened file containing an existing code fence (empty undo_stack),
+        // user presses Enter -> closing fence inserted, then Undo twice restores exact ` ``` `.
+        let mut buf = TextBuffer::from_str("```");
+        let mut hist = UndoHistory::new();
+
+        hist.apply_edit(
+            &mut buf,
+            ByteRange::empty(3),
+            "\n\n```",
+            Selection::caret(3),
+            Selection::caret(4),
+            EditKind::SyntaxConversion {
+                escape_insert_at: Some(0),
+            },
+        );
+        assert_eq!(buf.to_string(), "```\n\n```");
+
+        // 1st Undo removes auto-inserted closing fence and escapes opening ```
+        let sel1 = hist.undo(&mut buf).unwrap();
+        assert_eq!(buf.to_string(), "\\```");
+        assert_eq!(sel1, Selection::caret(4));
+
+        // 2nd Undo must undo the backslash escape cleanly back to original ` ``` `
+        let sel2 = hist.undo(&mut buf).unwrap();
+        assert_eq!(buf.to_string(), "```");
+        assert_eq!(sel2, Selection::caret(3));
+
+        // Redoing twice reaches the converted fence cleanly, and undoing twice restores ` ``` ` again
+        hist.redo(&mut buf).unwrap();
+        assert_eq!(buf.to_string(), "\\```");
+        hist.redo(&mut buf).unwrap();
+        assert_eq!(buf.to_string(), "```\n\n```");
+        hist.undo(&mut buf).unwrap();
+        assert_eq!(buf.to_string(), "\\```");
+        hist.undo(&mut buf).unwrap();
+        assert_eq!(buf.to_string(), "```");
     }
 }

@@ -8,6 +8,7 @@
 pub mod buffer;
 pub mod editor;
 pub mod encoding;
+pub mod find_replace;
 pub mod state;
 pub mod stats;
 pub mod undo;
@@ -23,9 +24,14 @@ pub use encoding::{
     detect_and_decode, encode_for_save,
 };
 pub use state::{
-    ConflictActionOutcome, DiskSnapshot, DocState, DocumentSession, RecoveryPayload,
-    RecoverySlotReport, RecoveryWorker, SaveOutcome, SessionError,
+    AutoMergeOutcome, ConflictActionOutcome, DiskSnapshot, DocState, DocumentSession,
+    MergeConflictHunk, PendingRecoveryEntry, RecoveryMeta, RecoveryPayload, RecoverySlotReport,
+    RecoveryWorker, SaveOutcome, SessionError, scan_recovery_root,
 };
 pub use stats::{DocumentStats, count_text_metrics};
+pub use find_replace::{
+    FindError, FindMatch, FindOptions, FindReplaceOutcome, find_all_matches, find_next_match,
+    find_prev_match, replace_all_in_buffer, replace_match_in_buffer,
+};
 pub use undo::{EditKind, EditOp, Transaction, UndoHistory, syntax_conversion_escape_op};
 pub use workspace::{FileTreeNode, RecentFilesList, is_supported_document};

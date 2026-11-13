@@ -691,6 +691,356 @@ fn find_closing_single(bytes: &[u8], marker: u8) -> Option<usize> {
     None
 }
 
+fn shift_offset(off: ByteOffset, delta: isize) -> ByteOffset {
+    debug_assert!(off as isize + delta >= 0);
+    (off as isize + delta) as usize
+}
+
+fn shift_range(range: ByteRange, delta: isize) -> ByteRange {
+    ByteRange::new(shift_offset(range.start, delta), shift_offset(range.end, delta))
+}
+
+impl BlockNode {
+    /// Shift all byte offsets inside this block node and its inline spans by `delta`.
+    pub fn shift_offsets(&mut self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        self.range = shift_range(self.range, delta);
+        if let BlockKind::Heading { prefix_range, .. } = &mut self.kind {
+            *prefix_range = shift_range(*prefix_range, delta);
+        }
+        for span in &mut self.inlines {
+            span.full_range = shift_range(span.full_range, delta);
+            span.open_marker = shift_range(span.open_marker, delta);
+            span.close_marker = shift_range(span.close_marker, delta);
+        }
+    }
+}
+
+/// Summary of work performed by an incremental re-parse (PRD 5.1 / 6.2 #2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncrementalUpdate {
+    /// Byte span in the new source passed to `parse_blocks`.
+    pub reparsed_new_range: ByteRange,
+    /// Number of untouched leading blocks kept as-is.
+    pub reused_prefix_blocks: usize,
+    /// Number of untouched trailing blocks kept via byte-offset shifting only.
+    pub shifted_suffix_blocks: usize,
+    /// Whether fence/front-matter/boundary rules required a full document parse.
+    pub full_reparse: bool,
+}
+
+/// Cached block AST with O(dirty_region + suffix_blocks) incremental updates.
+#[derive(Debug, Clone)]
+pub struct IncrementalDoc {
+    source: String,
+    blocks: Vec<BlockNode>,
+}
+
+impl IncrementalDoc {
+    /// Parse an initial Markdown document into an incremental cache.
+    pub fn new(source: impl Into<String>) -> Self {
+        let source = source.into();
+        let blocks = parse_blocks(&source);
+        Self { source, blocks }
+    }
+
+    /// Borrow the current source text.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Borrow the up-to-date block AST slice.
+    pub fn blocks(&self) -> &[BlockNode] {
+        &self.blocks
+    }
+
+    /// Consume the cache into its underlying `(source, blocks)`.
+    pub fn into_parts(self) -> (String, Vec<BlockNode>) {
+        (self.source, self.blocks)
+    }
+
+    /// Synchronize with an updated full document string by computing the dirty span.
+    pub fn sync_source(&mut self, new_source: impl Into<String>) -> IncrementalUpdate {
+        let new_source = new_source.into();
+        if self.source == new_source {
+            return IncrementalUpdate {
+                reparsed_new_range: ByteRange::empty(0),
+                reused_prefix_blocks: self.blocks.len(),
+                shifted_suffix_blocks: 0,
+                full_reparse: false,
+            };
+        }
+        let (edit_start, old_end, new_end) = compute_dirty_byte_span(&self.source, &new_source);
+        self.apply_edit(new_source, edit_start, old_end, new_end)
+    }
+
+    /// Apply a known byte-range replacement `[edit_start..old_end) -> [edit_start..new_end)`
+    /// resulting in `new_source`, updating `blocks()` to match `parse_blocks(&new_source)`.
+    pub fn apply_edit(
+        &mut self,
+        new_source: impl Into<String>,
+        edit_start: ByteOffset,
+        old_end: ByteOffset,
+        new_end: ByteOffset,
+    ) -> IncrementalUpdate {
+        let new_source = new_source.into();
+        let old_len = self.source.len();
+        let new_len = new_source.len();
+
+        let invalid_bounds = edit_start > old_end
+            || edit_start > new_end
+            || old_end > old_len
+            || new_end > new_len
+            || !self.source.is_char_boundary(edit_start)
+            || !self.source.is_char_boundary(old_end)
+            || !new_source.is_char_boundary(edit_start)
+            || !new_source.is_char_boundary(new_end);
+
+        if invalid_bounds || self.blocks.len() < 4 {
+            return self.fallback_full_reparse(new_source);
+        }
+
+        let old_win = touched_lines(&self.source, edit_start, old_end);
+        let new_win = touched_lines(&new_source, edit_start, new_end);
+
+        // Code fence delimiter changes can open/close/split fences across arbitrary ranges.
+        let touches_fence_delim =
+            has_fence_delimiter_line(old_win) || has_fence_delimiter_line(new_win);
+
+        // Left boundary: block(s) at or just before `edit_start`.
+        let first_affected = self.blocks.partition_point(|b| b.range.end < edit_start);
+        let mut start_idx = first_affected.min(self.blocks.len()).saturating_sub(2);
+        if start_idx > 0 && self.blocks[start_idx - 1].range.end == edit_start {
+            start_idx = start_idx.saturating_sub(1);
+        }
+        // Step back to a preceding blank-line boundary within a small lookback when
+        // possible, ensuring setext/table/list continuations cannot leak leftward.
+        let min_lookback = start_idx.saturating_sub(3);
+        while start_idx > min_lookback && !preceded_by_blank_line(&new_source, self.blocks[start_idx].range.start) {
+            start_idx -= 1;
+        }
+
+        // Front-matter at byte 0 can absorb or release content up to the next `---`/`...`
+        // anywhere in the document, so front-matter boundary edits always full-reparse.
+        let has_frontmatter = matches!(
+            self.blocks.first().map(|b| &b.kind),
+            Some(BlockKind::YamlFrontMatter)
+        );
+        let frontmatter_affected = (has_frontmatter
+            && edit_start <= self.blocks[0].range.end.saturating_add(4))
+            || (new_source.starts_with("---")
+                && (edit_start <= 4
+                    || has_frontmatter_marker_line(old_win)
+                    || has_frontmatter_marker_line(new_win)))
+            || (self.source.starts_with("---") && has_frontmatter_marker_line(old_win));
+        if frontmatter_affected || touches_fence_delim {
+            return self.fallback_full_reparse(new_source);
+        }
+
+        // Right boundary: pick an untouched anchor block strictly after `old_end`.
+        let delta: isize = new_end as isize - old_end as isize;
+        let after_old_end = self.blocks.partition_point(|b| b.range.start <= old_end);
+        let mut suffix_idx = after_old_end + 1;
+
+        while suffix_idx < self.blocks.len() {
+            // Avoid stopping inside/on a CodeFence as anchor when safer blocks follow nearby.
+            if matches!(self.blocks[suffix_idx].kind, BlockKind::CodeFence { .. })
+                && suffix_idx + 1 < self.blocks.len()
+            {
+                suffix_idx += 1;
+                continue;
+            }
+            let reparse_start = if start_idx == 0 {
+                0
+            } else {
+                self.blocks[start_idx].range.start
+            };
+            let stop_byte = if suffix_idx + 1 < self.blocks.len() {
+                let raw = self.blocks[suffix_idx + 1].range.start as isize + delta;
+                if raw < reparse_start as isize || (raw as usize) > new_len {
+                    return self.fallback_full_reparse(new_source);
+                }
+                raw as usize
+            } else {
+                new_len
+            };
+
+            if !new_source.is_char_boundary(reparse_start)
+                || !new_source.is_char_boundary(stop_byte)
+                || reparse_start >= stop_byte
+            {
+                return self.fallback_full_reparse(new_source);
+            }
+
+            let local_blocks = parse_blocks_slice(&new_source, reparse_start, stop_byte);
+            let mut expected_anchor = self.blocks[suffix_idx].clone();
+            expected_anchor.shift_offsets(delta);
+
+            let slice_to_eof = stop_byte == new_len;
+            let anchor_matches = if slice_to_eof {
+                true
+            } else {
+                local_blocks.last() == Some(&expected_anchor)
+                    && local_blocks
+                        .iter()
+                        .all(|b| b.range.end <= expected_anchor.range.end)
+            };
+
+            if anchor_matches {
+                let reparsed_range = ByteRange::new(reparse_start, stop_byte);
+                let tail_start = suffix_idx + 1;
+                let shifted_suffix_blocks = self.blocks.len().saturating_sub(tail_start);
+                if delta != 0 {
+                    for b in &mut self.blocks[tail_start..] {
+                        b.shift_offsets(delta);
+                    }
+                }
+                self.blocks.splice(start_idx..=suffix_idx, local_blocks);
+                self.source = new_source;
+                return IncrementalUpdate {
+                    reparsed_new_range: reparsed_range,
+                    reused_prefix_blocks: start_idx,
+                    shifted_suffix_blocks,
+                    full_reparse: false,
+                };
+            }
+
+            // Structural merge/split crossed our tentative anchor; widen exponentially.
+            let remaining = self.blocks.len() - suffix_idx;
+            if remaining <= 4 {
+                break;
+            }
+            let step = (suffix_idx - after_old_end).max(2);
+            suffix_idx = (suffix_idx + step).min(self.blocks.len() - 1);
+        }
+
+        // Fall back to full re-parse if anchor never stabilized before EOF (or reached EOF via step).
+        let reparse_start = if start_idx == 0 {
+            0
+        } else {
+            self.blocks[start_idx].range.start
+        };
+        if start_idx > 0 && new_source.is_char_boundary(reparse_start) {
+            let local_blocks = parse_blocks_slice(&new_source, reparse_start, new_len);
+            self.blocks.splice(start_idx.., local_blocks);
+            self.source = new_source;
+            return IncrementalUpdate {
+                reparsed_new_range: ByteRange::new(reparse_start, new_len),
+                reused_prefix_blocks: start_idx,
+                shifted_suffix_blocks: 0,
+                full_reparse: false,
+            };
+        }
+
+        self.fallback_full_reparse(new_source)
+    }
+
+    fn fallback_full_reparse(&mut self, new_source: String) -> IncrementalUpdate {
+        let len = new_source.len();
+        self.blocks = parse_blocks(&new_source);
+        self.source = new_source;
+        IncrementalUpdate {
+            reparsed_new_range: ByteRange::new(0, len),
+            reused_prefix_blocks: 0,
+            shifted_suffix_blocks: 0,
+            full_reparse: true,
+        }
+    }
+}
+
+fn parse_blocks_slice(new_source: &str, reparse_start: usize, stop_byte: usize) -> Vec<BlockNode> {
+    let slice = &new_source[reparse_start..stop_byte];
+    if reparse_start > 0 && slice.starts_with("---") {
+        // Prevent `parse_blocks` from treating a mid-document `---` at index 0 of
+        // the sub-slice as `YamlFrontMatter`.
+        const GUARD: &str = "p\n\n";
+        let mut buf = String::with_capacity(GUARD.len() + slice.len());
+        buf.push_str(GUARD);
+        buf.push_str(slice);
+        let adjust = reparse_start as isize - GUARD.len() as isize;
+        let mut blocks = Vec::new();
+        for mut b in parse_blocks(&buf) {
+            if b.range.start >= GUARD.len() {
+                b.shift_offsets(adjust);
+                blocks.push(b);
+            }
+        }
+        blocks
+    } else {
+        let mut blocks = parse_blocks(slice);
+        if reparse_start > 0 {
+            let shift = reparse_start as isize;
+            for b in &mut blocks {
+                b.shift_offsets(shift);
+            }
+        }
+        blocks
+    }
+}
+
+fn compute_dirty_byte_span(old: &str, new: &str) -> (ByteOffset, ByteOffset, ByteOffset) {
+    let old_b = old.as_bytes();
+    let new_b = new.as_bytes();
+    let min_len = old_b.len().min(new_b.len());
+
+    let mut prefix = 0usize;
+    while prefix < min_len && old_b[prefix] == new_b[prefix] {
+        prefix += 1;
+    }
+    while prefix > 0 && (!old.is_char_boundary(prefix) || !new.is_char_boundary(prefix)) {
+        prefix -= 1;
+    }
+
+    let max_suffix = min_len - prefix;
+    let mut suffix = 0usize;
+    while suffix < max_suffix && old_b[old_b.len() - 1 - suffix] == new_b[new_b.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    while suffix > 0
+        && (!old.is_char_boundary(old.len() - suffix)
+            || !new.is_char_boundary(new.len() - suffix))
+    {
+        suffix -= 1;
+    }
+
+    (prefix, old.len() - suffix, new.len() - suffix)
+}
+
+fn touched_lines(src: &str, start: ByteOffset, end: ByteOffset) -> &str {
+    let bytes = src.as_bytes();
+    let mut ls = start.min(bytes.len());
+    while ls > 0 && bytes[ls - 1] != b'\n' {
+        ls -= 1;
+    }
+    let mut le = end.min(bytes.len());
+    while le < bytes.len() && bytes[le] != b'\n' {
+        le += 1;
+    }
+    &src[ls..le]
+}
+
+fn has_fence_delimiter_line(window: &str) -> bool {
+    window.lines().any(|line| {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        trimmed.starts_with("```") || trimmed.starts_with("~~~")
+    })
+}
+
+fn has_frontmatter_marker_line(window: &str) -> bool {
+    window.lines().any(|line| {
+        let t = line.trim_end_matches('\r');
+        t == "---" || t == "..."
+    })
+}
+
+fn preceded_by_blank_line(src: &str, block_start: ByteOffset) -> bool {
+    let prefix = src[..block_start.min(src.len())].as_bytes();
+    prefix.ends_with(b"\n\n") || prefix.ends_with(b"\r\n\r\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,5 +1225,124 @@ mod tests {
                 pair[1].range.start
             );
         }
+    }
+
+    fn apply_text_patch(
+        inc: &mut IncrementalDoc,
+        old_start: usize,
+        old_end: usize,
+        replacement: &str,
+    ) -> IncrementalUpdate {
+        let mut next = inc.source().to_string();
+        next.replace_range(old_start..old_end, replacement);
+        let upd = inc.apply_edit(next.clone(), old_start, old_end, old_start + replacement.len());
+        assert_eq!(
+            inc.blocks(),
+            parse_blocks(&next).as_slice(),
+            "IncrementalDoc mismatch after edit ({old_start}..{old_end} -> {replacement:?})"
+        );
+        upd
+    }
+
+    #[test]
+    fn test_incremental_doc_local_edit_reuses_prefix_and_shifts_suffix() {
+        let doc = concat!(
+            "# Heading 0\n\n",
+            "Paragraph 1 with **bold**.\n\n",
+            "Paragraph 2 to edit.\n\n",
+            "- list item A\n",
+            "- list item B\n\n",
+            "## Trailing Heading\n\n",
+            "Final paragraph *italic*.\n"
+        );
+        let mut inc = IncrementalDoc::new(doc);
+        assert_eq!(inc.blocks(), parse_blocks(doc).as_slice());
+
+        let needle = "Paragraph 2 to edit.";
+        let pos = doc.find(needle).unwrap();
+        let upd = apply_text_patch(
+            &mut inc,
+            pos,
+            pos + needle.len(),
+            "Paragraph 2 now has `inline code` and **strong**!",
+        );
+        assert!(!upd.full_reparse);
+        assert!(upd.reused_prefix_blocks >= 1);
+        assert!(upd.shifted_suffix_blocks >= 1);
+    }
+
+    #[test]
+    fn test_incremental_doc_equivalence_across_complex_mutations() {
+        let initial = concat!(
+            "---\n",
+            "title: Spec\n",
+            "---\n\n",
+            "# Chapter 1\n\n",
+            "中文段落 **加粗** 和 [链接](https://a.example)\n\n",
+            "---\n\n",
+            "> 引用内容 line 1\n\n",
+            "```rust\nlet x = 1;\n```\n\n",
+            "| Col A | Col B |\n| --- | --- |\n| 1 | 2 |\n\n",
+            "Tail paragraph A\n\n",
+            "Tail paragraph B\n\n",
+            "Tail paragraph C\n"
+        );
+        let mut inc = IncrementalDoc::new(initial);
+        assert_eq!(inc.blocks(), parse_blocks(initial).as_slice());
+
+        // 1. Insert mid-document ThematicBreak right at a slice start candidate
+        let p = inc.source().find("中文段落").unwrap();
+        apply_text_patch(&mut inc, p, p, "---\n\n新段 ");
+
+        // 2. Edit inside a closed CodeFence without touching fence delimiters (partial reuse)
+        let let_x = inc.source().find("let x = 1;").unwrap();
+        let fence_upd = apply_text_patch(&mut inc, let_x, let_x + "let x = 1;".len(), "let y = 42;\nprintln!(\"{y}\");");
+        assert!(!fence_upd.full_reparse);
+        assert!(fence_upd.shifted_suffix_blocks >= 1);
+
+        // 3. Delete blank line merging two paragraphs or splitting block
+        let tail_a = inc.source().find("Tail paragraph A\n\nTail").unwrap() + "Tail paragraph A".len();
+        apply_text_patch(&mut inc, tail_a, tail_a + 1, "");
+
+        // 4. Open a code fence mid-document and later close it
+        let quote_pos = inc.source().find("> 引用").unwrap();
+        apply_text_patch(&mut inc, quote_pos, quote_pos, "```python\nprint(1)\n");
+        let after_open = quote_pos + "```python\nprint(1)\n".len();
+        apply_text_patch(&mut inc, after_open, after_open, "```\n\n");
+
+        // 5. Mutate YAML front matter and verify full consistency
+        apply_text_patch(&mut inc, 0, 4, "---\nauthor: Alice\n");
+
+        // 6. Remove YAML front matter closing marker
+        let close_fm = inc.source().find("\n---\n").unwrap();
+        apply_text_patch(&mut inc, close_fm, close_fm + 4, "");
+
+        // 6. Delete `\n` right before closing ``` of a fence (line merge removes closing fence!)
+        let close_fence = inc.source().find("\n```\n\n").unwrap();
+        apply_text_patch(&mut inc, close_fence, close_fence + 1, "");
+
+        // 7. Re-check `sync_source`
+        let synced = format!("{}\n\n# Extra End\n", inc.source());
+        inc.sync_source(synced.clone());
+        assert_eq!(inc.blocks(), parse_blocks(&synced).as_slice());
+    }
+
+    #[test]
+    fn test_incremental_doc_large_5000_blocks_local_update() {
+        let mut doc = String::with_capacity(180_000);
+        for i in 0..5_000 {
+            doc.push_str(&format!("Paragraph #{i} with **bold** content.\n\n"));
+        }
+        let mut inc = IncrementalDoc::new(doc.clone());
+        assert_eq!(inc.blocks().len(), 10_000);
+
+        // Edit right in the middle (#2500)
+        let target = "Paragraph #2500";
+        let pos = doc.find(target).unwrap();
+        let upd = apply_text_patch(&mut inc, pos, pos + target.len(), "## Heading 2500 Replaced");
+        assert!(!upd.full_reparse);
+        assert!(upd.reused_prefix_blocks > 4_900);
+        assert!(upd.shifted_suffix_blocks > 4_900);
+        assert!(upd.reparsed_new_range.len() < 512);
     }
 }

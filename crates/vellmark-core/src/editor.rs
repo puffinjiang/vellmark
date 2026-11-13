@@ -647,12 +647,26 @@ impl EditorContext<'_> {
         *self.selection = sel_after;
 
         // P2 fix: Only record WYSIWYG syntax conversion triggers when in `ViewMode::Wysiwyg` AND outside fenced code blocks!
-        if *self.mode == ViewMode::Wysiwyg && !in_code_fence && ch == ' ' {
+        if *self.mode == ViewMode::Wysiwyg && !in_code_fence {
             let (line_start, line_end) = self.current_line_bounds();
             let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
-            if is_just_heading_trigger(&line) && self.selection.head == line_end {
-                self.undo
-                    .record_syntax_trigger(line_start, *self.selection);
+            if ch == ' ' && self.selection.head == line_end {
+                if let Some(rel) = block_line_syntax_escape_offset(&line) {
+                    self.undo
+                        .record_syntax_trigger(line_start + rel, *self.selection);
+                }
+            } else if matches!(ch, '*' | '`' | '~') {
+                let caret_in_line = self.selection.head.saturating_sub(line_start);
+                let escapes = detect_inline_conversion_escapes(&line, caret_in_line, ch);
+                if escapes.len() == 1 {
+                    self.undo
+                        .record_syntax_trigger(line_start + escapes[0], *self.selection);
+                } else if escapes.len() > 1 {
+                    let abs: Vec<ByteOffset> =
+                        escapes.into_iter().map(|rel| line_start + rel).collect();
+                    self.undo
+                        .record_syntax_trigger_offsets(abs, *self.selection);
+                }
             }
         }
     }
@@ -756,6 +770,30 @@ impl EditorContext<'_> {
                             );
                             *self.selection = sel_after;
                         }
+                        return;
+                    }
+                }
+
+                // PRD 4.1.1 C: Backspace at start of blockquote content demotes one quote level (`> ‸text` -> `text`, `> > ‸text` -> `> text`)
+                if let Some((content_start, strip_rel_range)) =
+                    blockquote_demote_parts(&line)
+                {
+                    if caret == line_start + content_start {
+                        let sel_before = *self.selection;
+                        let del_range = ByteRange::new(
+                            line_start + strip_rel_range.start,
+                            line_start + strip_rel_range.end,
+                        );
+                        let sel_after = Selection::caret(caret - del_range.len());
+                        self.undo.apply_edit(
+                            self.buffer,
+                            del_range,
+                            "",
+                            sel_before,
+                            sel_after,
+                            EditKind::Structural,
+                        );
+                        *self.selection = sel_after;
                         return;
                     }
                 }
@@ -1023,6 +1061,106 @@ impl EditorContext<'_> {
                             sel_before,
                             sel_after,
                             EditKind::Structural,
+                        );
+                        *self.selection = sel_after;
+                        return;
+                    }
+                }
+
+                // PRD 4.1.1 C: BlockQuote Enter continuation, nested outdent, or empty exit
+                if let Some((content_start, strip_rel_range)) = blockquote_demote_parts(&line) {
+                    if caret >= line_start + content_start {
+                        let sel_before = *self.selection;
+                        if line[content_start..].trim().is_empty() {
+                            let del_range = if strip_rel_range.start == 0 {
+                                ByteRange::new(line_start, line_end)
+                            } else {
+                                ByteRange::new(
+                                    line_start + strip_rel_range.start,
+                                    line_start + strip_rel_range.end,
+                                )
+                            };
+                            let sel_after = Selection::caret(del_range.start);
+                            self.undo.apply_edit(
+                                self.buffer,
+                                del_range,
+                                "",
+                                sel_before,
+                                sel_after,
+                                EditKind::Structural,
+                            );
+                            *self.selection = sel_after;
+                        } else {
+                            let full_text = self.buffer.to_string();
+                            let le = LineEnding::detect_dominant(&full_text).as_str();
+                            let prefix = &line[..content_start];
+                            let continuation = if prefix.ends_with(' ') {
+                                format!("{le}{prefix}")
+                            } else {
+                                format!("{le}{prefix} ")
+                            };
+                            let sel_after = Selection::caret(caret + continuation.len());
+                            self.undo.apply_edit(
+                                self.buffer,
+                                ByteRange::empty(caret),
+                                &continuation,
+                                sel_before,
+                                sel_after,
+                                EditKind::Structural,
+                            );
+                            *self.selection = sel_after;
+                        }
+                        return;
+                    }
+                }
+
+                // PRD 4.1.1 B.1: ``` / ~~~ + Enter inserts companion closing fence in single SyntaxConversion tx
+                if caret == line_end {
+                    if let Some((fence_ch, fence_len)) = parse_opening_code_fence(&line) {
+                        let full_text = self.buffer.to_string();
+                        if !has_unpaired_closing_fence_below(
+                            &full_text,
+                            line_end,
+                            fence_ch,
+                            fence_len,
+                        ) {
+                            let indent = line.len() - line.trim_start_matches(' ').len();
+                            let le = LineEnding::detect_dominant(&full_text).as_str();
+                            let closer: String =
+                                std::iter::repeat(fence_ch as char).take(fence_len).collect();
+                            let insertion = format!("{le}{le}{closer}");
+                            let sel_before = *self.selection;
+                            let sel_after = Selection::caret(caret + le.len());
+                            self.undo.apply_edit(
+                                self.buffer,
+                                ByteRange::empty(caret),
+                                &insertion,
+                                sel_before,
+                                sel_after,
+                                EditKind::SyntaxConversion {
+                                    escape_insert_at: Some(line_start + indent),
+                                },
+                            );
+                            *self.selection = sel_after;
+                            return;
+                        }
+                    }
+
+                    // PRD 4.1.1 B.1: --- / *** / ___ + Enter completes ThematicBreak with escape-undo
+                    if let Some(escape_rel) = thematic_break_escape_offset(&line) {
+                        let full_text = self.buffer.to_string();
+                        let le = LineEnding::detect_dominant(&full_text).as_str();
+                        let sel_before = *self.selection;
+                        let sel_after = Selection::caret(caret + le.len());
+                        self.undo.apply_edit(
+                            self.buffer,
+                            ByteRange::empty(caret),
+                            le,
+                            sel_before,
+                            sel_after,
+                            EditKind::SyntaxConversion {
+                                escape_insert_at: Some(line_start + escape_rel),
+                            },
                         );
                         *self.selection = sel_after;
                         return;
@@ -1550,6 +1688,306 @@ fn table_row_insert_pos(full: &str, line_start: ByteOffset, line_end: ByteOffset
     } else {
         line_end
     }
+}
+
+/// Relative escape offset for PRD 4.1.1 B.1 block-line space triggers (`# `, `> `, `- `, `1. `, `- [ ] `).
+fn block_line_syntax_escape_offset(line: &str) -> Option<ByteOffset> {
+    if is_just_heading_trigger(line) {
+        return Some(0);
+    }
+    if let Some((indent, marker_len)) = list_prefix_parts(line) {
+        if line.len() == indent + marker_len {
+            let marker = &line[indent..];
+            if marker.starts_with("- [") {
+                // `- [ ] ` -> `- \[ ] ` (escape before `[` per PRD 4.1.1 B.1)
+                return Some(indent + 2);
+            }
+            if matches!(marker, "- " | "* " | "+ ") {
+                return Some(indent);
+            }
+            if let Some(dot_rel) = marker.find(". ") {
+                // `1. ` -> `1\. `
+                return Some(indent + dot_rel);
+            }
+        }
+    }
+    blockquote_trigger_offset(line)
+}
+
+fn blockquote_trigger_offset(line: &str) -> Option<ByteOffset> {
+    let bytes = line.as_bytes();
+    let mut pos = 0usize;
+    while pos < bytes.len() && bytes[pos] == b' ' && pos < 3 {
+        pos += 1;
+    }
+    if pos >= bytes.len() {
+        return None;
+    }
+    let mut last_quote = None;
+    while pos < bytes.len() && line[pos..].starts_with("> ") {
+        last_quote = Some(pos);
+        pos += 2;
+    }
+    if pos == line.len() {
+        last_quote
+    } else {
+        None
+    }
+}
+
+/// Parse single or nested blockquote line prefix (`> `, `> > `, optional <=3 leading spaces).
+/// Returns `(content_start_in_line, strip_rel_range)` where deleting `strip_rel_range`
+/// demotes one blockquote level.
+fn blockquote_demote_parts(line: &str) -> Option<(usize, ByteRange)> {
+    let bytes = line.as_bytes();
+    let mut indent = 0usize;
+    while indent < bytes.len() && bytes[indent] == b' ' && indent < 4 {
+        indent += 1;
+    }
+    if indent >= 4 || indent >= bytes.len() || bytes[indent] != b'>' {
+        return None;
+    }
+    let mut pos = indent;
+    let mut level_count = 0usize;
+    let mut last_level_start = indent;
+    while pos < bytes.len() && bytes[pos] == b'>' {
+        let level_start = pos;
+        pos += 1;
+        if pos < bytes.len() && bytes[pos] == b' ' {
+            pos += 1;
+        }
+        level_count += 1;
+        last_level_start = level_start;
+    }
+    if level_count == 1 {
+        Some((pos, ByteRange::new(0, pos)))
+    } else {
+        Some((pos, ByteRange::new(last_level_start, pos)))
+    }
+}
+
+/// Check if `line` is a CommonMark thematic break (`---`, `***`, `___` with optional spaces, count >= 3).
+fn thematic_break_escape_offset(line: &str) -> Option<ByteOffset> {
+    let bytes = line.as_bytes();
+    let mut indent = 0usize;
+    while indent < bytes.len() && bytes[indent] == b' ' && indent < 4 {
+        indent += 1;
+    }
+    if indent >= 4 || indent >= bytes.len() {
+        return None;
+    }
+    let marker = bytes[indent];
+    if !matches!(marker, b'-' | b'*' | b'_') {
+        return None;
+    }
+    let mut count = 0usize;
+    for &b in &bytes[indent..] {
+        if b == marker {
+            count += 1;
+        } else if b != b' ' && b != b'\t' {
+            return None;
+        }
+    }
+    if count >= 3 {
+        Some(indent)
+    } else {
+        None
+    }
+}
+
+/// Determine whether a newly typed opening fence line at `line_end` already pairs
+/// with an existing unpaired closing fence below it.
+fn has_unpaired_closing_fence_below(
+    full_text: &str,
+    line_end: ByteOffset,
+    fence_ch: u8,
+    fence_len: usize,
+) -> bool {
+    let mut rest = &full_text[line_end.min(full_text.len())..];
+    if let Some(after) = rest.strip_prefix("\r\n") {
+        rest = after;
+    } else if let Some(after) = rest.strip_prefix('\n') {
+        rest = after;
+    } else {
+        return false;
+    }
+
+    let mut inner: Option<(u8, usize)> = None;
+    let mut bare_closers = 0usize;
+    for raw_line in rest.split('\n') {
+        let line = raw_line.trim_end_matches('\r');
+        if let Some((ich, ilen)) = inner {
+            if is_closing_code_fence(line, ich, ilen) {
+                inner = None;
+            }
+            continue;
+        }
+        if is_closing_code_fence(line, fence_ch, fence_len) {
+            bare_closers += 1;
+        } else if let Some((och, olen)) = parse_opening_code_fence(line) {
+            // Only enter a nested balanced block if its delimiter could validly exist outside
+            // or has an info string (so shorter literal ``` lines inside ``` ` ```` ` don't swallow ` ```` `).
+            let trimmed_start = line.trim_start_matches(' ');
+            let info_non_empty = !trimmed_start[olen..].trim().is_empty();
+            if info_non_empty || och != fence_ch || olen >= fence_len {
+                inner = Some((och, olen));
+            }
+        }
+    }
+    bare_closers % 2 == 1
+}
+
+/// Detect whether typing `typed_char` ending at `caret_in_line` just closed a paired
+/// inline formatting span (`**bold**`, `*italic*`, `` `code` ``, `~~strike~~`),
+/// returning the relative byte offsets inside `line` that 1st Undo should escape.
+fn detect_inline_conversion_escapes(
+    line: &str,
+    caret_in_line: usize,
+    typed_char: char,
+) -> Vec<ByteOffset> {
+    if caret_in_line == 0
+        || caret_in_line > line.len()
+        || !line.is_char_boundary(caret_in_line)
+        || line[caret_in_line..].starts_with(typed_char)
+    {
+        return Vec::new();
+    }
+
+    let prefix = &line[..caret_in_line];
+    let bytes = prefix.as_bytes();
+    let mut i = 0usize;
+    let mut open_backtick: Option<(usize, usize)> = None;
+    let mut open_single_star: Option<usize> = None;
+    let mut open_double_star: Option<usize> = None;
+    let mut open_double_tilde: Option<usize> = None;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if open_backtick.is_some() {
+            if b == b'`' {
+                let mut run = 0usize;
+                while i + run < bytes.len() && bytes[i + run] == b'`' {
+                    run += 1;
+                }
+                if let Some((open, open_len)) = open_backtick {
+                    if run == open_len {
+                        let inner = &prefix[open + run..i];
+                        let is_fence = parse_opening_code_fence(line).is_some() && open <= 3 && run >= 3;
+                        if i + run == caret_in_line
+                            && typed_char == '`'
+                            && !is_fence
+                            && !inner.is_empty()
+                            && inner.chars().any(|c| !c.is_whitespace())
+                        {
+                            return vec![open];
+                        }
+                        open_backtick = None;
+                    }
+                }
+                i += run;
+                continue;
+            }
+            let ch = prefix[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+            continue;
+        }
+
+        if b == b'\\' {
+            if i + 1 < bytes.len() {
+                let next_ch = prefix[i + 1..].chars().next().unwrap();
+                i += 1 + next_ch.len_utf8();
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if b == b'`' {
+            let mut run = 0usize;
+            while i + run < bytes.len() && bytes[i + run] == b'`' {
+                run += 1;
+            }
+            open_backtick = Some((i, run));
+            i += run;
+            continue;
+        }
+
+        if b == b'*' {
+            let mut run = 0usize;
+            while i + run < bytes.len() && bytes[i + run] == b'*' {
+                run += 1;
+            }
+            if run == 2 {
+                if let Some(open) = open_double_star {
+                    let inner = &prefix[open + 2..i];
+                    if !inner.is_empty()
+                        && !inner.starts_with(char::is_whitespace)
+                        && !inner.ends_with(char::is_whitespace)
+                    {
+                        if i + run == caret_in_line && typed_char == '*' {
+                            return vec![open, open + 1];
+                        }
+                        open_double_star = None;
+                    } else {
+                        open_double_star = Some(i);
+                    }
+                } else {
+                    open_double_star = Some(i);
+                }
+            } else if run == 1 {
+                if let Some(open) = open_single_star {
+                    let inner = &prefix[open + 1..i];
+                    if !inner.is_empty()
+                        && !inner.starts_with(char::is_whitespace)
+                        && !inner.ends_with(char::is_whitespace)
+                    {
+                        if i + run == caret_in_line && typed_char == '*' {
+                            return vec![open];
+                        }
+                        open_single_star = None;
+                    } else {
+                        open_single_star = Some(i);
+                    }
+                } else {
+                    open_single_star = Some(i);
+                }
+            }
+            i += run;
+            continue;
+        }
+
+        if b == b'~' {
+            let mut run = 0usize;
+            while i + run < bytes.len() && bytes[i + run] == b'~' {
+                run += 1;
+            }
+            if run == 2 {
+                if let Some(open) = open_double_tilde {
+                    let inner = &prefix[open + 2..i];
+                    if !inner.is_empty()
+                        && !inner.starts_with(char::is_whitespace)
+                        && !inner.ends_with(char::is_whitespace)
+                    {
+                        if i + run == caret_in_line && typed_char == '~' {
+                            return vec![open, open + 1];
+                        }
+                        open_double_tilde = None;
+                    } else {
+                        open_double_tilde = Some(i);
+                    }
+                } else {
+                    open_double_tilde = Some(i);
+                }
+            }
+            i += run;
+            continue;
+        }
+
+        let ch = prefix[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+    }
+
+    Vec::new()
 }
 
 fn is_just_heading_trigger(line: &str) -> bool {
@@ -2203,5 +2641,172 @@ mod tests {
             mixed_crlf_dom.buffer.to_string(),
             "l1\r\nl2\r\nl3\r\n| a | b |\n| --- | --- |\n| 1 | 2 |\r\n|  |  |"
         );
+    }
+
+    fn type_str(ed: &mut EditorController, s: &str) {
+        for ch in s.chars() {
+            ed.dispatch(EditorAction::InsertChar(ch));
+        }
+    }
+
+    #[test]
+    fn test_prd_4_1_1_b1_block_and_inline_triggers_and_escape_undo() {
+        // 1. Blockquote `> ` -> `\> ` -> ``
+        let mut q = EditorController::new();
+        type_str(&mut q, "> ");
+        assert_eq!(q.buffer.to_string(), "> ");
+        q.dispatch(EditorAction::Undo);
+        assert_eq!(q.buffer.to_string(), "\\> ");
+        q.dispatch(EditorAction::Undo);
+        assert_eq!(q.buffer.to_string(), "");
+
+        // 2. Unordered list `- ` / `* ` / `+ ` -> `\- ` -> ``
+        for marker in ["- ", "* ", "+ "] {
+            let mut ul = EditorController::new();
+            type_str(&mut ul, marker);
+            ul.dispatch(EditorAction::Undo);
+            assert_eq!(ul.buffer.to_string(), format!("\\{marker}"));
+            ul.dispatch(EditorAction::Undo);
+            assert_eq!(ul.buffer.to_string(), "");
+        }
+
+        // 3. Ordered list `1. ` -> `1\. ` -> ``
+        let mut ol = EditorController::new();
+        type_str(&mut ol, "1. ");
+        ol.dispatch(EditorAction::Undo);
+        assert_eq!(ol.buffer.to_string(), "1\\. ");
+        ol.dispatch(EditorAction::Undo);
+        assert_eq!(ol.buffer.to_string(), "");
+
+        // 4. Task list `- [ ] ` -> `- \[ ] ` -> `- `
+        let mut task = EditorController::new();
+        type_str(&mut task, "- [ ] ");
+        task.dispatch(EditorAction::Undo);
+        assert_eq!(task.buffer.to_string(), "- \\[ ] ");
+        task.dispatch(EditorAction::Undo);
+        assert_eq!(task.buffer.to_string(), "- ");
+
+        // 5. Inline bold `**粗体**` -> `\*\*粗体**` -> ``, plus Redo cycle & italic/code/strike
+        let mut bold = EditorController::new();
+        type_str(&mut bold, "**粗体**");
+        assert_eq!(bold.buffer.to_string(), "**粗体**");
+        bold.dispatch(EditorAction::Undo);
+        assert_eq!(bold.buffer.to_string(), "\\*\\*粗体**");
+        bold.dispatch(EditorAction::Redo);
+        assert_eq!(bold.buffer.to_string(), "**粗体**");
+        bold.dispatch(EditorAction::Undo);
+        assert_eq!(bold.buffer.to_string(), "\\*\\*粗体**");
+        bold.dispatch(EditorAction::Undo);
+        assert_eq!(bold.buffer.to_string(), "");
+
+        let mut italic = EditorController::new();
+        type_str(&mut italic, "*斜体*");
+        italic.dispatch(EditorAction::Undo);
+        assert_eq!(italic.buffer.to_string(), "\\*斜体*");
+        italic.dispatch(EditorAction::Undo);
+        assert_eq!(italic.buffer.to_string(), "");
+
+        let mut code = EditorController::new();
+        type_str(&mut code, "`code`");
+        code.dispatch(EditorAction::Undo);
+        assert_eq!(code.buffer.to_string(), "\\`code`");
+        code.dispatch(EditorAction::Undo);
+        assert_eq!(code.buffer.to_string(), "");
+
+        let mut strike = EditorController::new();
+        type_str(&mut strike, "~~del~~");
+        strike.dispatch(EditorAction::Undo);
+        assert_eq!(strike.buffer.to_string(), "\\~\\~del~~");
+        strike.dispatch(EditorAction::Undo);
+        assert_eq!(strike.buffer.to_string(), "");
+
+        // Pre-existing `**bold*` + typing final `*` escapes both and 2nd Undo restores exact `**bold*`
+        let mut pre_bold = EditorController::from_str("**bold*");
+        pre_bold.set_caret("**bold*".len());
+        type_str(&mut pre_bold, "*");
+        pre_bold.dispatch(EditorAction::Undo);
+        assert_eq!(pre_bold.buffer.to_string(), "\\*\\*bold**");
+        pre_bold.dispatch(EditorAction::Undo);
+        assert_eq!(pre_bold.buffer.to_string(), "**bold*");
+
+        // 6. Code fence ``` + Enter inserts companion closing fence; 1st Undo -> `\``` `; 2nd Undo -> ``
+        let mut fence = EditorController::new();
+        type_str(&mut fence, "```");
+        fence.dispatch(EditorAction::Enter);
+        assert_eq!(fence.buffer.to_string(), "```\n\n```");
+        assert_eq!(fence.selection, Selection::caret(4));
+        fence.dispatch(EditorAction::Undo);
+        assert_eq!(fence.buffer.to_string(), "\\```");
+        fence.dispatch(EditorAction::Undo);
+        assert_eq!(fence.buffer.to_string(), "");
+
+        // 7. Thematic break `---` + Enter -> `---\n`; 1st Undo -> `\---`; 2nd Undo -> ``
+        let mut hr = EditorController::new();
+        type_str(&mut hr, "---");
+        hr.dispatch(EditorAction::Enter);
+        assert_eq!(hr.buffer.to_string(), "---\n");
+        hr.dispatch(EditorAction::Undo);
+        assert_eq!(hr.buffer.to_string(), "\\---");
+        hr.dispatch(EditorAction::Undo);
+        assert_eq!(hr.buffer.to_string(), "");
+
+        // 8. Code fence ```rust + Enter above an existing code block still inserts its companion
+        let mut above = EditorController::from_str("\n# Later\n```py\nprint(1)\n```\n");
+        above.set_caret(0);
+        type_str(&mut above, "```rust");
+        above.dispatch(EditorAction::Enter);
+        assert_eq!(
+            above.buffer.to_string(),
+            "```rust\n\n```\n# Later\n```py\nprint(1)\n```\n"
+        );
+    }
+
+    #[test]
+    fn test_prd_4_1_1_c_blockquote_enter_and_backspace_demotion() {
+        let mut ed = EditorController::from_str("> first quote");
+        ed.set_caret("> first quote".len());
+        ed.dispatch(EditorAction::Enter);
+        assert_eq!(ed.buffer.to_string(), "> first quote\n> ");
+
+        // Empty blockquote Enter exits quote cleanly to paragraph
+        ed.dispatch(EditorAction::Enter);
+        assert_eq!(ed.buffer.to_string(), "> first quote\n");
+
+        // Nested blockquote Backspace demotes one level at a time
+        let mut nested = EditorController::from_str("> > text");
+        nested.set_caret("> > ".len());
+        nested.dispatch(EditorAction::Backspace);
+        assert_eq!(nested.buffer.to_string(), "> text");
+        nested.dispatch(EditorAction::Backspace);
+        assert_eq!(nested.buffer.to_string(), "text");
+
+        // Source mode and inside code fence ignore WYSIWYG triggers
+        let mut src_ed = EditorController::new();
+        src_ed.mode = ViewMode::Source;
+        type_str(&mut src_ed, "```");
+        src_ed.dispatch(EditorAction::Enter);
+        assert_eq!(src_ed.buffer.to_string(), "```\n");
+
+        let mut fence_ed = EditorController::from_str("```md\n> \n```");
+        fence_ed.set_caret("```md\n> ".len());
+        fence_ed.dispatch(EditorAction::Backspace);
+        assert_eq!(fence_ed.buffer.to_string(), "```md\n>\n```");
+    }
+
+    #[test]
+    fn test_p2_open_existing_code_fence_enter_then_two_undos_restores_fence() {
+        let mut ed = EditorController::from_str("```");
+        ed.set_caret(3);
+        ed.dispatch(EditorAction::Enter);
+        assert_eq!(ed.buffer.to_string(), "```\n\n```");
+
+        // 1st Undo removes companion fence and escapes opening ```
+        ed.dispatch(EditorAction::Undo);
+        assert_eq!(ed.buffer.to_string(), "\\```");
+
+        // 2nd Undo removes the escape cleanly back to original ` ``` `
+        ed.dispatch(EditorAction::Undo);
+        assert_eq!(ed.buffer.to_string(), "```");
+        assert_eq!(ed.selection, Selection::caret(3));
     }
 }
