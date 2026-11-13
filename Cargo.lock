@@ -180,6 +180,7 @@ checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 name = "vellmark-app"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "vellmark-core",
  "vellmark-export",
  "vellmark-parser",
@@ -194,6 +195,7 @@ dependencies = [
  "vellmark-core",
  "vellmark-export",
  "vellmark-parser",
+ "vellmark-theme",
 ]
 
 [[package]]

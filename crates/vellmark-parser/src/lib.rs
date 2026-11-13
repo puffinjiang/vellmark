@@ -124,27 +124,63 @@ pub fn parse_blocks(source: &str) -> Vec<BlockNode> {
         };
         let line_trimmed = source[line_start..line_end].trim_end_matches('\r');
 
-        // Fenced code block (` ``` `)
-        if let Some(rest) = line_trimmed.strip_prefix("```") {
-            let info = rest.trim().to_string();
-            let mut fence_end = next_pos;
-            while fence_end < bytes.len() {
-                let l_start = fence_end;
-                let mut l_end = fence_end;
+        // YAML Front Matter at byte 0 (`---` ... `---` / `...`, PRD 4.2 M-08)
+        if line_start == 0 && line_trimmed == "---" {
+            let mut fm_pos = next_pos;
+            let mut fm_close_end = None;
+            let mut fm_next_pos = next_pos;
+            while fm_pos < bytes.len() {
+                let l_start = fm_pos;
+                let mut l_end = fm_pos;
                 while l_end < bytes.len() && bytes[l_end] != b'\n' {
                     l_end += 1;
                 }
-                fence_end = if l_end < bytes.len() { l_end + 1 } else { l_end };
-                if source[l_start..l_end].trim_end_matches('\r').trim() == "```" {
+                let l_next = if l_end < bytes.len() { l_end + 1 } else { l_end };
+                let l_str = source[l_start..l_end].trim_end_matches('\r').trim();
+                if l_str == "---" || l_str == "..." {
+                    fm_close_end = Some(l_end);
+                    fm_next_pos = l_next;
                     break;
                 }
+                fm_pos = l_next;
+            }
+            if let Some(close_end) = fm_close_end {
+                blocks.push(BlockNode {
+                    kind: BlockKind::YamlFrontMatter,
+                    range: ByteRange::new(0, close_end),
+                    inlines: Vec::new(),
+                });
+                pos = fm_next_pos;
+                continue;
+            }
+        }
+
+        // Fenced code block (` ``` ` or `~~~`, length >= 3, CommonMark spec)
+        if let Some((f_char, f_len, info)) = parse_opening_fence_line(line_trimmed) {
+            let mut fence_pos = next_pos;
+            let mut block_end = line_end;
+            let mut after_fence_pos = next_pos;
+            while fence_pos < bytes.len() {
+                let l_start = fence_pos;
+                let mut l_end = fence_pos;
+                while l_end < bytes.len() && bytes[l_end] != b'\n' {
+                    l_end += 1;
+                }
+                let l_next = if l_end < bytes.len() { l_end + 1 } else { l_end };
+                block_end = l_end;
+                after_fence_pos = l_next;
+                let candidate = source[l_start..l_end].trim_end_matches('\r');
+                if is_closing_fence_line(candidate, f_char, f_len) {
+                    break;
+                }
+                fence_pos = l_next;
             }
             blocks.push(BlockNode {
                 kind: BlockKind::CodeFence { info_string: info },
-                range: ByteRange::new(line_start, fence_end),
+                range: ByteRange::new(line_start, block_end),
                 inlines: Vec::new(),
             });
-            pos = fence_end;
+            pos = after_fence_pos;
             continue;
         }
 
@@ -165,12 +201,52 @@ pub fn parse_blocks(source: &str) -> Vec<BlockNode> {
             continue;
         }
 
-        // Thematic break (`---`)
+        // Thematic break (`---`, `***`, `___`)
         if line_trimmed == "---" || line_trimmed == "***" || line_trimmed == "___" {
             blocks.push(BlockNode {
                 kind: BlockKind::ThematicBreak,
                 range: ByteRange::new(line_start, line_end),
                 inlines: Vec::new(),
+            });
+            pos = next_pos;
+            continue;
+        }
+
+        // BlockQuote (`> ...`)
+        if line_trimmed.trim_start().starts_with('>') {
+            let inlines = parse_inlines(source, line_start, line_end);
+            blocks.push(BlockNode {
+                kind: BlockKind::BlockQuote,
+                range: ByteRange::new(line_start, line_end),
+                inlines,
+            });
+            pos = next_pos;
+            continue;
+        }
+
+        // List Item (`- `, `* `, `+ `, `1. `, `- [ ] `)
+        if let Some((ordered, indent, task_checked)) = parse_list_item_kind(line_trimmed) {
+            let inlines = parse_inlines(source, line_start, line_end);
+            blocks.push(BlockNode {
+                kind: BlockKind::ListItem {
+                    ordered,
+                    indent,
+                    task_checked,
+                },
+                range: ByteRange::new(line_start, line_end),
+                inlines,
+            });
+            pos = next_pos;
+            continue;
+        }
+
+        // Table row (`| ... |`)
+        if line_trimmed.trim().starts_with('|') && line_trimmed.trim().ends_with('|') {
+            let inlines = parse_inlines(source, line_start, line_end);
+            blocks.push(BlockNode {
+                kind: BlockKind::Table,
+                range: ByteRange::new(line_start, line_end),
+                inlines,
             });
             pos = next_pos;
             continue;
@@ -188,6 +264,207 @@ pub fn parse_blocks(source: &str) -> Vec<BlockNode> {
     }
 
     blocks
+}
+
+fn parse_opening_fence_line(line: &str) -> Option<(u8, usize, String)> {
+    let bytes = line.as_bytes();
+    let mut indent = 0usize;
+    while indent < bytes.len() && bytes[indent] == b' ' && indent < 4 {
+        indent += 1;
+    }
+    if indent >= 4 || indent >= bytes.len() {
+        return None;
+    }
+    let ch = bytes[indent];
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let mut run = 0usize;
+    while indent + run < bytes.len() && bytes[indent + run] == ch {
+        run += 1;
+    }
+    if run < 3 {
+        return None;
+    }
+    let info = &line[indent + run..];
+    if ch == b'`' && info.contains('`') {
+        return None;
+    }
+    Some((ch, run, info.trim().to_string()))
+}
+
+fn is_closing_fence_line(line: &str, fence_char: u8, min_len: usize) -> bool {
+    let bytes = line.as_bytes();
+    let mut indent = 0usize;
+    while indent < bytes.len() && bytes[indent] == b' ' && indent < 4 {
+        indent += 1;
+    }
+    if indent >= 4 || indent >= bytes.len() {
+        return false;
+    }
+    let mut run = 0usize;
+    while indent + run < bytes.len() && bytes[indent + run] == fence_char {
+        run += 1;
+    }
+    if run < min_len {
+        return false;
+    }
+    line[indent + run..].trim().is_empty()
+}
+
+fn parse_list_item_kind(line: &str) -> Option<(bool, usize, Option<bool>)> {
+    let bytes = line.as_bytes();
+    let mut indent = 0usize;
+    while indent < bytes.len() && bytes[indent] == b' ' {
+        indent += 1;
+    }
+    let rest = &line[indent..];
+    if rest.starts_with("- [ ] ") {
+        return Some((false, indent, Some(false)));
+    }
+    if rest.starts_with("- [x] ") || rest.starts_with("- [X] ") {
+        return Some((false, indent, Some(true)));
+    }
+    for m in ["- ", "* ", "+ "] {
+        if rest.starts_with(m) {
+            return Some((false, indent, None));
+        }
+    }
+    let mut digits = 0usize;
+    while digits < rest.len() && rest.as_bytes()[digits].is_ascii_digit() {
+        digits += 1;
+    }
+    if digits > 0 && rest[digits..].starts_with(". ") {
+        return Some((true, indent, None));
+    }
+    None
+}
+
+/// Sidebar Outline item extracted from document headings (PRD 4.5 F-04).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutlineItem {
+    pub level: u8,
+    pub title: String,
+    pub block_range: ByteRange,
+    pub content_range: ByteRange,
+}
+
+/// Extract document outline (`H1`..`H6`) with exact source byte ranges, ignoring `#` inside
+/// fenced code blocks or YAML Front Matter (PRD 4.5 F-04).
+pub fn extract_outline(source: &str) -> Vec<OutlineItem> {
+    let blocks = parse_blocks(source);
+    let mut outline = Vec::new();
+    for block in blocks {
+        if let BlockKind::Heading {
+            level,
+            prefix_range,
+        } = block.kind
+        {
+            let content_range = ByteRange::new(prefix_range.end, block.range.end);
+            let title = source[content_range.start..content_range.end]
+                .trim()
+                .to_string();
+            outline.push(OutlineItem {
+                level,
+                title,
+                block_range: block.range,
+                content_range,
+            });
+        }
+    }
+    outline
+}
+
+/// Returns the index in `outline` of the heading section that currently contains `caret` (PRD 4.5 F-04).
+pub fn active_outline_index(outline: &[OutlineItem], caret: ByteOffset) -> Option<usize> {
+    let mut active = None;
+    for (idx, item) in outline.iter().enumerate() {
+        if item.block_range.start <= caret {
+            active = Some(idx);
+        } else {
+            break;
+        }
+    }
+    active
+}
+
+/// Clipboard copy payload containing both Markdown (`text/plain`) and HTML (`text/html`) with
+/// automatically completed paired inline markers when a selection partially overlaps inline elements (PRD 4.1.1 D & 4.6 X-06).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopyPayload {
+    pub markdown: String,
+    pub html: String,
+}
+
+/// Generates `CopyPayload` (`text/plain` + `text/html`) for `selection` in `source`, automatically
+/// completing paired inline markers (`**`, `*`, `~~`, `` ` ``) when an inline element is partially selected (PRD 4.1.1 D).
+pub fn copy_selection(source: &str, selection: Selection) -> CopyPayload {
+    if selection.is_caret() {
+        return CopyPayload {
+            markdown: String::new(),
+            html: String::new(),
+        };
+    }
+    let sel_range = selection.range();
+    let mut start = sel_range.start.min(source.len());
+    while start > 0 && !source.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = sel_range.end.min(source.len()).max(start);
+    while end > start && !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    if start == end {
+        return CopyPayload {
+            markdown: String::new(),
+            html: String::new(),
+        };
+    }
+
+    let blocks = parse_blocks(source);
+    let mut prefix_markers = String::new();
+    let mut suffix_markers: Vec<&str> = Vec::new();
+
+    for block in &blocks {
+        for span in &block.inlines {
+            let content_start = span.open_marker.end;
+            let content_end = span.close_marker.start;
+            // Check if the selection intersects the inner text of `span` `[content_start, content_end)`
+            let overlaps_content = start < content_end && end > content_start;
+            if !overlaps_content {
+                continue;
+            }
+            if start > span.open_marker.start {
+                let missing_open = if start < content_start {
+                    &source[span.open_marker.start..start]
+                } else {
+                    &source[span.open_marker.start..span.open_marker.end]
+                };
+                prefix_markers.push_str(missing_open);
+            }
+            if end < span.close_marker.end {
+                let missing_close = if end > content_end {
+                    &source[end..span.close_marker.end]
+                } else {
+                    &source[span.close_marker.start..span.close_marker.end]
+                };
+                suffix_markers.push(missing_close);
+            }
+        }
+    }
+
+    suffix_markers.reverse();
+    let mut markdown = String::with_capacity(
+        prefix_markers.len() + (end - start) + suffix_markers.iter().map(|s| s.len()).sum::<usize>(),
+    );
+    markdown.push_str(&prefix_markers);
+    markdown.push_str(&source[start..end]);
+    for m in suffix_markers {
+        markdown.push_str(m);
+    }
+
+    let html = render_markdown_to_html(&markdown);
+    CopyPayload { markdown, html }
 }
 
 fn parse_atx_heading_prefix(line: &str) -> Option<(u8, usize)> {
@@ -214,6 +491,27 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
         // Skip backslash-escaped characters (`\*`, `\#`, etc., PRD 4.1.1 B.1)
         if bytes[i] == b'\\' && i + 1 < bytes.len() {
             i += 2;
+            continue;
+        }
+
+        // Inline code `` `...` `` (highest inline precedence per CommonMark; escapes are literal inside code spans)
+        if bytes[i] == b'`' {
+            let mut open_len = 1usize;
+            while i + open_len < bytes.len() && bytes[i + open_len] == b'`' {
+                open_len += 1;
+            }
+            if let Some(rel_close) = find_closing_backtick_run(&bytes[i + open_len..], open_len) {
+                let close_idx = i + open_len + rel_close;
+                spans.push(InlineSpan {
+                    kind: InlineKind::InlineCode,
+                    full_range: ByteRange::new(start + i, start + close_idx + open_len),
+                    open_marker: ByteRange::new(start + i, start + i + open_len),
+                    close_marker: ByteRange::new(start + close_idx, start + close_idx + open_len),
+                });
+                i = close_idx + open_len;
+                continue;
+            }
+            i += open_len;
             continue;
         }
 
@@ -286,18 +584,34 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
             }
         }
 
-        // Inline code `` `...` ``
-        if bytes[i] == b'`' {
-            if let Some(rel_close) = find_closing_single(&bytes[i + 1..], b'`') {
-                let close_idx = i + 1 + rel_close;
-                spans.push(InlineSpan {
-                    kind: InlineKind::InlineCode,
-                    full_range: ByteRange::new(start + i, start + close_idx + 1),
-                    open_marker: ByteRange::new(start + i, start + i + 1),
-                    close_marker: ByteRange::new(start + close_idx, start + close_idx + 1),
-                });
-                i = close_idx + 1;
-                continue;
+        // Image `![alt](url)` and Link `[text](url)`
+        let link_open_len = if bytes[i] == b'!' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            Some((InlineKind::Image, 2usize))
+        } else if bytes[i] == b'[' {
+            Some((InlineKind::Link, 1usize))
+        } else {
+            None
+        };
+        if let Some((kind, open_len)) = link_open_len {
+            if let Some(rel_bracket) = find_closing_single(&bytes[i + open_len..], b']') {
+                let close_bracket = i + open_len + rel_bracket;
+                if close_bracket + 1 < bytes.len() && bytes[close_bracket + 1] == b'(' {
+                    if let Some(close_paren) = find_matching_paren(&bytes[close_bracket + 2..]) {
+                        let span_end = close_bracket + 2 + close_paren + 1;
+                        spans.push(InlineSpan {
+                            kind,
+                            full_range: ByteRange::new(start + i, start + span_end),
+                            open_marker: ByteRange::new(start + i, start + i + open_len),
+                            close_marker: ByteRange::new(start + close_bracket, start + span_end),
+                        });
+                        if kind == InlineKind::Link && close_bracket > i + open_len {
+                            let nested = parse_inlines(source, start + i + open_len, start + close_bracket);
+                            spans.extend(nested);
+                        }
+                        i = span_end;
+                        continue;
+                    }
+                }
             }
         }
 
@@ -305,6 +619,46 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
     }
 
     spans
+}
+
+fn find_closing_backtick_run(bytes: &[u8], run_len: usize) -> Option<usize> {
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let mut run = 0usize;
+            while i + run < bytes.len() && bytes[i + run] == b'`' {
+                run += 1;
+            }
+            if run == run_len {
+                return Some(i);
+            }
+            i += run;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_matching_paren(bytes: &[u8]) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'(' {
+            depth += 1;
+        } else if bytes[i] == b')' {
+            if depth == 0 {
+                return Some(i);
+            }
+            depth -= 1;
+        }
+        i += 1;
+    }
+    None
 }
 
 fn find_closing_double(bytes: &[u8], marker: u8) -> Option<usize> {
@@ -360,6 +714,14 @@ mod tests {
 
         // Non-empty selection across the paragraph -> NO markers expand (PRD 4.1.1 A)
         assert!(b.expanded_inline_spans(Selection::new(0, 15)).is_empty());
+
+        // PRD 4.1.1 G #11: Link markers expand when caret is inside `[text](url)`
+        let link_src = "See [Vellmark](https://example.com) now";
+        let link_blocks = parse_blocks(link_src);
+        let inside_url = "See [Vellmark](https://".len();
+        let expanded_links = link_blocks[0].expanded_inline_spans(Selection::caret(inside_url));
+        assert_eq!(expanded_links.len(), 1);
+        assert_eq!(expanded_links[0].kind, InlineKind::Link);
     }
 
     #[test]
@@ -393,5 +755,125 @@ mod tests {
         assert!(out.contains("type=\"checkbox\""));
         assert!(out.contains("<table>"));
         assert!(out.contains("<del>2</del>"));
+    }
+
+    #[test]
+    fn test_prd_f04_extract_outline_ignores_frontmatter_and_code_fences() {
+        let md = "---\n# not a heading\n---\n# Chapter 1\n```sh\n# comment\n```\n## Section 1.1\nBody";
+        let outline = extract_outline(md);
+        assert_eq!(outline.len(), 2);
+        assert_eq!(outline[0].level, 1);
+        assert_eq!(outline[0].title, "Chapter 1");
+        assert_eq!(outline[1].level, 2);
+        assert_eq!(outline[1].title, "Section 1.1");
+
+        // Caret inside body of Section 1.1 highlights index 1
+        assert_eq!(active_outline_index(&outline, md.len() - 2), Some(1));
+    }
+
+    #[test]
+    fn test_prd_4_1_1_d_copy_selection_auto_balances_partial_inline_markers() {
+        // PRD 4.1.1 D: Partially selecting "bold" inside "hello **bold text** world"
+        // automatically completes paired `**` markers in both Markdown and HTML clipboard formats.
+        let src = "hello **bold text** world";
+        let start = "hello **".len();
+        let end = start + "bold".len();
+        let payload = copy_selection(src, Selection::new(start, end));
+        assert_eq!(payload.markdown, "**bold**");
+        assert_eq!(payload.html.trim(), "<p><strong>bold</strong></p>");
+    }
+
+    #[test]
+    fn test_inline_code_precedence_and_partial_link_copy_selection() {
+        // Inline code must suppress bold/link parsing inside backtick spans (multi-backtick included)
+        let code_src = "Use ``**raw** [not](link)`` here and [click **here**](https://example.com)";
+        let spans = parse_inlines(code_src, 0, code_src.len());
+        let has_raw_code = spans.iter().any(|s| {
+            s.kind == InlineKind::InlineCode
+                && &code_src[s.full_range.start..s.full_range.end] == "``**raw** [not](link)``"
+        });
+        assert!(has_raw_code, "expected multi-backtick inline code span");
+
+        // No bold or link span should be emitted for `**raw** [not](link)` inside inline code
+        let code_span = spans
+            .iter()
+            .find(|s| s.kind == InlineKind::InlineCode)
+            .expect("inline code span");
+        let has_false_nested = spans.iter().any(|s| {
+            s.kind != InlineKind::InlineCode
+                && s.full_range.start >= code_span.full_range.start
+                && s.full_range.end <= code_span.full_range.end
+        });
+        assert!(
+            !has_false_nested,
+            "inline code should suppress bold/link parsing inside it"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.kind == InlineKind::Link
+                    && &code_src[s.full_range.start..s.full_range.end]
+                        == "[click **here**](https://example.com)"),
+            "expected trailing link span"
+        );
+
+        // Partial selection inside `[hello world](https://example.com)` completes paired `[` and `](url)`
+        let link_src = "Visit [hello world](https://example.com) now";
+        let start = "Visit [".len();
+        let end = start + "hello".len();
+        let payload = copy_selection(link_src, Selection::new(start, end));
+        assert_eq!(payload.markdown, "[hello](https://example.com)");
+        assert_eq!(
+            payload.html.trim(),
+            "<p><a href=\"https://example.com\">hello</a></p>"
+        );
+
+        // Starting right at content_start inside emphasis still completes symmetric marker
+        let em_src = "say *hello world*";
+        let em_start = "say *".len();
+        let em_end = em_start + "hello".len();
+        let em_payload = copy_selection(em_src, Selection::new(em_start, em_end));
+        assert_eq!(em_payload.markdown, "*hello*");
+    }
+
+    #[test]
+    fn test_fenced_code_and_yaml_front_matter_boundaries_do_not_overlap() {
+        let md = "---\ntitle: Test\n---\n````md\n```\n# inside fence\n```\n````\n# Real Heading\n";
+        let blocks = parse_blocks(md);
+        assert_eq!(blocks.len(), 3, "expected front matter, fence, and heading");
+
+        assert_eq!(blocks[0].kind, BlockKind::YamlFrontMatter);
+        assert_eq!(blocks[0].range.start, 0);
+        assert!(&md[blocks[0].range.start..blocks[0].range.end].ends_with("---"));
+
+        match &blocks[1].kind {
+            BlockKind::CodeFence { info_string } => {
+                assert_eq!(info_string, "md");
+                let slice = &md[blocks[1].range.start..blocks[1].range.end];
+                assert!(slice.starts_with("````md"));
+                assert!(slice.ends_with("````"));
+                assert!(slice.contains("# inside fence"));
+            }
+            other => panic!("expected CodeFence, got {other:?}"),
+        }
+
+        match &blocks[2].kind {
+            BlockKind::Heading { level, .. } => {
+                assert_eq!(*level, 1);
+                let slice = &md[blocks[2].range.start..blocks[2].range.end];
+                assert!(slice.contains("Real Heading"));
+            }
+            other => panic!("expected Heading, got {other:?}"),
+        }
+
+        // Strict monotonicity / non-overlapping check
+        for pair in blocks.windows(2) {
+            assert!(
+                pair[0].range.end <= pair[1].range.start,
+                "adjacent blocks overlapped: {} > {}",
+                pair[0].range.end,
+                pair[1].range.start
+            );
+        }
     }
 }

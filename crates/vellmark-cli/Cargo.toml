@@ -10,3 +10,4 @@ repository.workspace = true
 vellmark-core.workspace = true
 vellmark-parser.workspace = true
 vellmark-export.workspace = true
+vellmark-theme.workspace = true

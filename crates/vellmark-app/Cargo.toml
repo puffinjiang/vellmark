@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde.workspace = true
 vellmark-core.workspace = true
 vellmark-parser.workspace = true
 vellmark-theme.workspace = true

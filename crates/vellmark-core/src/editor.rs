@@ -6,6 +6,7 @@
 //!   task lists, blockquotes, fenced code blocks, and tables (4.1.1 C & G)
 
 use crate::buffer::{ByteOffset, ByteRange, Selection, TextBuffer};
+use crate::encoding::LineEnding;
 use crate::undo::{EditKind, EditOp, Transaction, UndoHistory};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,16 +18,82 @@ pub enum ViewMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorAction {
     InsertChar(char),
+    InsertText(String),
     Backspace,
     Enter,
     Tab,
     ShiftTab,
+    SelectAll,
     ToggleSourceMode,
+    ToggleBold,
+    ToggleItalic,
+    ToggleInlineCode,
+    ToggleStrikethrough,
+    SetHeadingLevel(u8),
+    ToggleTaskCheckbox,
+    AlignCurrentTable,
     Undo,
     Redo,
 }
 
-/// Stateful editor controller wrapping `TextBuffer`, `Selection`, `UndoHistory`,
+/// Pure view/selection/IME state attached to a document session without duplicating `TextBuffer` or `UndoHistory`.
+#[derive(Debug, Clone)]
+pub struct EditorViewState {
+    pub selection: Selection,
+    pub mode: ViewMode,
+    /// Active IME pre-edit string (never written to `buffer` until `ime_commit`, PRD 4.1.1 F).
+    pub ime_preedit: Option<String>,
+    /// Full `Selection` (preserving `anchor` and `head` direction) where the active IME composition
+    /// started, so if the user clicks/moves the cursor before `ime_commit` arrives, committed text is
+    /// inserted at the original composition range, and `undo()` restores the exact directional selection.
+    pub ime_composition_selection: Option<Selection>,
+    /// Tracks whether block expansion is frozen due to active IME composition.
+    pub expansion_frozen: bool,
+}
+
+impl Default for EditorViewState {
+    fn default() -> Self {
+        Self {
+            selection: Selection::caret(0),
+            mode: ViewMode::Wysiwyg,
+            ime_preedit: None,
+            ime_composition_selection: None,
+            expansion_frozen: false,
+        }
+    }
+}
+
+impl EditorViewState {
+    pub fn context<'a>(
+        &'a mut self,
+        buffer: &'a mut TextBuffer,
+        undo: &'a mut UndoHistory,
+    ) -> EditorContext<'a> {
+        EditorContext {
+            buffer,
+            undo,
+            selection: &mut self.selection,
+            mode: &mut self.mode,
+            ime_preedit: &mut self.ime_preedit,
+            ime_composition_selection: &mut self.ime_composition_selection,
+            expansion_frozen: &mut self.expansion_frozen,
+        }
+    }
+}
+
+/// Borrowed editing context shared by standalone `EditorController` and `DocumentSession`
+/// so all structural editing, IME, and undo rules live in one single implementation (zero duplication).
+pub struct EditorContext<'a> {
+    pub buffer: &'a mut TextBuffer,
+    pub undo: &'a mut UndoHistory,
+    pub selection: &'a mut Selection,
+    pub mode: &'a mut ViewMode,
+    pub ime_preedit: &'a mut Option<String>,
+    pub ime_composition_selection: &'a mut Option<Selection>,
+    pub expansion_frozen: &'a mut bool,
+}
+
+/// Stateful standalone editor controller wrapping `TextBuffer`, `Selection`, `UndoHistory`,
 /// `ViewMode`, and active IME composition state (PRD 4.1.1).
 #[derive(Debug, Clone)]
 pub struct EditorController {
@@ -75,11 +142,140 @@ impl EditorController {
         }
     }
 
+    pub fn ctx(&mut self) -> EditorContext<'_> {
+        EditorContext {
+            buffer: &mut self.buffer,
+            undo: &mut self.undo,
+            selection: &mut self.selection,
+            mode: &mut self.mode,
+            ime_preedit: &mut self.ime_preedit,
+            ime_composition_selection: &mut self.ime_composition_selection,
+            expansion_frozen: &mut self.expansion_frozen,
+        }
+    }
+
+    pub fn dispatch(&mut self, action: EditorAction) {
+        self.ctx().dispatch(action);
+    }
+
     /// Toggle between WYSIWYG and Source mode while preserving exact source byte offset (PRD 4.1.1 E & G #11).
     pub fn toggle_mode(&mut self) {
-        self.ime_preedit = None;
-        self.expansion_frozen = false;
-        self.mode = match self.mode {
+        self.ctx().toggle_mode();
+    }
+
+    pub fn set_caret(&mut self, offset: ByteOffset) {
+        self.ctx().set_caret(offset);
+    }
+
+    pub fn set_selection(&mut self, anchor: ByteOffset, head: ByteOffset) {
+        self.ctx().set_selection(anchor, head);
+    }
+
+    pub fn ime_update(&mut self, preedit: &str) {
+        self.ctx().ime_update(preedit);
+    }
+
+    pub fn ime_cancel(&mut self) {
+        self.ctx().ime_cancel();
+    }
+
+    pub fn abort_ime_preedit(&mut self) {
+        self.ctx().abort_ime_preedit();
+    }
+
+    pub fn ime_commit(&mut self, committed: &str) {
+        self.ctx().ime_commit(committed);
+    }
+
+    pub fn insert_char(&mut self, ch: char) {
+        self.ctx().insert_char(ch);
+    }
+
+    pub fn insert_text(&mut self, text: &str) {
+        self.ctx().insert_text(text);
+    }
+
+    pub fn toggle_inline_wrap(&mut self, marker: &str) {
+        self.ctx().toggle_inline_wrap(marker);
+    }
+
+    pub fn insert_link(&mut self, url: &str) {
+        self.ctx().insert_link(url);
+    }
+
+    pub fn set_heading_level(&mut self, level: u8) {
+        self.ctx().set_heading_level(level);
+    }
+
+    pub fn toggle_task_checkbox(&mut self) -> bool {
+        self.ctx().toggle_task_checkbox()
+    }
+
+    pub fn backspace(&mut self) {
+        self.ctx().backspace();
+    }
+
+    pub fn tab(&mut self) {
+        self.ctx().tab();
+    }
+
+    pub fn shift_tab(&mut self) {
+        self.ctx().shift_tab();
+    }
+
+    pub fn enter(&mut self) {
+        self.ctx().enter();
+    }
+
+    pub fn undo(&mut self) {
+        self.ctx().undo();
+    }
+
+    pub fn redo(&mut self) {
+        self.ctx().redo();
+    }
+
+    pub fn select_all(&mut self) {
+        self.ctx().select_all();
+    }
+
+    pub fn align_current_table(&mut self) -> bool {
+        self.ctx().align_current_table()
+    }
+}
+
+impl EditorContext<'_> {
+    pub fn dispatch(&mut self, action: EditorAction) {
+        match action {
+            EditorAction::InsertChar(ch) => self.insert_char(ch),
+            EditorAction::InsertText(text) => self.insert_text(&text),
+            EditorAction::Backspace => self.backspace(),
+            EditorAction::Enter => self.enter(),
+            EditorAction::Tab => self.tab(),
+            EditorAction::ShiftTab => self.shift_tab(),
+            EditorAction::SelectAll => self.select_all(),
+            EditorAction::ToggleSourceMode => self.toggle_mode(),
+            EditorAction::ToggleBold => self.toggle_inline_wrap("**"),
+            EditorAction::ToggleItalic => self.toggle_inline_wrap("*"),
+            EditorAction::ToggleInlineCode => self.toggle_inline_wrap("`"),
+            EditorAction::ToggleStrikethrough => self.toggle_inline_wrap("~~"),
+            EditorAction::SetHeadingLevel(lvl) => self.set_heading_level(lvl),
+            EditorAction::ToggleTaskCheckbox => {
+                self.toggle_task_checkbox();
+            }
+            EditorAction::AlignCurrentTable => {
+                self.align_current_table();
+            }
+            EditorAction::Undo => self.undo(),
+            EditorAction::Redo => self.redo(),
+        }
+    }
+
+    /// Toggle between WYSIWYG and Source mode while preserving exact source byte offset (PRD 4.1.1 E & G #11).
+    pub fn toggle_mode(&mut self) {
+        *self.ime_preedit = None;
+        *self.expansion_frozen = false;
+        *self.mode = match *self.mode {
             ViewMode::Wysiwyg => ViewMode::Source,
             ViewMode::Source => ViewMode::Wysiwyg,
         };
@@ -88,17 +284,17 @@ impl EditorController {
     pub fn set_caret(&mut self, offset: ByteOffset) {
         // Keep `ime_composition_selection` intact if an IME session was active so a subsequent `ime_commit`
         // triggered by the focus/click change still commits at the original composition range!
-        self.ime_preedit = None;
-        self.expansion_frozen = false;
+        *self.ime_preedit = None;
+        *self.expansion_frozen = false;
         let clamped = offset.min(self.buffer.len_bytes());
-        self.selection = Selection::caret(clamped);
+        *self.selection = Selection::caret(clamped);
     }
 
     pub fn set_selection(&mut self, anchor: ByteOffset, head: ByteOffset) {
-        self.ime_preedit = None;
-        self.expansion_frozen = false;
+        *self.ime_preedit = None;
+        *self.expansion_frozen = false;
         let max = self.buffer.len_bytes();
-        self.selection = Selection::new(anchor.min(max), head.min(max));
+        *self.selection = Selection::new(anchor.min(max), head.min(max));
     }
 
     /// Start or update IME composition (PRD 4.1.1 F):
@@ -107,24 +303,24 @@ impl EditorController {
     /// and block expansion is frozen.
     pub fn ime_update(&mut self, preedit: &str) {
         if self.ime_composition_selection.is_none() {
-            self.ime_composition_selection = Some(self.selection);
+            *self.ime_composition_selection = Some(*self.selection);
         }
-        self.ime_preedit = Some(preedit.to_string());
-        self.expansion_frozen = true;
+        *self.ime_preedit = Some(preedit.to_string());
+        *self.expansion_frozen = true;
     }
 
     /// Cancel IME composition (e.g. Esc key handled by IME, PRD 4.1.1 F).
     pub fn ime_cancel(&mut self) {
-        self.ime_preedit = None;
-        self.ime_composition_selection = None;
-        self.expansion_frozen = false;
+        *self.ime_preedit = None;
+        *self.ime_composition_selection = None;
+        *self.expansion_frozen = false;
     }
 
     /// Clear unconfirmed IME preedit and composition anchor when a non-IME edit occurs.
     pub fn abort_ime_preedit(&mut self) {
-        self.ime_preedit = None;
-        self.ime_composition_selection = None;
-        self.expansion_frozen = false;
+        *self.ime_preedit = None;
+        *self.ime_composition_selection = None;
+        *self.expansion_frozen = false;
     }
 
     /// Commit IME composition as a single standalone undo transaction (PRD 4.1.1 F & G #9, #10).
@@ -132,17 +328,17 @@ impl EditorController {
     /// inserts `committed` at the original `ime_composition_selection` (so `A|B` -> move to end -> commit `"你"` yields `A你B`)
     /// and shifts the new cursor position by the byte delta if needed.
     pub fn ime_commit(&mut self, committed: &str) {
-        self.ime_preedit = None;
-        self.expansion_frozen = false;
+        *self.ime_preedit = None;
+        *self.expansion_frozen = false;
         let orig_selection = self
             .ime_composition_selection
             .take()
-            .unwrap_or(self.selection);
+            .unwrap_or(*self.selection);
         let target_range = orig_selection.range();
         if committed.is_empty() {
             return;
         }
-        let cursor_moved_away = self.selection != orig_selection;
+        let cursor_moved_away = *self.selection != orig_selection;
         let sel_before = orig_selection;
         let commit_end = target_range.start + committed.len();
         let sel_after = if cursor_moved_away {
@@ -163,14 +359,247 @@ impl EditorController {
             Selection::caret(commit_end)
         };
         self.undo.apply_edit(
-            &mut self.buffer,
+            self.buffer,
             target_range,
             committed,
             sel_before,
             sel_after,
             EditKind::ImeCommit,
         );
-        self.selection = sel_after;
+        *self.selection = sel_after;
+    }
+
+    /// Insert an arbitrary text snippet (e.g. paste / rich-text conversion / image link) as a single transaction.
+    pub fn insert_text(&mut self, text: &str) {
+        self.abort_ime_preedit();
+        if text.is_empty() && self.selection.is_caret() {
+            return;
+        }
+        let range = self.selection.range();
+        let sel_before = *self.selection;
+        let sel_after = Selection::caret(range.start + text.len());
+        self.undo.apply_edit(
+            self.buffer,
+            range,
+            text,
+            sel_before,
+            sel_after,
+            EditKind::Structural,
+        );
+        *self.selection = sel_after;
+    }
+
+    /// Toggle inline Markdown formatting markers (`**`, `*`, `` ` ``, `~~`) around the current selection (PRD 4.10).
+    pub fn toggle_inline_wrap(&mut self, marker: &str) {
+        self.abort_ime_preedit();
+        if marker.is_empty() {
+            return;
+        }
+        let range = self.selection.range();
+        let was_backward = self.selection.anchor > self.selection.head;
+        let sel_before = *self.selection;
+        let m_len = marker.len();
+        let full = self.buffer.to_string();
+        let selected = &full[range.start..range.end];
+        let full_bytes = full.as_bytes();
+        let single_emph = is_single_byte_emphasis_marker(marker);
+
+        // Case 1: Selection itself includes matching opening and closing markers (`**text**` / `*text*`)
+        let mut unwrap_inner = !range.is_empty()
+            && range.len() >= m_len * 2
+            && selected.starts_with(marker)
+            && selected.ends_with(marker);
+        if unwrap_inner && single_emph {
+            let ch = marker.as_bytes()[0];
+            let sel_bytes = selected.as_bytes();
+            let inner_left = count_consecutive_byte_right(sel_bytes, 0, ch);
+            let inner_right = count_consecutive_byte_left(sel_bytes, sel_bytes.len(), ch);
+            let outer_left = count_consecutive_byte_left(full_bytes, range.start, ch);
+            let outer_right = count_consecutive_byte_right(full_bytes, range.end, ch);
+            unwrap_inner = inner_left % 2 == 1
+                && inner_right % 2 == 1
+                && (outer_left + inner_left) % 2 == 1
+                && (inner_right + outer_right) % 2 == 1;
+        }
+        if unwrap_inner {
+            let inner = &selected[m_len..selected.len() - m_len];
+            let new_start = range.start;
+            let new_end = new_start + inner.len();
+            let sel_after = if was_backward {
+                Selection::new(new_end, new_start)
+            } else {
+                Selection::new(new_start, new_end)
+            };
+            self.undo.apply_edit(
+                self.buffer,
+                range,
+                inner,
+                sel_before,
+                sel_after,
+                EditKind::Structural,
+            );
+            *self.selection = sel_after;
+            return;
+        }
+
+        // Case 2: Outer markers immediately wrap the selection (`**` before and `**` after)
+        let mut unwrap_outer = !range.is_empty()
+            && range.start >= m_len
+            && range.end + m_len <= full.len()
+            && full_bytes.get(range.start - m_len..range.start) == Some(marker.as_bytes())
+            && full_bytes.get(range.end..range.end + m_len) == Some(marker.as_bytes());
+        if unwrap_outer && single_emph {
+            let ch = marker.as_bytes()[0];
+            let sel_bytes = selected.as_bytes();
+            let outer_left = count_consecutive_byte_left(full_bytes, range.start, ch);
+            let outer_right = count_consecutive_byte_right(full_bytes, range.end, ch);
+            let inner_left = count_consecutive_byte_right(sel_bytes, 0, ch);
+            let inner_right = count_consecutive_byte_left(sel_bytes, sel_bytes.len(), ch);
+            unwrap_outer = outer_left % 2 == 1
+                && outer_right % 2 == 1
+                && (outer_left + inner_left) % 2 == 1
+                && (inner_right + outer_right) % 2 == 1;
+        }
+        if unwrap_outer {
+            let new_start = range.start - m_len;
+            let new_end = new_start + selected.len();
+            let sel_after = if was_backward {
+                Selection::new(new_end, new_start)
+            } else {
+                Selection::new(new_start, new_end)
+            };
+            self.undo.apply_edit(
+                self.buffer,
+                ByteRange::new(new_start, range.end + m_len),
+                selected,
+                sel_before,
+                sel_after,
+                EditKind::Structural,
+            );
+            *self.selection = sel_after;
+            return;
+        }
+
+        // Case 3: Wrap selection (or insert marker pair around empty caret)
+        let wrapped = format!("{marker}{selected}{marker}");
+        let sel_after = if range.is_empty() {
+            Selection::caret(range.start + m_len)
+        } else if was_backward {
+            Selection::new(range.end + m_len, range.start + m_len)
+        } else {
+            Selection::new(range.start + m_len, range.end + m_len)
+        };
+        self.undo.apply_edit(
+            self.buffer,
+            range,
+            &wrapped,
+            sel_before,
+            sel_after,
+            EditKind::Structural,
+        );
+        *self.selection = sel_after;
+    }
+
+    /// Insert or wrap selection as a Markdown hyperlink `[label](url)` (PRD 4.10 `Cmd/Ctrl+K`).
+    pub fn insert_link(&mut self, url: &str) {
+        self.abort_ime_preedit();
+        let range = self.selection.range();
+        let sel_before = *self.selection;
+        let selected = self.buffer.slice_to_string(range);
+        let snippet = format!("[{selected}]({url})");
+        let caret_pos = if selected.is_empty() {
+            range.start + 1
+        } else {
+            range.start + snippet.len()
+        };
+        let sel_after = Selection::caret(caret_pos);
+        self.undo.apply_edit(
+            self.buffer,
+            range,
+            &snippet,
+            sel_before,
+            sel_after,
+            EditKind::Structural,
+        );
+        *self.selection = sel_after;
+    }
+
+    /// Convert current line to Paragraph (`level == 0`) or Heading 1–6 (`1..=6`, PRD 4.10 `Cmd/Ctrl + 0..6`).
+    pub fn set_heading_level(&mut self, level: u8) {
+        self.abort_ime_preedit();
+        let (line_start, line_end) = self.current_line_bounds();
+        if *self.mode == ViewMode::Wysiwyg && self.is_offset_inside_fenced_code_block(line_start) {
+            return;
+        }
+        let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
+        let old_prefix_len = heading_prefix_len(&line).unwrap_or(0);
+        let new_prefix = if level == 0 || level > 6 {
+            String::new()
+        } else {
+            format!("{} ", "#".repeat(usize::from(level)))
+        };
+        if &line[..old_prefix_len] == new_prefix {
+            return;
+        }
+
+        let sel_before = *self.selection;
+        let rel_head = sel_before.head.saturating_sub(line_start);
+        let new_rel_head = if rel_head <= old_prefix_len {
+            new_prefix.len()
+        } else {
+            (rel_head - old_prefix_len) + new_prefix.len()
+        };
+        let sel_after = Selection::caret(line_start + new_rel_head);
+        self.undo.apply_edit(
+            self.buffer,
+            ByteRange::new(line_start, line_start + old_prefix_len),
+            &new_prefix,
+            sel_before,
+            sel_after,
+            EditKind::Structural,
+        );
+        *self.selection = sel_after;
+    }
+
+    /// Toggle task-list checkbox (`- [ ] ` <-> `- [x] `, or `- ` -> `- [ ] `) on current line.
+    pub fn toggle_task_checkbox(&mut self) -> bool {
+        self.abort_ime_preedit();
+        let (line_start, line_end) = self.current_line_bounds();
+        if *self.mode == ViewMode::Wysiwyg && self.is_offset_inside_fenced_code_block(line_start) {
+            return false;
+        }
+        let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
+        let Some((indent, marker_len)) = list_prefix_parts(&line) else {
+            return false;
+        };
+        let marker = &line[indent..indent + marker_len];
+        let replacement = if marker == "- [ ] " {
+            "- [x] "
+        } else if marker == "- [x] " || marker == "- [X] " {
+            "- [ ] "
+        } else if marker == "- " || marker == "* " || marker == "+ " {
+            "- [ ] "
+        } else {
+            return false;
+        };
+        let sel_before = *self.selection;
+        let delta = replacement.len() as isize - marker.len() as isize;
+        let head = if sel_before.head <= line_start + indent {
+            sel_before.head
+        } else {
+            ((sel_before.head as isize) + delta).max(line_start as isize) as usize
+        };
+        let sel_after = Selection::caret(head);
+        self.undo.apply_edit(
+            self.buffer,
+            ByteRange::new(line_start + indent, line_start + indent + marker_len),
+            replacement,
+            sel_before,
+            sel_after,
+            EditKind::Structural,
+        );
+        *self.selection = sel_after;
+        true
     }
 
     /// Type a character in WYSIWYG/Source mode with automatic syntax trigger recording (PRD 4.1.1 B & G #1, #6).
@@ -181,23 +610,23 @@ impl EditorController {
         let in_code_fence = self.is_offset_inside_fenced_code_block(line_start_before);
 
         // PRD 4.1.1 G #6: Inside a Markdown table line (outside code fence), typing `|` in WYSIWYG mode writes escaped `\|` to source.
-        if self.mode == ViewMode::Wysiwyg
+        if *self.mode == ViewMode::Wysiwyg
             && !in_code_fence
             && ch == '|'
             && self.is_caret_in_table_row()
         {
-            let pos = self.selection.range().start;
-            let sel_before = self.selection;
-            let sel_after = Selection::caret(pos + 2);
+            let range = self.selection.range();
+            let sel_before = *self.selection;
+            let sel_after = Selection::caret(range.start + 2);
             self.undo.apply_edit(
-                &mut self.buffer,
-                self.selection.range(),
+                self.buffer,
+                range,
                 "\\|",
                 sel_before,
                 sel_after,
                 EditKind::Typing,
             );
-            self.selection = sel_after;
+            *self.selection = sel_after;
             return;
         }
 
@@ -205,25 +634,25 @@ impl EditorController {
         let s = ch.encode_utf8(&mut buf);
         let range = self.selection.range();
         let new_caret = range.start + s.len();
-        let sel_before = self.selection;
+        let sel_before = *self.selection;
         let sel_after = Selection::caret(new_caret);
         self.undo.apply_edit(
-            &mut self.buffer,
+            self.buffer,
             range,
             s,
             sel_before,
             sel_after,
             EditKind::Typing,
         );
-        self.selection = sel_after;
+        *self.selection = sel_after;
 
         // P2 fix: Only record WYSIWYG syntax conversion triggers when in `ViewMode::Wysiwyg` AND outside fenced code blocks!
-        if self.mode == ViewMode::Wysiwyg && !in_code_fence && ch == ' ' {
+        if *self.mode == ViewMode::Wysiwyg && !in_code_fence && ch == ' ' {
             let (line_start, line_end) = self.current_line_bounds();
             let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
             if is_just_heading_trigger(&line) && self.selection.head == line_end {
                 self.undo
-                    .record_syntax_trigger(line_start, self.selection);
+                    .record_syntax_trigger(line_start, *self.selection);
             }
         }
     }
@@ -239,17 +668,17 @@ impl EditorController {
 
         if !self.selection.is_caret() {
             let r = self.selection.range();
-            let sel_before = self.selection;
+            let sel_before = *self.selection;
             let sel_after = Selection::caret(r.start);
             self.undo.apply_edit(
-                &mut self.buffer,
+                self.buffer,
                 r,
                 "",
                 sel_before,
                 sel_after,
                 EditKind::Deletion,
             );
-            self.selection = sel_after;
+            *self.selection = sel_after;
             return;
         }
 
@@ -257,21 +686,21 @@ impl EditorController {
         let (line_start, line_end) = self.current_line_bounds();
         let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
 
-        if self.mode == ViewMode::Wysiwyg {
+        if *self.mode == ViewMode::Wysiwyg {
             // PRD 4.1.1 G #8: Backspace at start of empty code block content line converts code block to empty paragraph
             if caret == line_start && line.is_empty() {
                 if let Some(fence_range) = self.enclosing_empty_code_fence_range(line_start) {
-                    let sel_before = self.selection;
+                    let sel_before = *self.selection;
                     let sel_after = Selection::caret(fence_range.start);
                     self.undo.apply_edit(
-                        &mut self.buffer,
+                        self.buffer,
                         fence_range,
                         "",
                         sel_before,
                         sel_after,
                         EditKind::Structural,
                     );
-                    self.selection = sel_after;
+                    *self.selection = sel_after;
                     return;
                 }
             }
@@ -283,17 +712,17 @@ impl EditorController {
                 // PRD 4.1.1 C & G #2: Backspace at start of heading text (either at `line_start` or right after `## `)
                 if let Some(prefix_len) = heading_prefix_len(&line) {
                     if caret == line_start || caret == line_start + prefix_len {
-                        let sel_before = self.selection;
+                        let sel_before = *self.selection;
                         let sel_after = Selection::caret(line_start);
                         self.undo.apply_edit(
-                            &mut self.buffer,
+                            self.buffer,
                             ByteRange::new(line_start, line_start + prefix_len),
                             "",
                             sel_before,
                             sel_after,
                             EditKind::Structural,
                         );
-                        self.selection = sel_after;
+                        *self.selection = sel_after;
                         return;
                     }
                 }
@@ -301,31 +730,31 @@ impl EditorController {
                 // PRD 4.1.1 C: Backspace at start of list item content
                 if let Some((indent_bytes, marker_bytes)) = list_prefix_parts(&line) {
                     if caret == line_start + indent_bytes + marker_bytes {
-                        let sel_before = self.selection;
+                        let sel_before = *self.selection;
                         if indent_bytes >= 2 {
                             // Nested item -> outdent by 2 spaces
                             let sel_after = Selection::caret(caret - 2);
                             self.undo.apply_edit(
-                                &mut self.buffer,
+                                self.buffer,
                                 ByteRange::new(line_start, line_start + 2),
                                 "",
                                 sel_before,
                                 sel_after,
                                 EditKind::Structural,
                             );
-                            self.selection = sel_after;
+                            *self.selection = sel_after;
                         } else {
                             // Top-level list item -> strip list marker, convert to paragraph in place
                             let sel_after = Selection::caret(line_start);
                             self.undo.apply_edit(
-                                &mut self.buffer,
+                                self.buffer,
                                 ByteRange::new(line_start, line_start + indent_bytes + marker_bytes),
                                 "",
                                 sel_before,
                                 sel_after,
                                 EditKind::Structural,
                             );
-                            self.selection = sel_after;
+                            *self.selection = sel_after;
                         }
                         return;
                     }
@@ -342,21 +771,66 @@ impl EditorController {
                 .map(|c| c.len_utf8())
                 .unwrap_or(1);
             let del_range = ByteRange::new(caret - prev_char_len, caret);
-            let sel_before = self.selection;
+            let sel_before = *self.selection;
             let sel_after = Selection::caret(del_range.start);
             self.undo.apply_edit(
-                &mut self.buffer,
+                self.buffer,
                 del_range,
                 "",
                 sel_before,
                 sel_after,
                 EditKind::Deletion,
             );
-            self.selection = sel_after;
+            *self.selection = sel_after;
         }
     }
 
-    /// Handle Shift+Tab (PRD 4.1.1 C & G #4): outdent nested list item by one level (2 spaces).
+    /// Handle Tab (PRD 4.1.1 C, G #6 & 4.3 T-02):
+    /// - In a list item: indent by 2 spaces.
+    /// - In a table cell: jump to next cell on the row, or if at the last cell, jump to the first cell
+    ///   of the next data row (or append a new empty row if at the bottom-right cell of the table).
+    pub fn tab(&mut self) {
+        self.abort_ime_preedit();
+        let (line_start, line_end) = self.current_line_bounds();
+        if *self.mode == ViewMode::Wysiwyg && !self.is_offset_inside_fenced_code_block(line_start) {
+            let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
+            if list_prefix_parts(&line).is_some() {
+                let sel_before = *self.selection;
+                let sel_after = Selection::caret(self.selection.head + 2);
+                self.undo.apply_edit(
+                    self.buffer,
+                    ByteRange::empty(line_start),
+                    "  ",
+                    sel_before,
+                    sel_after,
+                    EditKind::Structural,
+                );
+                *self.selection = sel_after;
+                return;
+            }
+            if self.is_caret_in_table_row() {
+                self.tab_in_table(line_start, line_end, &line);
+                return;
+            }
+        }
+        // Fallback: insert 2 spaces
+        let range = self.selection.range();
+        let sel_before = *self.selection;
+        let sel_after = Selection::caret(range.start + 2);
+        self.undo.apply_edit(
+            self.buffer,
+            range,
+            "  ",
+            sel_before,
+            sel_after,
+            EditKind::Typing,
+        );
+        *self.selection = sel_after;
+    }
+
+    /// Handle Shift+Tab (PRD 4.1.1 C, G #4 & 4.3 T-02):
+    /// - Outdent nested list item by one level (2 spaces).
+    /// - Or move to previous cell in a Markdown table.
     pub fn shift_tab(&mut self) {
         self.abort_ime_preedit();
         let (line_start, line_end) = self.current_line_bounds();
@@ -366,27 +840,74 @@ impl EditorController {
         let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
         if let Some((indent_bytes, _)) = list_prefix_parts(&line) {
             if indent_bytes >= 2 {
-                let sel_before = self.selection;
+                let sel_before = *self.selection;
                 let new_head = self.selection.head.saturating_sub(2).max(line_start);
                 let sel_after = Selection::caret(new_head);
                 self.undo.apply_edit(
-                    &mut self.buffer,
+                    self.buffer,
                     ByteRange::new(line_start, line_start + 2),
                     "",
                     sel_before,
                     sel_after,
                     EditKind::Structural,
                 );
-                self.selection = sel_after;
+                *self.selection = sel_after;
+            }
+            return;
+        }
+        if *self.mode == ViewMode::Wysiwyg && self.is_caret_in_table_row() {
+            let pipes = unescaped_pipe_offsets(&line);
+            let rel_caret = self.selection.head.saturating_sub(line_start);
+            if pipes.len() >= 2 {
+                if let Some(cell_idx) = current_table_cell_index(&pipes, rel_caret) {
+                    if cell_idx > 0 {
+                        let prev_pipe = pipes[cell_idx - 1];
+                        let next_pipe = pipes[cell_idx];
+                        let cell_slice = &line[prev_pipe + 1..next_pipe];
+                        let target_rel = prev_pipe + 1 + table_cell_caret_offset(cell_slice);
+                        *self.selection = Selection::caret(line_start + target_rel);
+                        return;
+                    }
+                    // Cell 0: jump backward to the last cell of the previous non-delimiter table row
+                    let full = self.buffer.to_string();
+                    let mut probe_end = line_start;
+                    while probe_end > 0 {
+                        let before = &full[..probe_end - 1];
+                        let prev_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                        let prev_line = before[prev_start..].trim_end_matches('\r');
+                        if !(prev_line.trim().starts_with('|') && prev_line.trim().ends_with('|')) {
+                            break;
+                        }
+                        if is_table_delimiter_row(prev_line) {
+                            probe_end = prev_start;
+                            continue;
+                        }
+                        let prev_pipes = unescaped_pipe_offsets(prev_line);
+                        if prev_pipes.len() >= 2 {
+                            let last_idx = prev_pipes.len() - 2;
+                            let c_slice = &prev_line[prev_pipes[last_idx] + 1..prev_pipes[last_idx + 1]];
+                            *self.selection = Selection::caret(
+                                prev_start
+                                    + prev_pipes[last_idx]
+                                    + 1
+                                    + table_cell_caret_offset(c_slice),
+                            );
+                        }
+                        break;
+                    }
+                }
             }
         }
     }
 
-    /// Handle Enter with PRD 4.1.1 C & G (#5, #7):
+    /// Handle Enter with PRD 4.1.1 C & G (#5, #6, #7) and 4.3 (T-01, T-02):
     /// - Non-empty selection -> replaces the selected range with `\n` in a single transaction (P2 fix).
     /// - Empty top-level list item (`- ‸`) -> exit list and become empty paragraph.
     /// - Empty nested list item (`  - ‸`) -> outdent one level (`- ‸`).
     /// - Non-empty list item (`- item‸`) -> continue list on next line (`\n- `).
+    /// - Table row (`| a | b |`):
+    ///   - Standalone header row (T-01) -> generates separator + empty data row (`\n| --- | --- |\n|  |  |`).
+    ///   - Existing table row (G #6 & T-02) -> inserts a new empty row below (`\n|  |  |`) and places caret in first cell.
     /// - Inside fenced code block at end of block with 2 trailing empty lines (3rd consecutive Enter, G #7) ->
     ///   remove trailing empty lines and exit code block to a new paragraph after closing ` ``` ` in a SINGLE undo transaction (P2 fix).
     pub fn enter(&mut self) {
@@ -395,17 +916,17 @@ impl EditorController {
         // P2 fix: When a non-empty selection exists, Enter replaces the selected range with `\n`.
         if !self.selection.is_caret() {
             let range = self.selection.range();
-            let sel_before = self.selection;
+            let sel_before = *self.selection;
             let sel_after = Selection::caret(range.start + 1);
             self.undo.apply_edit(
-                &mut self.buffer,
+                self.buffer,
                 range,
                 "\n",
                 sel_before,
                 sel_after,
                 EditKind::Typing,
             );
-            self.selection = sel_after;
+            *self.selection = sel_after;
             return;
         }
 
@@ -413,7 +934,7 @@ impl EditorController {
         let (line_start, line_end) = self.current_line_bounds();
         let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
 
-        if self.mode == ViewMode::Wysiwyg {
+        if *self.mode == ViewMode::Wysiwyg {
             let in_code_fence = self.is_offset_inside_fenced_code_block(line_start);
 
             // PRD 4.1.1 G #5: List item handling (only outside fenced code blocks)
@@ -421,48 +942,89 @@ impl EditorController {
                 if let Some((indent_bytes, marker_bytes)) = list_prefix_parts(&line) {
                     let content_after_marker = line[indent_bytes + marker_bytes..].trim();
                     if content_after_marker.is_empty() {
-                        let sel_before = self.selection;
+                        let sel_before = *self.selection;
                         if indent_bytes >= 2 {
                             // Outdent nested empty item
                             let sel_after = Selection::caret(caret - 2);
                             self.undo.apply_edit(
-                                &mut self.buffer,
+                                self.buffer,
                                 ByteRange::new(line_start, line_start + 2),
                                 "",
                                 sel_before,
                                 sel_after,
                                 EditKind::Structural,
                             );
-                            self.selection = sel_after;
+                            *self.selection = sel_after;
                         } else {
                             // Exit top-level list -> empty paragraph
                             let sel_after = Selection::caret(line_start);
                             self.undo.apply_edit(
-                                &mut self.buffer,
+                                self.buffer,
                                 ByteRange::new(line_start, line_end),
                                 "",
                                 sel_before,
                                 sel_after,
                                 EditKind::Structural,
                             );
-                            self.selection = sel_after;
+                            *self.selection = sel_after;
                         }
                         return;
                     } else if caret == line_end {
                         // Continue list on next line
                         let prefix = &line[..indent_bytes + marker_bytes];
                         let insertion = format!("\n{prefix}");
-                        let sel_before = self.selection;
+                        let sel_before = *self.selection;
                         let sel_after = Selection::caret(caret + insertion.len());
                         self.undo.apply_edit(
-                            &mut self.buffer,
+                            self.buffer,
                             ByteRange::empty(caret),
                             &insertion,
                             sel_before,
                             sel_after,
                             EditKind::Structural,
                         );
-                        self.selection = sel_after;
+                        *self.selection = sel_after;
+                        return;
+                    }
+                }
+
+                // PRD 4.1.1 G #6 & 4.3 T-01 / T-02: Table Enter handling
+                if self.is_caret_in_table_row() {
+                    let pipes = unescaped_pipe_offsets(&line);
+                    if pipes.len() >= 2 {
+                        let cols = pipes.len() - 1;
+                        let empty_row = build_empty_table_row(cols);
+                        let is_standalone_header = !self.has_adjacent_table_row(line_start, line_end)
+                            && !is_table_delimiter_row(&line);
+
+                        let full = self.buffer.to_string();
+                        let nl = detect_line_ending_str(&full);
+                        let insert_pos = table_row_insert_pos(&full, line_start, line_end);
+
+                        let (insertion, caret_offset_in_insertion) = if is_standalone_header {
+                            // PRD 4.3 T-01: `| a | b |` + Enter -> create separator row + first empty data row
+                            let sep_row = build_table_separator_row(cols);
+                            let ins = format!("{nl}{sep_row}{nl}{empty_row}");
+                            let caret_rel = nl.len() + sep_row.len() + nl.len() + 2; // inside `| ‸ |` of empty_row
+                            (ins, caret_rel)
+                        } else {
+                            // PRD 4.1.1 G #6 & 4.3 T-02: Enter inside table inserts a new row below
+                            let ins = format!("{nl}{empty_row}");
+                            let caret_rel = nl.len() + 2; // after `<nl>| `
+                            (ins, caret_rel)
+                        };
+
+                        let sel_before = *self.selection;
+                        let sel_after = Selection::caret(insert_pos + caret_offset_in_insertion);
+                        self.undo.apply_edit(
+                            self.buffer,
+                            ByteRange::empty(insert_pos),
+                            &insertion,
+                            sel_before,
+                            sel_after,
+                            EditKind::Structural,
+                        );
+                        *self.selection = sel_after;
                         return;
                     }
                 }
@@ -473,7 +1035,7 @@ impl EditorController {
             if let Some((strip_range, closing_fence_end)) =
                 self.check_third_enter_at_code_fence_end(caret)
             {
-                let sel_before = self.selection;
+                let sel_before = *self.selection;
                 let removed_len = strip_range.len();
                 let deleted = self.buffer.replace_bytes(strip_range, "");
                 let mut ops = vec![EditOp {
@@ -502,37 +1064,251 @@ impl EditorController {
                     selection_after: sel_after,
                     kind: EditKind::Structural,
                 });
-                self.selection = sel_after;
+                *self.selection = sel_after;
                 return;
             }
         }
 
         // Default newline insertion
-        let sel_before = self.selection;
+        let sel_before = *self.selection;
         let sel_after = Selection::caret(caret + 1);
         self.undo.apply_edit(
-            &mut self.buffer,
+            self.buffer,
             ByteRange::empty(caret),
             "\n",
             sel_before,
             sel_after,
             EditKind::Typing,
         );
-        self.selection = sel_after;
+        *self.selection = sel_after;
     }
 
     pub fn undo(&mut self) {
         self.abort_ime_preedit();
-        if let Some(sel) = self.undo.undo(&mut self.buffer) {
-            self.selection = sel;
+        if let Some(sel) = self.undo.undo(self.buffer) {
+            *self.selection = sel;
         }
     }
 
     pub fn redo(&mut self) {
         self.abort_ime_preedit();
-        if let Some(sel) = self.undo.redo(&mut self.buffer) {
-            self.selection = sel;
+        if let Some(sel) = self.undo.redo(self.buffer) {
+            *self.selection = sel;
         }
+    }
+
+    /// Progressive Select-All (`Cmd/Ctrl + A`, PRD 4.1.1 D):
+    /// - 1st invocation: selects the current block's content (or inside a fenced code block / table cell,
+    ///   selects the current code block body / table cell content).
+    /// - 2nd consecutive invocation (when selection already matches the current block target): selects the entire document.
+    pub fn select_all(&mut self) {
+        self.abort_ime_preedit();
+        let doc_len = self.buffer.len_bytes();
+        let (line_start, line_end) = self.current_line_bounds();
+
+        let block_target = if let Some(body_range) =
+            self.enclosing_fenced_code_block_body_range(line_start)
+        {
+            body_range
+        } else if self.is_caret_in_table_row() {
+            let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
+            let pipes = unescaped_pipe_offsets(&line);
+            let rel_caret = self.selection.head.saturating_sub(line_start);
+            if let Some(cell_idx) = current_table_cell_index(&pipes, rel_caret) {
+                let c_start = line_start + pipes[cell_idx] + 1;
+                let c_end = line_start + pipes[cell_idx + 1];
+                let raw_cell = self.buffer.slice_to_string(ByteRange::new(c_start, c_end));
+                let trim_l = raw_cell.len() - raw_cell.trim_start().len();
+                let trim_r = raw_cell.len() - raw_cell.trim_end().len();
+                let inner_start = (c_start + trim_l).min(c_end);
+                let inner_end = c_end.saturating_sub(trim_r).max(inner_start);
+                ByteRange::new(inner_start, inner_end)
+            } else {
+                ByteRange::new(line_start, line_end)
+            }
+        } else {
+            ByteRange::new(line_start, line_end)
+        };
+
+        if !block_target.is_empty() && self.selection.range() != block_target {
+            *self.selection = Selection::new(block_target.start, block_target.end);
+        } else {
+            *self.selection = Selection::new(0, doc_len);
+        }
+    }
+
+    /// Re-aligns ONLY the Markdown table containing the caret (PRD 4.3 T-03 & 5.2 #2) as a single
+    /// undoable transaction. Returns `true` if a table was found and its source changed.
+    pub fn align_current_table(&mut self) -> bool {
+        self.abort_ime_preedit();
+        let (line_start, _) = self.current_line_bounds();
+        if self.is_offset_inside_fenced_code_block(line_start) || !self.is_caret_in_table_row() {
+            return false;
+        }
+        let full = self.buffer.to_string();
+        let Some(table_range) = find_enclosing_table_range(&full, line_start) else {
+            return false;
+        };
+        let raw_table = &full[table_range.start..table_range.end];
+        let aligned = format_markdown_table(raw_table);
+        if aligned == raw_table {
+            return false;
+        }
+        let sel_before = *self.selection;
+        let mut rel_after = aligned
+            .len()
+            .min(sel_before.head.saturating_sub(table_range.start));
+        while rel_after > 0 && !aligned.is_char_boundary(rel_after) {
+            rel_after -= 1;
+        }
+        let sel_after = Selection::caret(table_range.start + rel_after);
+        self.undo.apply_edit(
+            self.buffer,
+            table_range,
+            &aligned,
+            sel_before,
+            sel_after,
+            EditKind::Structural,
+        );
+        *self.selection = sel_after;
+        true
+    }
+
+    fn tab_in_table(&mut self, line_start: ByteOffset, line_end: ByteOffset, line: &str) {
+        let pipes = unescaped_pipe_offsets(line);
+        if pipes.len() < 2 {
+            return;
+        }
+        let cols = pipes.len() - 1;
+        let rel_caret = self.selection.head.saturating_sub(line_start);
+        let cell_idx = current_table_cell_index(&pipes, rel_caret).unwrap_or(0);
+
+        if cell_idx + 1 < cols {
+            // Move to next cell on the same row
+            let p_start = pipes[cell_idx + 1];
+            let p_end = pipes[cell_idx + 2];
+            let cell_slice = &line[p_start + 1..p_end];
+            let target_rel = p_start + 1 + table_cell_caret_offset(cell_slice);
+            *self.selection = Selection::caret(line_start + target_rel);
+            return;
+        }
+
+        // At last cell of current row: check if there is a next row in the table
+        let full = self.buffer.to_string();
+        let mut probe_start = if line_end < full.len() {
+            line_end + 1
+        } else {
+            full.len()
+        };
+        while probe_start < full.len() {
+            let rel_end = full[probe_start..]
+                .find('\n')
+                .unwrap_or(full.len() - probe_start);
+            let next_line_end = probe_start + rel_end;
+            let next_line = full[probe_start..next_line_end].trim_end_matches('\r');
+            if !(next_line.trim().starts_with('|') && next_line.trim().ends_with('|')) {
+                break;
+            }
+            if is_table_delimiter_row(next_line) {
+                probe_start = if next_line_end < full.len() {
+                    next_line_end + 1
+                } else {
+                    full.len()
+                };
+                continue;
+            }
+            let next_pipes = unescaped_pipe_offsets(next_line);
+            if next_pipes.len() >= 2 {
+                let c_slice = &next_line[next_pipes[0] + 1..next_pipes[1]];
+                *self.selection =
+                    Selection::caret(probe_start + next_pipes[0] + 1 + table_cell_caret_offset(c_slice));
+                return;
+            }
+            break;
+        }
+
+        // Bottom-right cell of table: append a new empty row (PRD 4.1.1 G #6)
+        let nl = detect_line_ending_str(&full);
+        let insert_pos = table_row_insert_pos(&full, line_start, line_end);
+        let empty_row = build_empty_table_row(cols);
+        let insertion = format!("{nl}{empty_row}");
+        let sel_before = *self.selection;
+        let sel_after = Selection::caret(insert_pos + nl.len() + 2); // inside `| ‸ |` of new row
+        self.undo.apply_edit(
+            self.buffer,
+            ByteRange::empty(insert_pos),
+            &insertion,
+            sel_before,
+            sel_after,
+            EditKind::Structural,
+        );
+        *self.selection = sel_after;
+    }
+
+    fn has_adjacent_table_row(&self, line_start: ByteOffset, line_end: ByteOffset) -> bool {
+        let full = self.buffer.to_string();
+        if line_start > 0 {
+            let before = &full[..line_start - 1];
+            let prev_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let prev_line = before[prev_start..].trim_end_matches('\r').trim();
+            if prev_line.starts_with('|') && prev_line.ends_with('|') {
+                return true;
+            }
+        }
+        if line_end < full.len() {
+            let after = &full[line_end + 1..];
+            let next_len = after.find('\n').unwrap_or(after.len());
+            let next_line = after[..next_len].trim_end_matches('\r').trim();
+            if next_line.starts_with('|') && next_line.ends_with('|') {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn enclosing_fenced_code_block_body_range(
+        &self,
+        target_line_start: ByteOffset,
+    ) -> Option<ByteRange> {
+        let full = self.buffer.to_string();
+        let bytes = full.as_bytes();
+        let mut pos = 0usize;
+        let mut active_fence: Option<(u8, usize, ByteOffset)> = None;
+        let mut passed_target = false;
+
+        while pos < bytes.len() {
+            let l_start = pos;
+            let mut l_end = pos;
+            while l_end < bytes.len() && bytes[l_end] != b'\n' {
+                l_end += 1;
+            }
+            let next_pos = if l_end < bytes.len() { l_end + 1 } else { l_end };
+            let line = full[l_start..l_end].trim_end_matches('\r');
+
+            if l_start == target_line_start {
+                if active_fence.is_none() {
+                    return None;
+                }
+                passed_target = true;
+            }
+
+            if let Some((f_char, f_len, body_start)) = active_fence {
+                if is_closing_code_fence(line, f_char, f_len) {
+                    if passed_target {
+                        let mut body_end = l_start.saturating_sub(1).max(body_start);
+                        if body_end > body_start && bytes.get(body_end - 1) == Some(&b'\r') {
+                            body_end -= 1;
+                        }
+                        return Some(ByteRange::new(body_start, body_end));
+                    }
+                    active_fence = None;
+                }
+            } else if let Some((f_char, f_len)) = parse_opening_code_fence(line) {
+                active_fence = Some((f_char, f_len, next_pos));
+            }
+            pos = next_pos;
+        }
+        None
     }
 
     fn current_line_bounds(&self) -> (ByteOffset, ByteOffset) {
@@ -638,6 +1414,49 @@ impl EditorController {
     }
 }
 
+/// Map a UTF-8 byte offset across an external file reload (`old_text` -> `new_text`)
+/// using longest common prefix/suffix so the cursor stays anchored near the same text (PRD 4.1.1 E).
+pub fn map_offset_across_reload(
+    old_text: &str,
+    new_text: &str,
+    old_offset: ByteOffset,
+) -> ByteOffset {
+    let mut clamped_old = old_offset.min(old_text.len());
+    while clamped_old > 0 && !old_text.is_char_boundary(clamped_old) {
+        clamped_old -= 1;
+    }
+
+    let mut prefix_bytes = 0usize;
+    for (oc, nc) in old_text.chars().zip(new_text.chars()) {
+        if oc != nc {
+            break;
+        }
+        prefix_bytes += oc.len_utf8();
+    }
+
+    if clamped_old <= prefix_bytes {
+        return clamped_old;
+    }
+
+    let old_rem = &old_text[prefix_bytes..];
+    let new_rem = &new_text[prefix_bytes..];
+    let mut suffix_bytes = 0usize;
+    for (oc, nc) in old_rem.chars().rev().zip(new_rem.chars().rev()) {
+        if oc != nc {
+            break;
+        }
+        suffix_bytes += oc.len_utf8();
+    }
+
+    let old_suffix_start = old_text.len() - suffix_bytes;
+    let new_suffix_start = new_text.len() - suffix_bytes;
+    if clamped_old >= old_suffix_start {
+        new_suffix_start + (clamped_old - old_suffix_start)
+    } else {
+        new_suffix_start
+    }
+}
+
 /// Parse a CommonMark opening code fence (` ``` ` or `~~~` with up to 3 leading spaces, length >= 3).
 fn parse_opening_code_fence(line: &str) -> Option<(u8, usize)> {
     let bytes = line.as_bytes();
@@ -687,6 +1506,52 @@ fn is_closing_code_fence(line: &str, fence_char: u8, min_len: usize) -> bool {
     line[indent + run..].trim().is_empty()
 }
 
+fn is_single_byte_emphasis_marker(marker: &str) -> bool {
+    matches!(marker, "*" | "_")
+}
+
+fn count_consecutive_byte_left(bytes: &[u8], idx: usize, target: u8) -> usize {
+    let mut count = 0;
+    let mut pos = idx;
+    while pos > 0 && bytes[pos - 1] == target {
+        count += 1;
+        pos -= 1;
+    }
+    count
+}
+
+fn count_consecutive_byte_right(bytes: &[u8], idx: usize, target: u8) -> usize {
+    let mut count = 0;
+    let mut pos = idx;
+    while pos < bytes.len() && bytes[pos] == target {
+        count += 1;
+        pos += 1;
+    }
+    count
+}
+
+fn table_cell_caret_offset(cell_slice: &str) -> usize {
+    match cell_slice.chars().next() {
+        Some(ch) if ch.is_whitespace() => ch.len_utf8(),
+        _ => 0,
+    }
+}
+
+fn detect_line_ending_str(full: &str) -> &'static str {
+    match LineEnding::detect_dominant(full) {
+        LineEnding::CrLf => "\r\n",
+        LineEnding::Lf | LineEnding::Cr => "\n",
+    }
+}
+
+fn table_row_insert_pos(full: &str, line_start: ByteOffset, line_end: ByteOffset) -> ByteOffset {
+    if line_end > line_start && full.as_bytes().get(line_end - 1) == Some(&b'\r') {
+        line_end - 1
+    } else {
+        line_end
+    }
+}
+
 fn is_just_heading_trigger(line: &str) -> bool {
     matches!(
         line,
@@ -728,6 +1593,187 @@ fn list_prefix_parts(line: &str) -> Option<(usize, usize)> {
         return Some((indent, digits + 2));
     }
     None
+}
+
+fn unescaped_pipe_offsets(line: &str) -> Vec<usize> {
+    let bytes = line.as_bytes();
+    let mut pipes = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'|' {
+            pipes.push(i);
+        }
+        i += 1;
+    }
+    pipes
+}
+
+fn current_table_cell_index(pipes: &[usize], rel_caret: usize) -> Option<usize> {
+    if pipes.len() < 2 {
+        return None;
+    }
+    for idx in 0..pipes.len() - 1 {
+        if rel_caret > pipes[idx] && rel_caret <= pipes[idx + 1] {
+            return Some(idx);
+        }
+    }
+    if rel_caret <= pipes[0] {
+        Some(0)
+    } else {
+        Some(pipes.len() - 2)
+    }
+}
+
+fn build_empty_table_row(cols: usize) -> String {
+    let mut out = String::with_capacity(cols * 3 + 1);
+    out.push('|');
+    for _ in 0..cols.max(1) {
+        out.push_str("  |");
+    }
+    out
+}
+
+fn build_table_separator_row(cols: usize) -> String {
+    let mut out = String::with_capacity(cols * 6 + 1);
+    out.push('|');
+    for _ in 0..cols.max(1) {
+        out.push_str(" --- |");
+    }
+    out
+}
+
+fn is_table_delimiter_row(line: &str) -> bool {
+    let pipes = unescaped_pipe_offsets(line);
+    if pipes.len() < 2 {
+        return false;
+    }
+    for idx in 0..pipes.len() - 1 {
+        let cell = line[pipes[idx] + 1..pipes[idx + 1]].trim();
+        let stripped = cell.trim_start_matches(':').trim_end_matches(':');
+        if stripped.len() < 3 || !stripped.bytes().all(|b| b == b'-') {
+            return false;
+        }
+    }
+    true
+}
+
+fn find_enclosing_table_range(source: &str, current_line_start: ByteOffset) -> Option<ByteRange> {
+    let bytes = source.as_bytes();
+    let mut lines: Vec<(ByteOffset, ByteOffset)> = Vec::new();
+    let mut pos = 0usize;
+    let mut current_idx = None;
+
+    while pos < bytes.len() {
+        let l_start = pos;
+        let mut l_end = pos;
+        while l_end < bytes.len() && bytes[l_end] != b'\n' {
+            l_end += 1;
+        }
+        if l_start == current_line_start {
+            current_idx = Some(lines.len());
+        }
+        lines.push((l_start, l_end));
+        pos = if l_end < bytes.len() { l_end + 1 } else { l_end };
+    }
+
+    let idx = current_idx?;
+    let is_tbl_line = |(s, e): (ByteOffset, ByteOffset)| -> bool {
+        let l = source[s..e].trim_end_matches('\r').trim();
+        l.starts_with('|') && l.ends_with('|') && unescaped_pipe_offsets(l).len() >= 2
+    };
+    if !is_tbl_line(lines[idx]) {
+        return None;
+    }
+
+    let mut first = idx;
+    while first > 0 && is_tbl_line(lines[first - 1]) {
+        first -= 1;
+    }
+    let mut last = idx;
+    while last + 1 < lines.len() && is_tbl_line(lines[last + 1]) {
+        last += 1;
+    }
+    Some(ByteRange::new(lines[first].0, lines[last].1))
+}
+
+fn format_markdown_table(raw_table: &str) -> String {
+    let raw_lines: Vec<&str> = raw_table.split('\n').collect();
+    let mut parsed_rows: Vec<(bool, Vec<String>)> = Vec::with_capacity(raw_lines.len());
+    let mut max_cols = 0usize;
+
+    for raw_line in &raw_lines {
+        let trimmed_cr = raw_line.trim_end_matches('\r');
+        let pipes = unescaped_pipe_offsets(trimmed_cr);
+        let is_delim = is_table_delimiter_row(trimmed_cr);
+        let mut cells = Vec::new();
+        for i in 0..pipes.len().saturating_sub(1) {
+            let cell = trimmed_cr[pipes[i] + 1..pipes[i + 1]].trim().to_string();
+            cells.push(cell);
+        }
+        max_cols = max_cols.max(cells.len());
+        parsed_rows.push((is_delim, cells));
+    }
+
+    if max_cols == 0 {
+        return raw_table.to_string();
+    }
+
+    let mut col_widths = vec![3usize; max_cols];
+    for (is_delim, cells) in &parsed_rows {
+        if *is_delim {
+            continue;
+        }
+        for (col, cell) in cells.iter().enumerate() {
+            col_widths[col] = col_widths[col].max(cell.chars().count());
+        }
+    }
+
+    let mut formatted_lines = Vec::with_capacity(raw_lines.len());
+    for (row_idx, (is_delim, cells)) in parsed_rows.iter().enumerate() {
+        let has_cr = raw_lines[row_idx].ends_with('\r');
+        let mut row_str = String::from("|");
+        for col in 0..max_cols {
+            let width = col_widths[col];
+            let cell = cells.get(col).map(|s| s.as_str()).unwrap_or("");
+            if *is_delim {
+                let left_colon = cell.starts_with(':');
+                let right_colon = cell.ends_with(':');
+                let dash_count = width
+                    .saturating_sub(usize::from(left_colon) + usize::from(right_colon))
+                    .max(1);
+                row_str.push(' ');
+                if left_colon {
+                    row_str.push(':');
+                }
+                for _ in 0..dash_count {
+                    row_str.push('-');
+                }
+                if right_colon {
+                    row_str.push(':');
+                }
+                row_str.push_str(" |");
+            } else {
+                let char_len = cell.chars().count();
+                let pad = width.saturating_sub(char_len);
+                row_str.push(' ');
+                row_str.push_str(cell);
+                for _ in 0..pad {
+                    row_str.push(' ');
+                }
+                row_str.push_str(" |");
+            }
+        }
+        if has_cr {
+            row_str.push('\r');
+        }
+        formatted_lines.push(row_str);
+    }
+
+    formatted_lines.join("\n")
 }
 
 #[cfg(test)]
@@ -950,5 +1996,212 @@ mod tests {
         ed.undo();
         assert_eq!(ed.buffer.to_string(), "hello world");
         assert_eq!(ed.selection, Selection::new(5, 0));
+    }
+
+    #[test]
+    fn test_prd_t01_t02_t03_table_creation_tab_navigation_and_alignment() {
+        // PRD 4.3 T-01: Typing `| a | b |` and pressing Enter creates separator + empty row
+        let mut ed = EditorController::from_str("| a | b |");
+        ed.set_caret(ed.buffer.len_bytes());
+        ed.enter();
+        assert_eq!(ed.buffer.to_string(), "| a | b |\n| --- | --- |\n|  |  |");
+
+        // PRD 4.1.1 G #6 & 4.3 T-02: Tab in 1st cell jumps to 2nd cell; Tab in last cell appends a new row
+        ed.insert_char('x');
+        ed.tab(); // jump to 2nd cell of row 1
+        ed.insert_char('y');
+        ed.tab(); // at last cell of table -> appends new row and places caret in its 1st cell
+        ed.insert_char('z');
+
+        // PRD 4.3 T-03: Align ONLY the active table as a single undoable transaction
+        assert!(ed.align_current_table());
+        assert_eq!(
+            ed.buffer.to_string(),
+            "| a   | b   |\n| --- | --- |\n| x   | y   |\n| z   |     |"
+        );
+
+        // Undo reverts the alignment step
+        ed.undo();
+        assert_eq!(
+            ed.buffer.to_string(),
+            "| a | b |\n| --- | --- |\n| x | y |\n| z |  |"
+        );
+
+        // Shift+Tab navigates backwards across table cells and skips delimiter row
+        ed.shift_tab(); // from cell 0 of row 2 ("z") -> cell 1 of row 1 ("y")
+        let row1_y_pos = "| a | b |\n| --- | --- |\n| x | ".len();
+        assert_eq!(ed.selection, Selection::caret(row1_y_pos));
+
+        // CJK table alignment keeps caret on valid UTF-8 boundary
+        let mut cjk_ed = EditorController::from_str("| 名称 | 值 |\n| --- | --- |\n| 中文 | 1 |");
+        cjk_ed.set_caret("| 名称 | ".len() + 1);
+        assert!(cjk_ed.align_current_table());
+        assert!(std::str::from_utf8(cjk_ed.buffer.to_string().as_bytes()).is_ok());
+        let after_head = cjk_ed.selection.head;
+        assert!(cjk_ed.buffer.to_string().is_char_boundary(after_head));
+    }
+
+    #[test]
+    fn test_prd_4_1_1_d_progressive_select_all_block_then_document() {
+        // PRD 4.1.1 D: 1st Select-All inside a code block selects only the code body;
+        // 2nd Select-All selects the entire document.
+        let doc = "# Title\n```rust\nfn main() {}\n```\nFooter";
+        let mut ed = EditorController::from_str(doc);
+        let code_body_start = "# Title\n```rust\n".len();
+        let code_body_end = code_body_start + "fn main() {}".len();
+        ed.set_caret(code_body_start + 3);
+
+        // 1st Cmd/Ctrl+A -> selects code block body
+        ed.select_all();
+        assert_eq!(ed.selection.range(), ByteRange::new(code_body_start, code_body_end));
+
+        // 2nd Cmd/Ctrl+A -> selects full document
+        ed.select_all();
+        assert_eq!(ed.selection.range(), ByteRange::new(0, doc.len()));
+    }
+
+    #[test]
+    fn test_inline_wrap_heading_level_task_checkbox_and_reload_offset_mapping() {
+        // Inline bold wrap & unwrap with backward selection preserved
+        let mut ed = EditorController::from_str("hello world");
+        ed.set_selection(11, 6); // backward selection of "world"
+        ed.toggle_inline_wrap("**");
+        assert_eq!(ed.buffer.to_string(), "hello **world**");
+        assert_eq!(ed.selection, Selection::new(13, 8));
+
+        ed.toggle_inline_wrap("**");
+        assert_eq!(ed.buffer.to_string(), "hello world");
+        assert_eq!(ed.selection, Selection::new(11, 6));
+
+        // Heading level conversion (Cmd+2 / Cmd+0) and task checkbox toggle
+        let mut ed2 = EditorController::from_str("Title\n- [ ] Todo item");
+        ed2.set_caret(2);
+        ed2.set_heading_level(2);
+        assert_eq!(ed2.buffer.to_string(), "## Title\n- [ ] Todo item");
+        ed2.set_heading_level(0);
+        assert_eq!(ed2.buffer.to_string(), "Title\n- [ ] Todo item");
+
+        ed2.set_caret("Title\n- [ ] To".len());
+        assert!(ed2.toggle_task_checkbox());
+        assert_eq!(ed2.buffer.to_string(), "Title\n- [x] Todo item");
+
+        // PRD 4.1.1 E: External reload preserves cursor position in unchanged suffix
+        let old = "# Header\nKeep my cursor here!";
+        let new = "# Header\nInserted externally!\nKeep my cursor here!";
+        let old_caret = "# Header\nKeep my ".len();
+        let mapped = map_offset_across_reload(old, new, old_caret);
+        assert_eq!(&new[mapped..], "cursor here!");
+    }
+
+    #[test]
+    fn test_p1_table_navigation_with_fullwidth_space_keeps_utf8_char_boundary() {
+        // P1 #6: Full-width space `\u{3000}` is 3 bytes in UTF-8; Tab/Shift+Tab must land on a valid
+        // UTF-8 char boundary so a subsequent Backspace never panics.
+        let mut ed = EditorController::from_str("| a |\u{3000}b |\n| --- | --- |\n| c |\u{3000}d |");
+        ed.set_caret(2); // inside `| a|`
+        ed.tab();
+        let caret = ed.selection.head;
+        let full = ed.buffer.to_string();
+        assert!(full.is_char_boundary(caret));
+        assert_eq!(caret, "| a |\u{3000}".len());
+
+        // Backspace removes the full 3-byte full-width space cleanly without panic
+        ed.backspace();
+        assert_eq!(ed.buffer.to_string(), "| a |b |\n| --- | --- |\n| c |\u{3000}d |");
+
+        // Also test jumping forward across delimiter row to row 2, then Shift+Tab backward
+        let row2_first_cell = ed.buffer.to_string().find("| c |").unwrap() + 2;
+        ed.set_caret(row2_first_cell);
+        ed.tab();
+        assert!(ed.buffer.to_string().is_char_boundary(ed.selection.head));
+        ed.shift_tab();
+        assert!(ed.buffer.to_string().is_char_boundary(ed.selection.head));
+        ed.shift_tab(); // back to row 0 cell 1 (`| a |b |`)
+        assert!(ed.buffer.to_string().is_char_boundary(ed.selection.head));
+    }
+
+    #[test]
+    fn test_p2_toggling_italic_twice_on_bold_preserves_bold() {
+        // P2 #1a: Selecting inner text of `**bold**` and toggling `*` twice must produce
+        // `***bold***` -> `**bold**`, preserving original bold markers.
+        let mut ed = EditorController::from_str("say **bold** now");
+        let start = "say **".len();
+        let end = start + "bold".len();
+        ed.set_selection(start, end);
+
+        ed.toggle_inline_wrap("*");
+        assert_eq!(ed.buffer.to_string(), "say ***bold*** now");
+        ed.toggle_inline_wrap("*");
+        assert_eq!(ed.buffer.to_string(), "say **bold** now");
+        assert_eq!(ed.selection, Selection::new(start, end));
+
+        // P2 #1b: Selecting full `**bold**` (including markers) and toggling `*` twice also preserves bold
+        let full_start = "say ".len();
+        let full_end = "say **bold**".len();
+        ed.set_selection(full_start, full_end);
+        ed.toggle_inline_wrap("*");
+        assert_eq!(ed.buffer.to_string(), "say ***bold*** now");
+        ed.toggle_inline_wrap("*");
+        assert_eq!(ed.buffer.to_string(), "say **bold** now");
+        assert_eq!(ed.selection, Selection::new(full_start, full_end));
+    }
+
+    #[test]
+    fn test_p2_table_new_rows_preserve_crlf_without_mixed_lf() {
+        // P2 #2: CRLF document creating separator+row on standalone header (T-01), appending via Enter (T-02),
+        // and appending via Tab at bottom-right cell must all insert `\r\n` without producing lone `\n`.
+        let mut ed = EditorController::from_str("| a | b |\r\nAfter");
+        ed.set_caret(3);
+        ed.enter();
+        assert_eq!(
+            ed.buffer.to_string(),
+            "| a | b |\r\n| --- | --- |\r\n|  |  |\r\nAfter"
+        );
+        // Append row at last row via Tab (with no trailing CRLF case too)
+        let mut ed2 = EditorController::from_str("| a | b |\r\n| --- | --- |\r\n| 1 | 2 |");
+        let second_col = ed2.buffer.to_string().rfind("2 |").unwrap();
+        ed2.set_caret(second_col);
+        ed2.tab();
+        let out = ed2.buffer.to_string();
+        assert_eq!(out, "| a | b |\r\n| --- | --- |\r\n| 1 | 2 |\r\n|  |  |");
+        // Verify ZERO bare LF (`\n` not preceded by `\r`)
+        for (idx, b) in out.bytes().enumerate() {
+            if b == b'\n' {
+                assert!(idx > 0 && out.as_bytes()[idx - 1] == b'\r', "found bare LF at {idx}");
+            }
+        }
+
+        // Mixed line-ending document with LF majority + minority CRLF must pick dominant LF (`\n`)
+        let mut mixed_lf_dom = EditorController::from_str(
+            "l1\nl2\nl3\n| a | b |\r\n| --- | --- |\r\n| 1 | 2 |",
+        );
+        let col = mixed_lf_dom.buffer.to_string().rfind("2 |").unwrap();
+        mixed_lf_dom.set_caret(col);
+        mixed_lf_dom.tab();
+        assert_eq!(
+            mixed_lf_dom.buffer.to_string(),
+            "l1\nl2\nl3\n| a | b |\r\n| --- | --- |\r\n| 1 | 2 |\n|  |  |"
+        );
+
+        let mut mixed_lf_enter =
+            EditorController::from_str("l1\nl2\nl3\n| a | b |\r\nAfter");
+        mixed_lf_enter.set_caret("l1\nl2\nl3\n| ".len());
+        mixed_lf_enter.enter();
+        assert_eq!(
+            mixed_lf_enter.buffer.to_string(),
+            "l1\nl2\nl3\n| a | b |\n| --- | --- |\n|  |  |\r\nAfter"
+        );
+
+        // Mixed line-ending document with CRLF majority + minority LF must pick dominant CRLF (`\r\n`)
+        let mut mixed_crlf_dom = EditorController::from_str(
+            "l1\r\nl2\r\nl3\r\n| a | b |\n| --- | --- |\n| 1 | 2 |",
+        );
+        let col2 = mixed_crlf_dom.buffer.to_string().rfind("2 |").unwrap();
+        mixed_crlf_dom.set_caret(col2);
+        mixed_crlf_dom.tab();
+        assert_eq!(
+            mixed_crlf_dom.buffer.to_string(),
+            "l1\r\nl2\r\nl3\r\n| a | b |\n| --- | --- |\n| 1 | 2 |\r\n|  |  |"
+        );
     }
 }

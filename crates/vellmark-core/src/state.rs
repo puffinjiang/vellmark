@@ -14,7 +14,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::buffer::{ByteRange, Selection, TextBuffer};
-use crate::encoding::{FileFormatMeta, detect_and_decode, encode_for_save};
+use crate::editor::{EditorContext, EditorViewState, map_offset_across_reload};
+use crate::encoding::{
+    DetectedEncoding, EncodingDecision, FileFormatMeta, LineEnding, detect_and_decode,
+    encode_for_save,
+};
 use crate::undo::{EditKind, UndoHistory};
 
 /// Document state machine per PRD 4.5.1 B.
@@ -354,6 +358,8 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
     #[error("encoding error: {0}")]
     Encoding(#[from] crate::encoding::EncodingError),
+    #[error("document is opened read-only and edits are disabled")]
+    ReadOnlyDocument,
     #[error("corrupted recovery snapshot")]
     CorruptedSnapshot,
 }
@@ -415,6 +421,233 @@ impl DocumentSession {
         })
     }
 
+    /// Create a brand-new untitled UTF-8 LF document session (PRD 4.5 F-01).
+    pub fn new_untitled(recovery_dir: Option<PathBuf>) -> Self {
+        Self::new_untitled_with_throttle(recovery_dir, Duration::from_millis(200))
+    }
+
+    pub fn new_untitled_with_throttle(
+        recovery_dir: Option<PathBuf>,
+        throttle_window: Duration,
+    ) -> Self {
+        let format = FileFormatMeta {
+            decision: EncodingDecision::Editable(DetectedEncoding::Utf8),
+            dominant_line_ending: LineEnding::Lf,
+            has_trailing_newline: false,
+        };
+        let buffer = TextBuffer::new();
+        let base = DiskSnapshot::from_rope(buffer.snapshot_rope());
+        let recovery_worker = recovery_dir
+            .clone()
+            .map(|dir| RecoveryWorker::spawn(dir, throttle_window));
+
+        Self {
+            path: None,
+            buffer,
+            undo: UndoHistory::new(),
+            format,
+            state: DocState::Clean,
+            base,
+            theirs: None,
+            recovery_dir,
+            recovery_worker,
+            recovery_degraded: false,
+            pending_recovery_revision: None,
+        }
+    }
+
+    /// True if the file encoding is ReadOnly (non-UTF-8/ambiguous, PRD 4.5.2).
+    pub fn is_read_only(&self) -> bool {
+        matches!(self.format.decision, EncodingDecision::ReadOnly { .. })
+    }
+
+    fn buffers_match_base(&self) -> bool {
+        self.buffer.crc32() == self.base.crc32
+            && self.buffer.len_bytes() == self.base.len_bytes
+            && self.buffer.rope().bytes().eq(self.base.rope.bytes())
+    }
+
+    fn sync_state_after_buffer_mutation(&mut self) {
+        match self.state {
+            DocState::Clean | DocState::Dirty => {
+                if self.buffers_match_base() {
+                    self.state = DocState::Clean;
+                    self.clear_current_recovery_snapshot();
+                } else {
+                    self.state = DocState::Dirty;
+                    self.schedule_recovery_snapshot();
+                }
+            }
+            DocState::Conflict => {
+                self.schedule_recovery_snapshot();
+            }
+            DocState::Missing { .. } => {
+                self.state = DocState::Missing {
+                    has_local_edits: true,
+                };
+                self.schedule_recovery_snapshot();
+            }
+        }
+    }
+
+    /// Execute an interactive editing closure using `EditorViewState` directly against this session's
+    /// single-source-of-truth `TextBuffer` and `UndoHistory`.
+    /// Refuses edits cleanly if `self.is_read_only()` (PRD 4.5.2), transitions `Clean <-> Dirty`,
+    /// and schedules non-blocking throttled recovery snapshots when `buffer.revision()` changes.
+    pub fn with_editor_view(
+        &mut self,
+        view: &mut EditorViewState,
+        f: impl FnOnce(&mut EditorContext<'_>),
+    ) -> Result<bool, SessionError> {
+        if self.is_read_only() {
+            return Err(SessionError::ReadOnlyDocument);
+        }
+        let rev_before = self.buffer.revision();
+        {
+            let mut ctx = view.context(&mut self.buffer, &mut self.undo);
+            f(&mut ctx);
+        }
+        let changed = self.buffer.revision() != rev_before;
+        if changed {
+            self.sync_state_after_buffer_mutation();
+        }
+        Ok(changed)
+    }
+
+    /// Handle external modification while preserving cursor position across Clean reloads and discarding
+    /// unconfirmed IME preedit text so external events never commit raw phonetic preedit into buffer (PRD 4.1.1 E & G).
+    pub fn on_external_modified_with_view(
+        &mut self,
+        new_disk_text: &str,
+        view: &mut EditorViewState,
+    ) {
+        view.ime_preedit = None;
+        view.ime_composition_selection = None;
+        view.expansion_frozen = false;
+
+        let old_text = self.buffer.to_string();
+        let mut old_anchor = view.selection.anchor.min(old_text.len());
+        while old_anchor > 0 && !old_text.is_char_boundary(old_anchor) {
+            old_anchor -= 1;
+        }
+        let mut old_head = view.selection.head.min(old_text.len());
+        while old_head > 0 && !old_text.is_char_boundary(old_head) {
+            old_head -= 1;
+        }
+        let old_sel = Selection::new(old_anchor, old_head);
+        let mapped_sel = Selection::new(
+            map_offset_across_reload(&old_text, new_disk_text, old_sel.anchor),
+            map_offset_across_reload(&old_text, new_disk_text, old_sel.head),
+        );
+
+        let rev_before = self.buffer.revision();
+        self.on_external_modified_inner(new_disk_text, Some((old_sel, mapped_sel)));
+        if self.buffer.revision() != rev_before {
+            view.selection = mapped_sel;
+        }
+    }
+
+    /// Perform "Use Disk Version" conflict resolution while mapping `view.selection` across the reloaded text.
+    pub fn resolve_conflict_use_theirs_with_view(
+        &mut self,
+        captured_revision: u64,
+        view: &mut EditorViewState,
+    ) -> ConflictActionOutcome {
+        let old_text = self.buffer.to_string();
+        let mut old_anchor = view.selection.anchor.min(old_text.len());
+        while old_anchor > 0 && !old_text.is_char_boundary(old_anchor) {
+            old_anchor -= 1;
+        }
+        let mut old_head = view.selection.head.min(old_text.len());
+        while old_head > 0 && !old_text.is_char_boundary(old_head) {
+            old_head -= 1;
+        }
+        let old_sel = Selection::new(old_anchor, old_head);
+
+        let (outcome, mapped_opt) =
+            self.resolve_conflict_use_theirs_inner(captured_revision, Some((&old_text, old_sel)));
+        if outcome == ConflictActionOutcome::ResolvedClean {
+            if let Some(mapped_sel) = mapped_opt {
+                view.selection = mapped_sel;
+            }
+            view.ime_preedit = None;
+            view.ime_composition_selection = None;
+            view.expansion_frozen = false;
+        }
+        outcome
+    }
+
+    /// Save the document to a target path (`Save As`, PRD 4.5.1 A & 4.5 F-01),
+    /// refusing to bypass `Conflict` / external-divergence checks when targeting the currently open path.
+    pub fn save_as(&mut self, new_path: impl AsRef<Path>) -> SaveOutcome {
+        if self.is_read_only() {
+            return SaveOutcome::WriteFailed("read-only document cannot be saved".to_string());
+        }
+        let target = new_path.as_ref().to_path_buf();
+
+        if let Some(current_path) = &self.path {
+            if paths_refer_to_same_file(current_path, &target) {
+                if self.state == DocState::Conflict {
+                    match fs::read(&target) {
+                        Ok(disk_bytes) => {
+                            let snap = match detect_and_decode(&disk_bytes) {
+                                Ok((disk_text, _)) => DiskSnapshot::from_str(&disk_text),
+                                Err(_) => DiskSnapshot::from_undecodable_bytes(&disk_bytes),
+                            };
+                            self.theirs = Some(snap);
+                            let _ = self.flush_current_recovery_snapshot();
+                            return SaveOutcome::EnteredConflict;
+                        }
+                        Err(_) => {
+                            self.on_external_deleted();
+                            return SaveOutcome::WriteFailed(
+                                "target file disappeared before write".to_string(),
+                            );
+                        }
+                    }
+                }
+                if !matches!(self.state, DocState::Missing { .. })
+                    || fs::symlink_metadata(&target).is_ok()
+                {
+                    return self.save();
+                }
+            }
+        }
+
+        let written_revision = self.buffer.revision();
+        let written_rope = self.buffer.snapshot_rope();
+        let written_text = written_rope.to_string();
+        let bytes = match encode_for_save(&written_text, &self.format) {
+            Ok(b) => b,
+            Err(e) => return SaveOutcome::WriteFailed(e.to_string()),
+        };
+
+        if let Some(parent) = target.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    return SaveOutcome::WriteFailed(e.to_string());
+                }
+            }
+        }
+        if let Err(e) = atomic_write_file(&target, &bytes) {
+            return SaveOutcome::WriteFailed(e.to_string());
+        }
+
+        self.path = Some(target);
+        self.base = DiskSnapshot::from_rope(written_rope);
+        self.theirs = None;
+
+        if self.buffer.revision() == written_revision && self.buffer.crc32() == self.base.crc32 {
+            self.state = DocState::Clean;
+            self.clear_current_recovery_snapshot();
+            SaveOutcome::SavedClean
+        } else {
+            self.state = DocState::Dirty;
+            let _ = self.flush_current_recovery_snapshot();
+            SaveOutcome::SavedButStillDirty { written_revision }
+        }
+    }
+
     /// Perform a local edit and transition state per PRD 4.5.1 C.
     /// Non-blocking: schedules an O(1) Rope-snapshot recovery payload on the background worker
     /// instead of performing synchronous serialization or `fsync` on the input thread.
@@ -440,10 +673,18 @@ impl DocumentSession {
 
     /// Handle external file modification event per PRD 4.5.1 C.
     pub fn on_external_modified(&mut self, new_disk_text: &str) {
+        self.on_external_modified_inner(new_disk_text, None);
+    }
+
+    fn on_external_modified_inner(
+        &mut self,
+        new_disk_text: &str,
+        selection_pair: Option<(Selection, Selection)>,
+    ) {
         let disk_snap = DiskSnapshot::from_str(new_disk_text);
         match self.state {
             DocState::Clean => {
-                self.buffer.reset_content(new_disk_text);
+                self.apply_external_reload_to_buffer(new_disk_text, selection_pair);
                 self.base = disk_snap;
                 self.state = DocState::Clean;
             }
@@ -470,7 +711,7 @@ impl DocumentSession {
                         DocState::Clean
                     };
                 } else if !has_local_edits {
-                    self.buffer.reset_content(new_disk_text);
+                    self.apply_external_reload_to_buffer(new_disk_text, selection_pair);
                     self.base = disk_snap;
                     self.state = DocState::Clean;
                 } else {
@@ -480,6 +721,27 @@ impl DocumentSession {
                 }
             }
         }
+    }
+
+    fn apply_external_reload_to_buffer(
+        &mut self,
+        new_disk_text: &str,
+        selection_pair: Option<(Selection, Selection)>,
+    ) {
+        if self.buffer.rope().bytes().eq(new_disk_text.bytes()) {
+            return;
+        }
+        let len = self.buffer.len_bytes();
+        let (sel_before, sel_after) =
+            selection_pair.unwrap_or((Selection::caret(0), Selection::caret(0)));
+        self.undo.apply_edit(
+            &mut self.buffer,
+            ByteRange::new(0, len),
+            new_disk_text,
+            sel_before,
+            sel_after,
+            EditKind::Structural,
+        );
     }
 
     /// Handle external file deletion per PRD 4.5.1 C.
@@ -648,11 +910,26 @@ impl DocumentSession {
     ///    (Issue 2 fix: if disk changed from A to B before file watcher delivered event, refreshes `theirs` to B and aborts);
     /// 3. Verifies no new local edits occurred since `captured_revision`.
     pub fn resolve_conflict_use_theirs(&mut self, captured_revision: u64) -> ConflictActionOutcome {
+        self.resolve_conflict_use_theirs_inner(captured_revision, None)
+            .0
+    }
+
+    fn resolve_conflict_use_theirs_inner(
+        &mut self,
+        captured_revision: u64,
+        view_selection: Option<(&str, Selection)>,
+    ) -> (ConflictActionOutcome, Option<Selection>) {
         let Some(path) = self.path.clone() else {
-            return ConflictActionOutcome::AbortedStillConflict("no path".to_string());
+            return (
+                ConflictActionOutcome::AbortedStillConflict("no path".to_string()),
+                None,
+            );
         };
         let Some(expected_theirs) = self.theirs.clone() else {
-            return ConflictActionOutcome::AbortedStillConflict("not in conflict".to_string());
+            return (
+                ConflictActionOutcome::AbortedStillConflict("not in conflict".to_string()),
+                None,
+            );
         };
 
         // Check if file still exists on disk
@@ -660,7 +937,7 @@ impl DocumentSession {
             Ok(b) => b,
             Err(_) => {
                 self.on_external_deleted();
-                return ConflictActionOutcome::TransitionedToMissing;
+                return (ConflictActionOutcome::TransitionedToMissing, None);
             }
         };
 
@@ -673,17 +950,23 @@ impl DocumentSession {
                 {
                     self.theirs = Some(latest_disk);
                     let _ = self.flush_current_recovery_snapshot();
-                    return ConflictActionOutcome::AbortedStillConflict(
-                        "disk content changed again before reload; refreshed theirs".to_string(),
+                    return (
+                        ConflictActionOutcome::AbortedStillConflict(
+                            "disk content changed again before reload; refreshed theirs".to_string(),
+                        ),
+                        None,
                     );
                 }
             }
             Err(e) => {
                 self.theirs = Some(DiskSnapshot::from_undecodable_bytes(&initial_disk_bytes));
                 let _ = self.flush_current_recovery_snapshot();
-                return ConflictActionOutcome::AbortedStillConflict(format!(
-                    "disk content is not valid text ({e}); cannot load disk version"
-                ));
+                return (
+                    ConflictActionOutcome::AbortedStillConflict(format!(
+                        "disk content is not valid text ({e}); cannot load disk version"
+                    )),
+                    None,
+                );
             }
         }
 
@@ -691,15 +974,21 @@ impl DocumentSession {
         let my_content = self.buffer.to_string();
         if let Err(e) = self.write_historical_backup("conflict-discarded-mine", &my_content) {
             self.recovery_degraded = true;
-            return ConflictActionOutcome::AbortedStillConflict(format!(
-                "recovery backup failed ({e}); refusing to discard local edits"
-            ));
+            return (
+                ConflictActionOutcome::AbortedStillConflict(format!(
+                    "recovery backup failed ({e}); refusing to discard local edits"
+                )),
+                None,
+            );
         }
 
         // 2. Re-verify both local revision AND disk content after backup completes (PRD 4.5.1 D)
         if self.buffer.revision() != captured_revision {
-            return ConflictActionOutcome::AbortedStillConflict(
-                "new edits occurred while saving backup; aborted reload".to_string(),
+            return (
+                ConflictActionOutcome::AbortedStillConflict(
+                    "new edits occurred while saving backup; aborted reload".to_string(),
+                ),
+                None,
             );
         }
 
@@ -707,7 +996,7 @@ impl DocumentSession {
             Ok(b) => b,
             Err(_) => {
                 self.on_external_deleted();
-                return ConflictActionOutcome::TransitionedToMissing;
+                return (ConflictActionOutcome::TransitionedToMissing, None);
             }
         };
         match detect_and_decode(&post_backup_bytes) {
@@ -718,35 +1007,51 @@ impl DocumentSession {
                 {
                     self.theirs = Some(latest_disk);
                     let _ = self.flush_current_recovery_snapshot();
-                    return ConflictActionOutcome::AbortedStillConflict(
-                        "disk content changed while saving backup; refreshed theirs".to_string(),
+                    return (
+                        ConflictActionOutcome::AbortedStillConflict(
+                            "disk content changed while saving backup; refreshed theirs".to_string(),
+                        ),
+                        None,
                     );
                 }
             }
             Err(e) => {
                 self.theirs = Some(DiskSnapshot::from_undecodable_bytes(&post_backup_bytes));
                 let _ = self.flush_current_recovery_snapshot();
-                return ConflictActionOutcome::AbortedStillConflict(format!(
-                    "disk content became undecodable ({e}); aborted reload"
-                ));
+                return (
+                    ConflictActionOutcome::AbortedStillConflict(format!(
+                        "disk content became undecodable ({e}); aborted reload"
+                    )),
+                    None,
+                );
             }
         }
 
         let theirs_text = expected_theirs.content_string();
+        let (sel_before, sel_after, mapped_ret) = match view_selection {
+            Some((old_text, old_sel)) => {
+                let mapped = Selection::new(
+                    map_offset_across_reload(old_text, &theirs_text, old_sel.anchor),
+                    map_offset_across_reload(old_text, &theirs_text, old_sel.head),
+                );
+                (old_sel, mapped, Some(mapped))
+            }
+            None => (Selection::caret(0), Selection::caret(0), None),
+        };
         let len = self.buffer.len_bytes();
         self.undo.apply_edit(
             &mut self.buffer,
             ByteRange::new(0, len),
             &theirs_text,
-            Selection::caret(0),
-            Selection::caret(0),
+            sel_before,
+            sel_after,
             EditKind::Structural,
         );
         self.base = expected_theirs;
         self.theirs = None;
         self.state = DocState::Clean;
         self.clear_current_recovery_snapshot();
-        ConflictActionOutcome::ResolvedClean
+        (ConflictActionOutcome::ResolvedClean, mapped_ret)
     }
 
     fn build_recovery_payload(&self) -> RecoveryPayload {
@@ -825,6 +1130,25 @@ impl DocumentSession {
             }
         }
     }
+}
+
+fn canonicalize_lossy(p: &Path) -> PathBuf {
+    if let Ok(c) = fs::canonicalize(p) {
+        return c;
+    }
+    if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+        let resolved_parent = if parent.as_os_str().is_empty() {
+            fs::canonicalize(".").unwrap_or_else(|_| PathBuf::from("."))
+        } else {
+            fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf())
+        };
+        return resolved_parent.join(name);
+    }
+    p.to_path_buf()
+}
+
+fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
+    a == b || canonicalize_lossy(a) == canonicalize_lossy(b)
 }
 
 /// Write to temporary sibling file, `fsync`, and atomically rename (PRD 4.5.1 G).
@@ -1316,6 +1640,249 @@ mod tests {
         let backup_path = rec_dir.join(format!("history-conflict-overwritten-theirs-rev{rev}.bak"));
         let backed_up_bytes = fs::read(&backup_path).unwrap();
         assert_eq!(backed_up_bytes, undecodable_theirs);
+
+        drop(session);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_untitled_save_as_read_only_guard_and_external_reload_cursor_mapping() {
+        let dir = unique_temp_dir("untitled-save-as");
+        let target = dir.join("draft.md");
+        let rec_dir = dir.join("recovery");
+
+        // 1. Untitled draft + EditorViewState editing + Save As
+        let mut session = DocumentSession::new_untitled(Some(rec_dir));
+        let mut view = EditorViewState::default();
+        session
+            .with_editor_view(&mut view, |ctx| {
+                ctx.insert_text("# Title\nHello world");
+            })
+            .unwrap();
+        assert_eq!(session.state, DocState::Dirty);
+        assert_eq!(session.save_as(&target), SaveOutcome::SavedClean);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "# Title\nHello world");
+
+        // Undo back to base -> returns cleanly to DocState::Clean
+        session
+            .with_editor_view(&mut view, |ctx| {
+                ctx.insert_char('!');
+            })
+            .unwrap();
+        assert_eq!(session.state, DocState::Dirty);
+        session
+            .with_editor_view(&mut view, |ctx| {
+                ctx.undo();
+            })
+            .unwrap();
+        assert_eq!(session.state, DocState::Clean);
+
+        // 2. External modification during Clean preserves cursor offset inside unchanged suffix
+        view.selection = Selection::caret("# Title\nHello ".len());
+        session.on_external_modified_with_view("# Title\nNew intro\nHello world", &mut view);
+        assert_eq!(view.selection, Selection::caret("# Title\nNew intro\nHello ".len()));
+
+        // 3. Non-UTF8 GBK file opens ReadOnly and blocks with_editor_view mutations
+        let gbk_path = dir.join("gbk.md");
+        fs::write(&gbk_path, [0xC4, 0xE3, 0xBA, 0xC3]).unwrap();
+        let mut ro_session = DocumentSession::open_file(&gbk_path, None).unwrap();
+        assert!(ro_session.is_read_only());
+        let mut ro_view = EditorViewState::default();
+        assert!(matches!(
+            ro_session.with_editor_view(&mut ro_view, |ctx| ctx.insert_char('x')),
+            Err(SessionError::ReadOnlyDocument)
+        ));
+
+        drop(session);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prd_5_2_round_trip_byte_fidelity_unmodified_open_save() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "vellmark-prd-5-2-roundtrip-{}-{uniq}",
+            std::process::id()
+        ));
+        let recovery_dir = root.join("recovery");
+        fs::create_dir_all(&recovery_dir).expect("create temp dirs");
+
+        let long_line = "中文长行Word ".repeat(900); // > 10KB UTF-8 line
+        assert!(long_line.len() > 10_000);
+
+        let crlf_no_trailing_nl = format!(
+            "\u{FEFF}# 标题\r\n\r\n第一段包含混合换行：\nsecond line with CRLF\r\n{long_line}end-no-nl"
+        );
+        let mixed_crlf_lf_raw = crlf_no_trailing_nl.into_bytes();
+
+        let cases: &[(&str, &[u8])] = &[
+            (
+                "bom_crlf_no_trailing_nl.md",
+                mixed_crlf_lf_raw.as_slice(),
+            ),
+            (
+                "pure_lf_no_trailing_nl.md",
+                "第一段\n\n```rust\nlet x = 1;\n```\n结尾无换行".as_bytes(),
+            ),
+            (
+                "pure_crlf_trailing_nl.md",
+                "\u{FEFF}Title\r\n\r\nBody 中文\r\n".as_bytes(),
+            ),
+        ];
+
+        for (name, raw_bytes) in cases {
+            let file_path = root.join(name);
+            fs::write(&file_path, raw_bytes).expect("write fixture");
+
+            let mut session =
+                DocumentSession::open_file(&file_path, Some(recovery_dir.clone()))
+                    .expect("open fixture");
+            let outcome = session.save();
+            assert_eq!(
+                outcome,
+                crate::state::SaveOutcome::SavedClean,
+                "expected clean save for {name}"
+            );
+
+            let saved_bytes = fs::read(&file_path).expect("read saved bytes");
+            assert_eq!(
+                saved_bytes.as_slice(),
+                *raw_bytes,
+                "PRD 5.2 round-trip byte mismatch for {name}"
+            );
+            drop(session);
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_p1_save_as_current_path_in_conflict_does_not_overwrite_external_version() {
+        let dir = unique_temp_dir("save-as-conflict");
+        let file_path = dir.join("doc.md");
+        let rec_dir = dir.join("recovery");
+        fs::write(&file_path, "Base text\n").unwrap();
+
+        let mut session = DocumentSession::open_file(&file_path, Some(rec_dir)).unwrap();
+        let mut view = EditorViewState::default();
+        session
+            .with_editor_view(&mut view, |ctx| {
+                ctx.insert_text("My edit\n");
+            })
+            .unwrap();
+
+        // External process overwrites file -> triggers Conflict
+        fs::write(&file_path, "External precious edit\n").unwrap();
+        assert_eq!(session.save(), SaveOutcome::EnteredConflict);
+        assert_eq!(session.state, DocState::Conflict);
+
+        // Save As targeting the exact same path (via relative `./doc.md` style or direct path) MUST NOT overwrite!
+        let same_via_dot = dir.join(".").join("doc.md");
+        assert_eq!(session.save_as(&same_via_dot), SaveOutcome::EnteredConflict);
+        assert_eq!(session.state, DocState::Conflict);
+        assert_eq!(
+            fs::read_to_string(&file_path).unwrap(),
+            "External precious edit\n"
+        );
+        assert!(session.theirs.is_some());
+
+        // Saving As a DIFFERENT path writes a copy safely without touching original conflicted file
+        let copy_path = dir.join("doc-copy.md");
+        assert_eq!(session.save_as(&copy_path), SaveOutcome::SavedClean);
+        assert_eq!(
+            fs::read_to_string(&file_path).unwrap(),
+            "External precious edit\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&copy_path).unwrap(),
+            "My edit\nBase text\n"
+        );
+
+        drop(session);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_p1_undo_after_external_reload_to_shorter_file_does_not_panic() {
+        let dir = unique_temp_dir("reload-undo");
+        let file_path = dir.join("long.md");
+        let rec_dir = dir.join("recovery");
+        let long_prefix = "A".repeat(400);
+        let initial = format!("{long_prefix} tail");
+        fs::write(&file_path, &initial).unwrap();
+
+        let mut session = DocumentSession::open_file(&file_path, Some(rec_dir)).unwrap();
+        let mut view = EditorViewState::default();
+        view.selection = Selection::caret(initial.len());
+
+        // Edit near offset 405, then save cleanly
+        session
+            .with_editor_view(&mut view, |ctx| {
+                ctx.insert_text(" more");
+            })
+            .unwrap();
+        assert_eq!(session.save(), SaveOutcome::SavedClean);
+
+        // External process truncates file to much shorter content ("short")
+        session.on_external_modified_with_view("short", &mut view);
+        assert_eq!(session.buffer.to_string(), "short");
+        assert_eq!(session.state, DocState::Clean);
+
+        // Undoing after external shrinkage MUST NOT panic with out-of-bounds range!
+        session.with_editor_view(&mut view, |ctx| ctx.undo()).unwrap();
+        assert_eq!(session.buffer.to_string(), format!("{long_prefix} tail more"));
+        assert_eq!(session.state, DocState::Dirty);
+
+        // Second undo reverts the pre-save edit cleanly too
+        session.with_editor_view(&mut view, |ctx| ctx.undo()).unwrap();
+        assert_eq!(session.buffer.to_string(), initial);
+
+        drop(session);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_p1_external_modified_during_ime_preedit_does_not_commit_raw_preedit() {
+        let dir = unique_temp_dir("ime-external-reload");
+        let file_path = dir.join("note.md");
+        let rec_dir = dir.join("recovery");
+        fs::write(&file_path, "Hello").unwrap();
+
+        let mut session = DocumentSession::open_file(&file_path, Some(rec_dir)).unwrap();
+        let mut view = EditorViewState::default();
+        view.selection = Selection::caret(5);
+
+        // User is composing `"ni"` in IME (not yet committed)
+        session
+            .with_editor_view(&mut view, |ctx| {
+                ctx.ime_update("ni");
+            })
+            .unwrap();
+        assert_eq!(session.state, DocState::Clean);
+        assert_eq!(view.ime_preedit.as_deref(), Some("ni"));
+
+        // External modification arrives while preedit is open:
+        // must discard unconfirmed preedit instead of committing `"ni"` into buffer, and reload Clean!
+        session.on_external_modified_with_view("Hello from disk", &mut view);
+        assert_eq!(view.ime_preedit, None);
+        assert!(!view.expansion_frozen);
+        assert_eq!(session.state, DocState::Clean);
+        assert_eq!(session.buffer.to_string(), "Hello from disk");
+
+        // Subsequent committed Chinese character does NOT form `"ni你"`
+        let end = session.buffer.len_bytes();
+        session
+            .with_editor_view(&mut view, |ctx| {
+                ctx.set_caret(end);
+                ctx.ime_commit("你");
+            })
+            .unwrap();
+        assert_eq!(session.buffer.to_string(), "Hello from disk你");
 
         drop(session);
         let _ = fs::remove_dir_all(&dir);

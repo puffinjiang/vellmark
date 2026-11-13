@@ -1,0 +1,51 @@
+/* Vellmark Academic (Newsprint) Theme (CSS Subset v1.0) */
+:root {
+    --text-color: #2c2620;
+    --bg-color: #f9f6f0;
+    --code-bg: #efeae1;
+    --quote-border: #b8afa0;
+    --link-color: #7a2e2e;
+}
+
+#write {
+    max-width: 780px;
+    color: var(--text-color);
+    background-color: var(--bg-color);
+    font-family: Georgia, "Songti SC", "Noto Serif CJK SC", "Times New Roman", serif;
+    font-size: 17px;
+    line-height: 1.85;
+    padding: 40px;
+}
+
+h1 {
+    font-size: 2.1em;
+    font-weight: 700;
+    text-align: center;
+    margin-top: 28px;
+    margin-bottom: 18px;
+}
+
+h2 {
+    font-size: 1.55em;
+    font-weight: 600;
+    margin-top: 24px;
+    margin-bottom: 14px;
+}
+
+a {
+    color: var(--link-color);
+    text-decoration: underline;
+}
+
+code {
+    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    background-color: var(--code-bg);
+    padding: 2px 4px;
+    border-radius: 3px;
+}
+
+blockquote {
+    border: 3px solid var(--quote-border);
+    padding-left: 18px;
+    font-style: italic;
+}

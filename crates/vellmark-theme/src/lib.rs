@@ -55,6 +55,45 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "width",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BuiltinTheme {
+    Light,
+    Dark,
+    Academic,
+    GitHub,
+}
+
+impl BuiltinTheme {
+    pub const ALL: [BuiltinTheme; 4] = [
+        BuiltinTheme::Light,
+        BuiltinTheme::Dark,
+        BuiltinTheme::Academic,
+        BuiltinTheme::GitHub,
+    ];
+
+    /// Follow system dark/light preference (PRD 4.8 S-02).
+    pub fn for_system_color_scheme(prefers_dark: bool) -> Self {
+        if prefers_dark {
+            Self::Dark
+        } else {
+            Self::Light
+        }
+    }
+
+    pub fn css_source(self) -> &'static str {
+        match self {
+            Self::Light => include_str!("../../../themes/default-light.css"),
+            Self::Dark => include_str!("../../../themes/default-dark.css"),
+            Self::Academic => include_str!("../../../themes/academic-newsprint.css"),
+            Self::GitHub => include_str!("../../../themes/github.css"),
+        }
+    }
+
+    pub fn load(self) -> ThemeSheet {
+        ThemeSheet::parse_css(self.css_source())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThemeDiagnostic {
     pub selector: String,
@@ -126,14 +165,76 @@ impl ThemeSheet {
         }
         sheet
     }
+
+    /// Resolve a property for `selector` (falling back to `#write` for inherited text properties)
+    /// and expand any `var(--custom-prop)` references against `:root` variables (PRD 6.6).
+    pub fn resolve_property(&self, selector: &str, property: &str) -> Option<String> {
+        let raw = self
+            .rules
+            .get(selector)
+            .and_then(|props| props.get(property))
+            .or_else(|| {
+                if matches!(
+                    property,
+                    "color" | "font-family" | "font-size" | "line-height" | "letter-spacing"
+                ) {
+                    self.rules
+                        .get("#write")
+                        .and_then(|props| props.get(property))
+                } else {
+                    None
+                }
+            })?;
+        Some(self.expand_css_variables(raw))
+    }
+
+    fn expand_css_variables(&self, raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len());
+        let mut rest = raw;
+        while let Some(idx) = rest.find("var(") {
+            out.push_str(&rest[..idx]);
+            let after_var = &rest[idx + 4..];
+            if let Some(close) = after_var.find(')') {
+                let inner = after_var[..close].trim();
+                let (var_name, fallback) = match inner.split_once(',') {
+                    Some((v, fb)) => (v.trim(), Some(fb.trim())),
+                    None => (inner, None),
+                };
+                if let Some(val) = self.variables.get(var_name) {
+                    out.push_str(val);
+                } else if let Some(fb) = fallback {
+                    out.push_str(fb);
+                }
+                rest = &after_var[close + 1..];
+            } else {
+                out.push_str(&rest[idx..]);
+                return out;
+            }
+        }
+        out.push_str(rest);
+        out
+    }
 }
 
 fn is_supported_selector(sel: &str) -> bool {
-    let base = sel
-        .trim_end_matches(":hover")
-        .trim_end_matches(":first-child")
-        .trim();
-    SUPPORTED_SELECTORS.contains(&base) || base.starts_with('.')
+    // Support descendant (`a b`) and child (`a > b`) combinators of supported simple selectors (PRD 6.6)
+    if sel.contains('(') || sel.contains('[') || sel.contains('+') || sel.contains('~') {
+        return false;
+    }
+    let parts: Vec<&str> = sel
+        .split(|c: char| c.is_whitespace() || c == '>')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return false;
+    }
+    parts.into_iter().all(|part| {
+        let base = part
+            .trim_end_matches(":hover")
+            .trim_end_matches(":first-child")
+            .trim();
+        SUPPORTED_SELECTORS.contains(&base) || base.starts_with('.')
+    })
 }
 
 fn strip_css_comments(input: &str) -> String {
@@ -168,5 +269,25 @@ mod tests {
         assert_eq!(sheet.rules["#write"]["max-width"], "860px");
         assert!(!sheet.rules["#write"].contains_key("display"));
         assert_eq!(sheet.diagnostics.len(), 2);
+        assert_eq!(
+            sheet.resolve_property("h1", "color").as_deref(),
+            Some("#222")
+        );
+    }
+
+    #[test]
+    fn test_prd_s01_all_four_builtin_themes_parse_cleanly_and_resolve_vars() {
+        for theme in BuiltinTheme::ALL {
+            let sheet = theme.load();
+            assert!(
+                sheet.diagnostics.is_empty(),
+                "Builtin theme {theme:?} produced diagnostics: {:?}",
+                sheet.diagnostics
+            );
+            let bg = sheet.resolve_property("#write", "background-color").unwrap();
+            let fg = sheet.resolve_property("#write", "color").unwrap();
+            assert!(bg.starts_with('#'));
+            assert!(fg.starts_with('#'));
+        }
     }
 }

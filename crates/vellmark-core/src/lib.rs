@@ -9,16 +9,23 @@ pub mod buffer;
 pub mod editor;
 pub mod encoding;
 pub mod state;
+pub mod stats;
 pub mod undo;
+pub mod workspace;
 
 pub use buffer::{ByteOffset, ByteRange, Selection, TextBuffer};
-pub use editor::{EditorAction, EditorController, ViewMode};
+pub use editor::{
+    EditorAction, EditorContext, EditorController, EditorViewState, ViewMode,
+    map_offset_across_reload,
+};
 pub use encoding::{
     DetectedEncoding, EncodingDecision, EncodingError, FileFormatMeta, LineEnding,
     detect_and_decode, encode_for_save,
 };
 pub use state::{
     ConflictActionOutcome, DiskSnapshot, DocState, DocumentSession, RecoveryPayload,
-    RecoverySlotReport, RecoveryWorker, SaveOutcome,
+    RecoverySlotReport, RecoveryWorker, SaveOutcome, SessionError,
 };
+pub use stats::{DocumentStats, count_text_metrics};
 pub use undo::{EditKind, EditOp, Transaction, UndoHistory, syntax_conversion_escape_op};
+pub use workspace::{FileTreeNode, RecentFilesList, is_supported_document};
