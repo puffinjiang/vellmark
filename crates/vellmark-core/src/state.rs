@@ -449,6 +449,100 @@ impl DocumentSession {
         })
     }
 
+    /// Reconstruct a live session from an unrecovered crash snapshot (`PendingRecoveryEntry`),
+    /// detecting any newer external disk edits since the snapshot was written.
+    pub fn from_pending_recovery(
+        entry: &PendingRecoveryEntry,
+        new_recovery_dir: Option<PathBuf>,
+    ) -> Self {
+        let buffer = TextBuffer::from_str(&entry.report.content);
+        let base = DiskSnapshot::from_str(&entry.report.base_content);
+        let mut theirs = entry
+            .report
+            .theirs_content
+            .as_deref()
+            .map(DiskSnapshot::from_str);
+        let mut format = FileFormatMeta {
+            decision: EncodingDecision::Editable(DetectedEncoding::Utf8),
+            dominant_line_ending: crate::encoding::LineEnding::detect_dominant(
+                &entry.report.content,
+            ),
+            has_trailing_newline: entry.report.content.ends_with('\n')
+                || entry.report.content.ends_with('\r'),
+        };
+        let mut state = match entry.report.state {
+            DocState::Clean => {
+                if buffer.crc32() != base.crc32 || buffer.len_bytes() != base.len_bytes {
+                    DocState::Dirty
+                } else {
+                    DocState::Clean
+                }
+            }
+            other => other,
+        };
+        let path = entry
+            .source_path
+            .as_ref()
+            .map(|p| normalize_session_path(p));
+
+        if let Some(p) = &path {
+            match fs::read(p) {
+                Ok(raw) => match detect_and_decode(&raw) {
+                    Ok((disk_text, disk_fmt)) => {
+                        format = disk_fmt;
+                        let disk_snap = DiskSnapshot::from_str(&disk_text);
+                        if disk_snap.crc32 != base.crc32 || disk_snap.len_bytes != base.len_bytes {
+                            theirs = Some(disk_snap);
+                            state = DocState::Conflict;
+                        }
+                    }
+                    Err(_) => {
+                        theirs = Some(DiskSnapshot::from_undecodable_bytes(&raw));
+                        state = DocState::Conflict;
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    state = DocState::Missing {
+                        has_local_edits: buffer.crc32() != base.crc32
+                            || buffer.len_bytes() != base.len_bytes,
+                    };
+                }
+                Err(_) => {}
+            }
+        }
+
+        let recovery_worker = new_recovery_dir
+            .clone()
+            .map(|dir| RecoveryWorker::spawn(dir, Duration::from_millis(200)));
+
+        let mut session = Self {
+            path,
+            buffer,
+            undo: UndoHistory::new(),
+            format,
+            state,
+            base,
+            theirs,
+            recovery_dir: new_recovery_dir.clone(),
+            recovery_worker,
+            recovery_degraded: false,
+            pending_recovery_revision: None,
+        };
+
+        let migrated = if state == DocState::Clean {
+            true
+        } else if new_recovery_dir.is_some() {
+            session.flush_current_recovery_snapshot().is_ok()
+        } else {
+            false
+        };
+        if migrated && new_recovery_dir.as_ref() != Some(&entry.recovery_dir) {
+            remove_recovery_dir_files(&entry.recovery_dir);
+            let _ = fs::remove_dir(&entry.recovery_dir);
+        }
+        session
+    }
+
     /// Create a brand-new untitled UTF-8 LF document session (PRD 4.5 F-01).
     pub fn new_untitled(recovery_dir: Option<PathBuf>) -> Self {
         Self::new_untitled_with_throttle(recovery_dir, Duration::from_millis(200))
@@ -1149,6 +1243,12 @@ impl DocumentSession {
         let rev = self.buffer.revision();
         let backup_path = dir.join(format!("history-{reason}-rev{rev}.bak"));
         atomic_write_file(&backup_path, bytes)
+    }
+
+    /// Explicitly discard any persisted crash recovery snapshot for this session
+    /// (called when the user deliberately chooses to discard unsaved edits and exit).
+    pub fn discard_recovery_snapshot(&mut self) {
+        self.clear_current_recovery_snapshot();
     }
 
     fn clear_current_recovery_snapshot(&mut self) {
@@ -2919,6 +3019,66 @@ mod tests {
         assert_eq!(scanned[0].source_path.as_ref(), Some(&expected_canonical));
 
         drop(session);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_pending_recovery_keeps_old_snapshot_if_new_dir_migration_fails() {
+        let root = unique_temp_dir("rec-migrate-fail");
+        let old_rec_root = root.join("old-recovery");
+        let old_rec_dir = old_rec_root.join("tab-1");
+        let blocking_file = root.join("not-a-directory");
+        let valid_new_dir = root.join("new-recovery").join("tab-1");
+
+        let mut original = DocumentSession::new_untitled(Some(old_rec_dir.clone()));
+        original.edit(
+            ByteRange::empty(0),
+            "unsaved recovery payload\n",
+            Selection::caret(0),
+            Selection::caret(25),
+            EditKind::Typing,
+        );
+        original.flush_current_recovery_snapshot().unwrap();
+        drop(original);
+
+        let entries = scan_recovery_root(&old_rec_root);
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+
+        // 1. None target must keep old snapshot intact when recovered document is not Clean
+        let recovered_none = DocumentSession::from_pending_recovery(entry, None);
+        assert_eq!(recovered_none.buffer.to_string(), "unsaved recovery payload\n");
+        assert!(old_rec_dir.exists());
+        assert!(DocumentSession::read_latest_intact_snapshot(&old_rec_dir).is_some());
+        drop(recovered_none);
+
+        // 2. Failing target directory must preserve old snapshot on disk instead of losing it
+        fs::write(&blocking_file, "file blocks create_dir_all").unwrap();
+        let recovered_fail =
+            DocumentSession::from_pending_recovery(entry, Some(blocking_file.clone()));
+        assert!(recovered_fail.recovery_degraded);
+        assert!(old_rec_dir.exists());
+        assert_eq!(
+            DocumentSession::read_latest_intact_snapshot(&old_rec_dir)
+                .unwrap()
+                .content,
+            "unsaved recovery payload\n"
+        );
+        drop(recovered_fail);
+
+        // 3. Valid new target persists the snapshot first, then removes the old snapshot directory
+        let recovered_ok =
+            DocumentSession::from_pending_recovery(entry, Some(valid_new_dir.clone()));
+        assert!(!recovered_ok.recovery_degraded);
+        assert!(!old_rec_dir.exists());
+        assert_eq!(
+            DocumentSession::read_latest_intact_snapshot(&valid_new_dir)
+                .unwrap()
+                .content,
+            "unsaved recovery payload\n"
+        );
+        drop(recovered_ok);
+
         let _ = fs::remove_dir_all(&root);
     }
 }

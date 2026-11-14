@@ -175,6 +175,10 @@ impl EditorController {
         self.ctx().ime_update(preedit);
     }
 
+    pub fn ime_clear_preedit(&mut self) {
+        self.ctx().ime_clear_preedit();
+    }
+
     pub fn ime_cancel(&mut self) {
         self.ctx().ime_cancel();
     }
@@ -307,6 +311,13 @@ impl EditorContext<'_> {
         }
         *self.ime_preedit = Some(preedit.to_string());
         *self.expansion_frozen = true;
+    }
+
+    /// Clear visible preedit string (e.g., empty `Preedit("", None)` emitted immediately before OS `Commit`)
+    /// while preserving `ime_composition_selection` so a trailing commit still lands on the composition anchor.
+    pub fn ime_clear_preedit(&mut self) {
+        *self.ime_preedit = None;
+        *self.expansion_frozen = false;
     }
 
     /// Cancel IME composition (e.g. Esc key handled by IME, PRD 4.1.1 F).
@@ -2386,6 +2397,7 @@ mod tests {
         ed.set_caret(1);
         ed.ime_update("ni");
         ed.set_caret(2);
+        ed.ime_clear_preedit();
         ed.ime_commit("你");
         assert_eq!(ed.buffer.to_string(), "A你B");
     }

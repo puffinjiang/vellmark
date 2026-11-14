@@ -5,6 +5,15 @@
 use vellmark_core::{ByteRange, Selection};
 use vellmark_parser::{BlockKind, BlockNode};
 
+pub mod shaper;
+pub mod style;
+
+pub use shaper::{
+    DrawList, EditorHitTarget, EditorSceneResult, EditorViewport, Rect, SceneGlyph, SceneRect,
+    ShapedDocumentCache, VisualTextMap, shape_ui_text_into,
+};
+pub use style::{HeadingStyle, ResolvedThemeStyle, RgbaColor, UiChromeColors};
+
 /// Computes the new scroll offset `scroll_y` so that the cursor line's screen Y coordinate
 /// remains invariant when marker expansion changes the height of blocks before the cursor line (PRD 4.1.1 A).
 pub fn stabilize_cursor_line_scroll(

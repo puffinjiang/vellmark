@@ -137,28 +137,32 @@ impl DocumentTab {
         self.edit(|ctx| ctx.insert_text(&converted))
     }
 
-    pub fn compute_layout(&self, base_line_height_px: f32) -> DocumentLayout {
+    /// Sync and borrow cached incremental AST blocks without allocating on unchanged frames (10 MB fast path).
+    pub fn with_incremental_blocks<R>(&self, f: impl FnOnce(&[vellmark_parser::BlockNode]) -> R) -> R {
         let rev = self.session.buffer.revision();
         let mut cache = self.ast_cache.borrow_mut();
         match cache.as_mut() {
-            Some((cached_rev, inc)) if *cached_rev == rev => {
-                DocumentLayout::compute(inc.blocks(), self.view.selection, base_line_height_px)
-            }
+            Some((cached_rev, inc)) if *cached_rev == rev => f(inc.blocks()),
             Some((cached_rev, inc)) => {
                 let source = self.session.buffer.to_string();
                 inc.sync_source(source);
                 *cached_rev = rev;
-                DocumentLayout::compute(inc.blocks(), self.view.selection, base_line_height_px)
+                f(inc.blocks())
             }
             None => {
                 let source = self.session.buffer.to_string();
                 let inc = IncrementalDoc::new(source);
-                let layout =
-                    DocumentLayout::compute(inc.blocks(), self.view.selection, base_line_height_px);
                 *cache = Some((rev, inc));
-                layout
+                let inc_ref = &cache.as_ref().expect("just inserted").1;
+                f(inc_ref.blocks())
             }
         }
+    }
+
+    pub fn compute_layout(&self, base_line_height_px: f32) -> DocumentLayout {
+        self.with_incremental_blocks(|blocks| {
+            DocumentLayout::compute(blocks, self.view.selection, base_line_height_px)
+        })
     }
 
     /// Return the buffer revision currently cached in this tab's incremental AST, if populated.
@@ -602,6 +606,82 @@ impl AppWorkbench {
                     .any(|tab| tab.session.recovery_dir.as_ref() == Some(&entry.recovery_dir))
             })
             .collect()
+    }
+
+    /// Restore any unrecovered crash snapshots found under `recovery_root` into open workbench tabs.
+    /// Returns the number of restored tabs.
+    pub fn restore_pending_recoveries(&mut self) -> usize {
+        let entries = self.discover_pending_recoveries();
+        let mut restored = 0usize;
+        for entry in entries {
+            let meaningful = entry.report.state != DocState::Clean
+                || entry.report.content != entry.report.base_content;
+            if !meaningful {
+                continue;
+            }
+            let entry_canonical = entry
+                .source_path
+                .as_ref()
+                .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
+
+            if let Some(target_canon) = &entry_canonical {
+                if let Some((existing_idx, tab)) = self.tabs.iter_mut().enumerate().find(|(_, t)| {
+                    t.session
+                        .path
+                        .as_ref()
+                        .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()) == *target_canon)
+                        .unwrap_or(false)
+                }) {
+                    if tab.session.state == DocState::Clean {
+                        let rec_dir = tab.session.recovery_dir.clone();
+                        tab.session = DocumentSession::from_pending_recovery(&entry, rec_dir);
+                        let caret = tab.session.buffer.len_bytes();
+                        tab.view.selection = Selection::caret(caret);
+                        *tab.ast_cache.borrow_mut() = None;
+                        self.active_tab_idx = Some(existing_idx);
+                        restored += 1;
+                    }
+                    continue;
+                }
+            }
+
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
+            let rec_dir = self.recovery_dir_for_tab(id);
+            let session = DocumentSession::from_pending_recovery(&entry, rec_dir);
+            let caret = session.buffer.len_bytes();
+            self.tabs.push(DocumentTab {
+                id,
+                session,
+                view: EditorViewState {
+                    selection: Selection::caret(caret),
+                    ..Default::default()
+                },
+                scroll_y: 0.0,
+                ast_cache: std::cell::RefCell::new(None),
+                last_zero_width_find: None,
+            });
+            self.active_tab_idx = Some(self.tabs.len() - 1);
+            restored += 1;
+        }
+        restored
+    }
+
+    /// Synchronously flush recovery snapshots for all unsaved tabs in the workbench.
+    pub fn flush_all_recoveries(&mut self) {
+        for tab in &mut self.tabs {
+            if tab.session.state != DocState::Clean {
+                let _ = tab.session.flush_current_recovery_snapshot();
+            }
+        }
+    }
+
+    /// Explicitly discard persisted recovery snapshots for all tabs
+    /// (invoked only after deliberate user discard confirmation).
+    pub fn discard_all_recoveries(&mut self) {
+        for tab in &mut self.tabs {
+            tab.session.discard_recovery_snapshot();
+        }
     }
 
     fn recovery_dir_for_tab(&self, tab_id: u64) -> Option<PathBuf> {

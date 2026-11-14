@@ -13,3 +13,12 @@ vellmark-parser.workspace = true
 vellmark-theme.workspace = true
 vellmark-render.workspace = true
 vellmark-export.workspace = true
+cosmic-text.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.2.2", features = ["NSPasteboard"] }
+objc2-foundation = { version = "0.2.2", features = ["NSArray", "NSData", "NSObjCRuntime", "NSString"] }
