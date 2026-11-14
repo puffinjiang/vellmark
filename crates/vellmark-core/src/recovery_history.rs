@@ -17,7 +17,7 @@ use std::time::UNIX_EPOCH;
 
 use crate::state::{
     BoundedFileHeader, DocState, MAX_RECOVERY_HEADER_BYTES, PendingRecoveryEntry,
-    RECOVERY_META_FILENAME, SessionError, SlotInspect, SlotVerify, atomic_write_file,
+    RECOVERY_META_FILENAME, SessionError, SlotInspect, SlotVerify, atomic_write_internal_file,
     canonicalize_lossy, compute_bytes_crc32, current_unix_secs, doc_state_from_tag,
     doc_state_to_tag, inspect_slot_report_header, json_escape_str, parse_json_string_at,
     read_file_bounded_header, remove_recovery_dir_and_empty_dir,
@@ -301,7 +301,7 @@ pub(crate) fn write_historical_backup_entry(
     out.extend_from_slice(stored_base_bytes);
     out.extend_from_slice(req.payload);
 
-    atomic_write_file(&target, &out)?;
+    atomic_write_internal_file(&target, &out)?;
     prune_historical_backups_at(
         req.history_root,
         req.policy,

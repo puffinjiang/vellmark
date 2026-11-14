@@ -711,14 +711,14 @@ fn write_payload_to_next_slot(
     };
     let encoded = serialize_slot_report(&report);
     let target = dir.join(format!("current.slot{next_slot}.rec"));
-    atomic_write_file(&target, encoded.as_bytes())?;
+    atomic_write_internal_file(&target, encoded.as_bytes())?;
     let meta = RecoveryMeta {
         source_path: payload.source_path.clone(),
         draft_id: payload.draft_id.clone(),
         updated_unix_secs: current_unix_secs(),
     };
     let meta_json = serialize_recovery_meta_json(&meta);
-    atomic_write_file(&dir.join(RECOVERY_META_FILENAME), meta_json.as_bytes())?;
+    atomic_write_internal_file(&dir.join(RECOVERY_META_FILENAME), meta_json.as_bytes())?;
     *active_slot = next_slot;
     Ok(())
 }
@@ -2115,11 +2115,92 @@ pub fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
     a == b || canonicalize_lossy(a) == canonicalize_lossy(b)
 }
 
-/// Write to a unique temporary sibling file, `fsync`, and atomically rename (PRD 4.5.1 G).
-/// Cleans up the temp file on any error so failed writes do not accumulate debris.
-pub fn atomic_write_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = target
+fn resolve_symlink_target_for_write(target: &Path) -> std::io::Result<PathBuf> {
+    match fs::canonicalize(target) {
+        Ok(canon) => Ok(canon),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Walk symlink hops manually for dangling symlinks so writes populate the
+            // intended link destination instead of replacing the symlink with a regular file.
+            let mut cur = target.to_path_buf();
+            for _ in 0..40 {
+                match fs::symlink_metadata(&cur) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        let raw = fs::read_link(&cur)?;
+                        cur = if raw.is_absolute() {
+                            raw
+                        } else {
+                            cur.parent().unwrap_or_else(|| Path::new(".")).join(raw)
+                        };
+                    }
+                    Ok(_) => break,
+                    Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(e2) => return Err(e2),
+                }
+            }
+            if fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "too many levels of symbolic links",
+                ));
+            }
+            Ok(canonicalize_lossy(&cur))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn resolve_write_target_and_permissions(
+    target: &Path,
+    follow_symlinks: bool,
+    preserve_permissions: bool,
+) -> std::io::Result<(PathBuf, Option<fs::Permissions>)> {
+    let write_target = match fs::symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if !follow_symlinks {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing to follow symlink for internal file write",
+                ));
+            }
+            resolve_symlink_target_for_write(target)?
+        }
+        Ok(meta) if meta.is_dir() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to overwrite directory",
+            ));
+        }
+        Ok(_) => target.to_path_buf(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => target.to_path_buf(),
+        Err(e) => return Err(e),
+    };
+
+    if fs::metadata(&write_target).is_ok_and(|m| m.is_dir()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to overwrite directory",
+        ));
+    }
+
+    let existing_perms = if preserve_permissions {
+        fs::metadata(&write_target).ok().map(|m| m.permissions())
+    } else {
+        None
+    };
+
+    Ok((write_target, existing_perms))
+}
+
+fn atomic_write_resolved(
+    write_target: &Path,
+    bytes: &[u8],
+    existing_perms: Option<fs::Permissions>,
+) -> std::io::Result<()> {
+    let parent = match write_target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let file_name = write_target
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("vellmark");
@@ -2128,17 +2209,40 @@ pub fn atomic_write_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
         ".{file_name}.{}.{seq}.vellmark.tmp",
         std::process::id()
     ));
+
     let write_res = (|| -> std::io::Result<()> {
-        let mut f = File::create(&tmp_path)?;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Start private when updating an existing file so 0600 data is never world-readable.
+            if existing_perms.is_some() {
+                opts.mode(0o600);
+            }
+        }
+        let mut f = opts.open(&tmp_path)?;
         f.write_all(bytes)?;
+        if let Some(perms) = existing_perms {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(fs::Permissions::from_mode(perms.mode() & 0o777))?;
+            }
+            #[cfg(not(unix))]
+            if !perms.readonly() {
+                f.set_permissions(perms)?;
+            }
+        }
         f.sync_all()?;
         Ok(())
     })();
+
     if let Err(e) = write_res {
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
     }
-    if let Err(e) = fs::rename(&tmp_path, target) {
+    if let Err(e) = fs::rename(&tmp_path, write_target) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
     }
@@ -2147,6 +2251,20 @@ pub fn atomic_write_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = File::open(parent).and_then(|d| d.sync_all());
     }
     Ok(())
+}
+
+/// Write an internal recovery/history artifact atomically without following symlinks at `target`.
+pub(crate) fn atomic_write_internal_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let (write_target, _) = resolve_write_target_and_permissions(target, false, false)?;
+    atomic_write_resolved(&write_target, bytes, None)
+}
+
+/// Write to a unique temporary sibling file, preserve original file permissions, follow symlinks
+/// to their link target without replacing the symlink itself, `fsync`, and atomically rename (PRD 4.5.1 G).
+/// Cleans up the temp file on any error so failed writes do not accumulate debris.
+pub fn atomic_write_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let (write_target, existing_perms) = resolve_write_target_and_permissions(target, true, true)?;
+    atomic_write_resolved(&write_target, bytes, existing_perms)
 }
 
 pub(crate) fn compute_bytes_crc32(bytes: &[u8]) -> u32 {
@@ -4969,6 +5087,133 @@ mod tests {
             session.buffer.to_string(),
             "| a | b |\r\n| --- | --- |\r\n|  |  |"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_save_preserves_original_permissions_and_writes_symlink_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = unique_temp_dir("write-safety-perms-symlink");
+        let links_dir = root.join("links");
+        let targets_dir = root.join("targets");
+        fs::create_dir_all(&links_dir).unwrap();
+        fs::create_dir_all(&targets_dir).unwrap();
+
+        // 1. Regular 0600 & 0755 files keep their mode across sync and async saves
+        let private_file = root.join("secret.md");
+        fs::write(&private_file, "secret v1\n").unwrap();
+        fs::set_permissions(&private_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let script_doc = root.join("exec.md");
+        fs::write(&script_doc, "script v1\n").unwrap();
+        fs::set_permissions(&script_doc, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut priv_session = DocumentSession::open_file(&private_file, None).unwrap();
+        let mut priv_view = EditorViewState::default();
+        priv_session
+            .with_editor_view(&mut priv_view, |ctx| {
+                ctx.set_caret(ctx.buffer.len_bytes());
+                ctx.insert_text("secret v2\n");
+            })
+            .unwrap();
+        assert_eq!(priv_session.save(), SaveOutcome::SavedClean);
+        assert_eq!(
+            fs::metadata(&private_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let mut script_session = DocumentSession::open_file(&script_doc, None).unwrap();
+        let mut script_view = EditorViewState::default();
+        script_session
+            .with_editor_view(&mut script_view, |ctx| {
+                ctx.set_caret(ctx.buffer.len_bytes());
+                ctx.insert_text("script v2\n");
+            })
+            .unwrap();
+        assert!(script_session.schedule_async_save());
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while script_session.is_async_save_in_flight() {
+            assert!(Instant::now() < deadline, "async save timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(script_session.poll_async_save(), Some(SaveOutcome::SavedClean));
+        assert_eq!(
+            fs::metadata(&script_doc).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        // 2. Writing via cross-directory symlink updates the real target without replacing the symlink
+        let real_target = targets_dir.join("real.md");
+        fs::write(&real_target, "real v1\n").unwrap();
+        fs::set_permissions(&real_target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link_path = links_dir.join("alias.md");
+        symlink("../targets/real.md", &link_path).unwrap();
+
+        let mut link_session = DocumentSession::open_file(&link_path, None).unwrap();
+        let mut link_view = EditorViewState::default();
+        link_session
+            .with_editor_view(&mut link_view, |ctx| {
+                ctx.set_caret(ctx.buffer.len_bytes());
+                ctx.insert_text("real v2\n");
+            })
+            .unwrap();
+        assert_eq!(link_session.save(), SaveOutcome::SavedClean);
+
+        assert!(
+            fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink itself must not be replaced by a regular file"
+        );
+        assert_eq!(
+            fs::read_link(&link_path).unwrap(),
+            PathBuf::from("../targets/real.md")
+        );
+        assert_eq!(fs::read_to_string(&real_target).unwrap(), "real v1\nreal v2\n");
+        assert_eq!(
+            fs::metadata(&real_target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            link_session.sync_from_disk_with_view(&mut link_view, true),
+            ExternalSyncResult::NoChange
+        );
+
+        // 3. Dangling symlink populates intended destination without destroying symlink;
+        //    symlink loops and internal recovery writes through symlinks fail safely
+        let dangling_target = targets_dir.join("dangling_real.md");
+        let dangling_link = links_dir.join("dangling.md");
+        symlink(&dangling_target, &dangling_link).unwrap();
+        atomic_write_file(&dangling_link, b"created via dangling symlink\n").unwrap();
+        assert!(
+            fs::symlink_metadata(&dangling_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(&dangling_target).unwrap(),
+            "created via dangling symlink\n"
+        );
+
+        let loop_a = links_dir.join("loop_a.md");
+        let loop_b = links_dir.join("loop_b.md");
+        symlink(&loop_b, &loop_a).unwrap();
+        symlink(&loop_a, &loop_b).unwrap();
+        assert!(atomic_write_file(&loop_a, b"should fail").is_err());
+        assert!(
+            fs::symlink_metadata(&loop_a)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        assert!(atomic_write_internal_file(&link_path, b"internal").is_err());
+        assert_eq!(fs::read_to_string(&real_target).unwrap(), "real v1\nreal v2\n");
 
         let _ = fs::remove_dir_all(&root);
     }
