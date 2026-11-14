@@ -126,6 +126,10 @@ enum ImeTarget {
     FindBox,
 }
 
+/// Warning shown in the status bar whenever protected crash snapshots exceed the 500 MB budget.
+pub const PROTECTED_SNAPSHOT_LIMIT_NOTICE: &str =
+    "Protected recovery snapshots exceed 500 MB — please save or discard old drafts";
+
 /// Platform-independent GUI controller owning layout state, shortcuts, IME state,
 /// find overlay, and virtualized scene construction (fully testable headlessly).
 pub struct GuiController {
@@ -159,6 +163,7 @@ pub struct GuiController {
     last_total_doc_height: f32,
     collapsed_dirs: HashSet<PathBuf>,
     pending_scroll_ensure_caret: bool,
+    protected_limit_warned: bool,
 }
 
 impl GuiController {
@@ -173,6 +178,7 @@ impl GuiController {
         } else {
             SidebarSection::Outline
         };
+        let protected_limit_warned = workbench.protected_snapshots_exceed_limit();
         Self {
             workbench,
             shaper: ShapedDocumentCache::new(),
@@ -204,6 +210,7 @@ impl GuiController {
             last_total_doc_height: 0.0,
             collapsed_dirs: HashSet::new(),
             pending_scroll_ensure_caret: false,
+            protected_limit_warned,
         }
     }
 
@@ -213,6 +220,68 @@ impl GuiController {
 
     pub fn set_notice(&mut self, msg: impl Into<String>) {
         self.status_notice = Some((msg.into(), Instant::now()));
+    }
+
+    /// Return the active status-bar notice text, keeping the protected-snapshot capacity warning
+    /// visible beyond the 3-second transient notice timeout until storage drops back within budget.
+    pub fn active_status_notice(&self) -> Option<String> {
+        let transient = self
+            .status_notice
+            .as_ref()
+            .and_then(|(msg, ts)| (ts.elapsed() < Duration::from_secs(3)).then_some(msg.as_str()));
+        match (transient, self.workbench.protected_snapshots_exceed_limit()) {
+            (Some(msg), true) if msg != PROTECTED_SNAPSHOT_LIMIT_NOTICE => {
+                Some(format!("{msg}   |   {PROTECTED_SNAPSHOT_LIMIT_NOTICE}"))
+            }
+            (Some(msg), _) => Some(msg.to_string()),
+            (None, true) => Some(PROTECTED_SNAPSHOT_LIMIT_NOTICE.to_string()),
+            (None, false) => None,
+        }
+    }
+
+    /// Synchronize transient notice state after a recovery-maintenance audit completes.
+    pub fn sync_protected_snapshot_warning(&mut self) -> bool {
+        let exceeds = self.workbench.protected_snapshots_exceed_limit();
+        if exceeds {
+            let newly_exceeded = !self.protected_limit_warned;
+            self.protected_limit_warned = true;
+            if newly_exceeded {
+                self.set_notice(PROTECTED_SNAPSHOT_LIMIT_NOTICE);
+            }
+            newly_exceeded
+        } else {
+            let cleared = self.protected_limit_warned;
+            self.protected_limit_warned = false;
+            if self
+                .status_notice
+                .as_ref()
+                .is_some_and(|(msg, _)| msg == PROTECTED_SNAPSHOT_LIMIT_NOTICE)
+            {
+                self.status_notice = None;
+            }
+            cleared
+        }
+    }
+
+    /// Harvest any completed background maintenance worker result and refresh runtime limit warnings.
+    pub fn poll_background_maintenance(&mut self) -> bool {
+        if self.workbench.poll_recovery_maintenance().is_some() {
+            self.sync_protected_snapshot_warning();
+            return true;
+        }
+        false
+    }
+
+    fn trigger_background_maintenance(&mut self, force_when_warned: bool) {
+        self.poll_background_maintenance();
+        let started = if force_when_warned && self.protected_limit_warned {
+            self.workbench.maintain_recovery_storage_async()
+        } else {
+            self.workbench.maybe_maintain_recovery_storage_async()
+        };
+        if !started {
+            self.sync_protected_snapshot_warning();
+        }
     }
 
     fn reset_blink(&mut self) {
@@ -1001,12 +1070,7 @@ impl GuiController {
             None => ("No Document".to_string(), chrome.muted_text, "", ""),
         };
 
-        // Notice if within 3 seconds
-        let active_notice = self
-            .status_notice
-            .as_ref()
-            .and_then(|(msg, ts)| (ts.elapsed() < Duration::from_secs(3)).then_some(msg.as_str()))
-            .map(str::to_string);
+        let active_notice = self.active_status_notice();
 
         dl.rects.push(SceneRect::rounded(
             Rect::new(10.0, sb.y + 8.0, 8.0, 8.0),
@@ -1216,6 +1280,7 @@ impl GuiController {
             .iter()
             .position(|t| t.session.state != DocState::Clean);
         let Some(idx) = first_unsaved else {
+            self.workbench.maintain_recovery_storage();
             return true;
         };
         if !self.close_confirm_armed {
@@ -1229,6 +1294,7 @@ impl GuiController {
             return false;
         }
         self.workbench.discard_all_recoveries();
+        self.workbench.maintain_recovery_storage();
         true
     }
 
@@ -1285,13 +1351,7 @@ impl GuiController {
                     "w" => {
                         self.close_confirm_armed = false;
                         if let Some(id) = self.workbench.active_tab().map(|t| t.id) {
-                            if self.workbench.close_tab(id, false) {
-                                if self.ime_target == ImeTarget::Tab(id) {
-                                    self.ime_target = ImeTarget::None;
-                                }
-                            } else {
-                                self.set_notice("Unsaved changes — save first or keep open");
-                            }
+                            self.close_tab_checked(id, "Unsaved changes — save first or keep open");
                         }
                         return true;
                     }
@@ -1639,13 +1699,7 @@ impl GuiController {
                 true
             }
             UiAction::CloseTab(id) => {
-                if self.workbench.close_tab(id, false) {
-                    if self.ime_target == ImeTarget::Tab(id) {
-                        self.ime_target = ImeTarget::None;
-                    }
-                } else {
-                    self.set_notice("Unsaved changes — press Save first");
-                }
+                self.close_tab_checked(id, "Unsaved changes — press Save first");
                 true
             }
             UiAction::NewTab => {
@@ -1743,6 +1797,17 @@ impl GuiController {
         self.set_notice(format!("Theme: {next:?}"));
     }
 
+    fn close_tab_checked(&mut self, id: u64, unsaved_msg: &str) {
+        if self.workbench.close_tab(id, false) {
+            if self.ime_target == ImeTarget::Tab(id) {
+                self.ime_target = ImeTarget::None;
+            }
+            self.trigger_background_maintenance(true);
+        } else {
+            self.set_notice(unsaved_msg);
+        }
+    }
+
     fn save_active_tab(&mut self) {
         self.close_confirm_armed = false;
         let untitled_dir = self
@@ -1763,6 +1828,7 @@ impl GuiController {
             match tab.save_as(&reserved) {
                 SaveOutcome::SavedClean | SaveOutcome::SavedButStillDirty { .. } => {
                     self.set_notice(format!("Saved {}", reserved.display()));
+                    self.trigger_background_maintenance(true);
                 }
                 SaveOutcome::EnteredConflict => {
                     let _ = fs::remove_file(&reserved);
@@ -1778,6 +1844,7 @@ impl GuiController {
         match tab.save() {
             SaveOutcome::SavedClean | SaveOutcome::SavedButStillDirty { .. } => {
                 self.set_notice("Saved");
+                self.trigger_background_maintenance(true);
             }
             SaveOutcome::EnteredConflict => {
                 self.set_notice("External modification conflict detected!");
@@ -2271,6 +2338,7 @@ impl ApplicationHandler for VellmarkApp {
                 if let Some(win) = &self.window {
                     win.set_ime_allowed(true);
                 }
+                self.controller.trigger_background_maintenance(false);
                 self.controller.reset_blink();
                 self.request_redraw();
             }
@@ -2282,6 +2350,10 @@ impl ApplicationHandler for VellmarkApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.controller.poll_background_maintenance() {
+            self.request_redraw();
+        }
+        self.controller.workbench.maybe_maintain_recovery_storage_async();
         let now = Instant::now();
         if self.controller.tick_blink(now) {
             self.request_redraw();
@@ -2792,5 +2864,140 @@ mod tests {
             .status_notice
             .as_ref()
             .is_some_and(|(n, _)| n.contains("Clipboard error")));
+    }
+
+    #[test]
+    fn test_gui_close_runs_recovery_maintenance_and_prunes_conflict_backups() {
+        let dir = std::env::temp_dir().join(format!(
+            "vellmark-gui-close-maint-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rec_root = dir.join("rec");
+        let doc = dir.join("doc.md");
+        fs::create_dir_all(&rec_root).unwrap();
+        fs::write(&doc, "Base\n").unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root.clone()));
+        wb.open_document(&doc).unwrap();
+        {
+            let tab = wb.active_tab_mut().unwrap();
+            tab.edit(|ctx| ctx.insert_text("Local\n")).unwrap();
+            let rev = tab.session.buffer.revision();
+            let rope = tab.session.buffer.snapshot_rope();
+            fs::write(&doc, "External\n").unwrap();
+            assert_eq!(tab.save(), SaveOutcome::EnteredConflict);
+            assert_eq!(
+                tab.session.resolve_conflict_keep_mine(rev, rope),
+                vellmark_core::ConflictActionOutcome::ResolvedClean
+            );
+        }
+        assert_eq!(wb.list_history_backups().len(), 1);
+
+        let mut gui = GuiController::with_clipboard(wb, Box::new(MemoryClipboard::default()));
+        // Tighten quota to 0 to simulate expired/over-budget conflict backups at clean exit time
+        gui.workbench.history_policy.max_total_bytes = 0;
+
+        assert!(gui.handle_close_requested());
+        let report = gui
+            .workbench
+            .last_recovery_maintenance
+            .as_ref()
+            .expect("clean window exit must run recovery storage maintenance");
+        assert_eq!(report.history_prune.removed_global_cap, 1);
+        assert!(gui.workbench.list_history_backups().is_empty());
+        assert!(
+            vellmark_core::scan_recovery_root(&rec_root).is_empty(),
+            "clean window exit must leave zero current snapshots"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_runtime_protected_snapshot_limit_warning_updates_and_persists_until_resolved() {
+        let dir = std::env::temp_dir().join(format!(
+            "vellmark-gui-runtime-limit-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rec_root = dir.join("rec");
+        let save_dir = dir.join("saved");
+        fs::create_dir_all(&rec_root).unwrap();
+        fs::create_dir_all(&save_dir).unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root.clone()));
+        wb.history_policy.max_total_bytes = 256;
+        // Initial startup maintenance starts cleanly under budget.
+        let initial = wb.maintain_recovery_storage_with_grace(0).unwrap();
+        assert!(!initial.protected_exceeds_limit);
+
+        let mut gui = GuiController::with_clipboard(wb, Box::new(MemoryClipboard::default()));
+        gui.untitled_save_dir = Some(save_dir.clone());
+        assert!(gui.active_status_notice().is_none());
+
+        // During runtime, create an unsaved draft exceeding the limit and flush its snapshot.
+        gui.workbench.new_document();
+        {
+            let tab = gui.workbench.active_tab_mut().unwrap();
+            tab.edit(|ctx| ctx.insert_text(&"X".repeat(2048))).unwrap();
+            tab.session.flush_current_recovery_snapshot().unwrap();
+        }
+
+        // Background maintenance runs and crosses limit during runtime (no restart!).
+        assert!(gui.workbench.maintain_recovery_storage_async());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !gui.poll_background_maintenance() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for runtime background maintenance"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(gui.workbench.protected_snapshots_exceed_limit());
+        assert_eq!(
+            gui.active_status_notice().as_deref(),
+            Some(PROTECTED_SNAPSHOT_LIMIT_NOTICE)
+        );
+
+        // Even after a 3-second transient notice timeout expires, warning remains visible.
+        gui.status_notice = Some((
+            "Transient notice".to_string(),
+            Instant::now() - Duration::from_secs(5),
+        ));
+        assert_eq!(
+            gui.active_status_notice().as_deref(),
+            Some(PROTECTED_SNAPSHOT_LIMIT_NOTICE)
+        );
+
+        // Transient notices during active overflow still retain the protected-limit warning.
+        gui.set_notice("Saved something else");
+        let combined = gui.active_status_notice().unwrap();
+        assert!(combined.contains(PROTECTED_SNAPSHOT_LIMIT_NOTICE));
+
+        // Saving the large untitled draft removes its protected snapshot and forces re-audit,
+        // clearing the limit warning once background maintenance finishes.
+        gui.save_active_tab();
+        let clear_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while gui.workbench.protected_snapshots_exceed_limit() {
+            gui.poll_background_maintenance();
+            assert!(
+                std::time::Instant::now() < clear_deadline,
+                "timed out waiting for warning to clear after save"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!gui.workbench.protected_snapshots_exceed_limit());
+        assert!(!gui
+            .active_status_notice()
+            .as_deref()
+            .is_some_and(|n| n.contains(PROTECTED_SNAPSHOT_LIMIT_NOTICE)));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

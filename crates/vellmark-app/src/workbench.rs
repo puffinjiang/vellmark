@@ -5,6 +5,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT_WORKBENCH_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -19,9 +21,13 @@ fn next_recovery_session_tag() -> String {
 }
 
 use vellmark_core::{
-    ByteOffset, ConflictActionOutcome, DocState, DocumentSession, DocumentStats, EditorAction,
-    EditorContext, EditorViewState, FileTreeNode, RecentFilesList, SaveOutcome, Selection,
-    SessionError,
+    ByteOffset, ConflictActionOutcome, DEFAULT_ORPHAN_GRACE_SECS, DocState, DocumentSession,
+    DocumentStats, EditorAction, EditorContext, EditorViewState, FileTreeNode,
+    HISTORICAL_BACKUPS_DIR_NAME, HistoricalBackupEntry, HistoricalBackupPolicy,
+    HistoricalBackupReason, PendingRecoveryEntry, RecentFilesList, RecoveryMaintenanceReport,
+    SaveOutcome, Selection, SessionError, archive_pending_recovery_to_history,
+    clear_conflict_backups_for_path, clear_historical_backups_for_path, delete_historical_backup,
+    discard_pending_recovery_entry, list_historical_backups, maintain_recovery_root,
 };
 use vellmark_export::{
     HtmlExportMode, export_markdown_to_html_document, html_to_markdown,
@@ -381,6 +387,13 @@ impl DocumentTab {
     }
 }
 
+const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 60;
+
+struct MaintenanceJob {
+    rx: mpsc::Receiver<(u64, RecoveryMaintenanceReport)>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
 /// Top-level Vellmark multi-tab application workbench (PRD 4.5, 4.7, 4.8).
 pub struct AppWorkbench {
     pub config: AppConfig,
@@ -388,6 +401,8 @@ pub struct AppWorkbench {
     pub file_tree: Option<FileTreeNode>,
     pub recent_files: RecentFilesList,
     pub recovery_root: Option<PathBuf>,
+    pub history_policy: HistoricalBackupPolicy,
+    pub last_recovery_maintenance: Option<RecoveryMaintenanceReport>,
     pub tabs: Vec<DocumentTab>,
     pub active_tab_idx: Option<usize>,
     pub system_prefers_dark: bool,
@@ -395,6 +410,14 @@ pub struct AppWorkbench {
     custom_theme_css: Option<String>,
     next_tab_id: u64,
     recovery_session_tag: String,
+    last_maintenance_unix_secs: Option<u64>,
+    pending_maintenance: Option<MaintenanceJob>,
+}
+
+impl Drop for AppWorkbench {
+    fn drop(&mut self) {
+        self.finish_pending_recovery_maintenance();
+    }
 }
 
 impl AppWorkbench {
@@ -406,6 +429,8 @@ impl AppWorkbench {
             file_tree: None,
             recent_files: RecentFilesList::default(),
             recovery_root,
+            history_policy: HistoricalBackupPolicy::default(),
+            last_recovery_maintenance: None,
             tabs: Vec::new(),
             active_tab_idx: None,
             system_prefers_dark: false,
@@ -413,7 +438,15 @@ impl AppWorkbench {
             custom_theme_css: None,
             next_tab_id: 1,
             recovery_session_tag: next_recovery_session_tag(),
+            last_maintenance_unix_secs: None,
+            pending_maintenance: None,
         }
+    }
+
+    pub fn history_root(&self) -> Option<PathBuf> {
+        self.recovery_root
+            .as_ref()
+            .map(|r| r.join(HISTORICAL_BACKUPS_DIR_NAME))
     }
 
     pub fn active_tab(&self) -> Option<&DocumentTab> {
@@ -428,7 +461,13 @@ impl AppWorkbench {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let rec_dir = self.recovery_dir_for_tab(id);
-        let session = DocumentSession::new_untitled(rec_dir);
+        let hist_root = self.history_root();
+        let session = DocumentSession::new_untitled_with_recovery(
+            rec_dir,
+            hist_root,
+            self.history_policy,
+            std::time::Duration::from_millis(200),
+        );
         self.tabs.push(DocumentTab {
             id,
             session,
@@ -461,7 +500,14 @@ impl AppWorkbench {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let rec_dir = self.recovery_dir_for_tab(id);
-        let session = DocumentSession::open_file(target, rec_dir)?;
+        let hist_root = self.history_root();
+        let session = DocumentSession::open_file_with_recovery(
+            target,
+            rec_dir,
+            hist_root,
+            self.history_policy,
+            std::time::Duration::from_millis(200),
+        )?;
         self.recent_files.record_open(canonical);
         self.tabs.push(DocumentTab {
             id,
@@ -475,13 +521,20 @@ impl AppWorkbench {
         Ok(id)
     }
 
-    /// Close a tab cleanly. Refuses to silently discard Dirty/Conflict tabs unless `force` is true (PRD 4.5.1).
-    pub fn close_tab(&mut self, tab_id: u64, force: bool) -> bool {
+    /// Close a tab, enforcing unsaved-change guards when `force == false` and archiving unsaved edits
+    /// into bounded historical backups when `force == true` (refusing to close `Missing` if backup fails).
+    pub fn try_close_tab(&mut self, tab_id: u64, force: bool) -> Result<bool, String> {
         let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) else {
-            return false;
+            return Ok(false);
         };
-        if !force && self.tabs[pos].session.state != DocState::Clean {
-            return false;
+        let state = self.tabs[pos].session.state;
+        if !force && state != DocState::Clean {
+            return Ok(false);
+        }
+        if state == DocState::Clean {
+            self.tabs[pos].session.clear_current_recovery_snapshot();
+        } else if let Err(err) = self.tabs[pos].session.archive_unsaved_on_close() {
+            return Err(format!("recovery backup failed: {err}"));
         }
         self.tabs.remove(pos);
         self.active_tab_idx = if self.tabs.is_empty() {
@@ -489,7 +542,13 @@ impl AppWorkbench {
         } else {
             Some(pos.min(self.tabs.len() - 1))
         };
-        true
+        self.maybe_maintain_recovery_storage_async();
+        Ok(true)
+    }
+
+    /// Close a tab cleanly. Refuses to silently discard Dirty/Conflict tabs unless `force` is true (PRD 4.5.1).
+    pub fn close_tab(&mut self, tab_id: u64, force: bool) -> bool {
+        self.try_close_tab(tab_id, force).unwrap_or(false)
     }
 
     pub fn open_folder(&mut self, root: impl AsRef<Path>) -> io::Result<()> {
@@ -608,15 +667,20 @@ impl AppWorkbench {
             .collect()
     }
 
-    /// Restore any unrecovered crash snapshots found under `recovery_root` into open workbench tabs.
+    /// Restore any unrecovered crash snapshots found under `recovery_root` into open workbench tabs,
+    /// cleaning stale `Clean` entries and enforcing bounded history retention across restarts.
     /// Returns the number of restored tabs.
     pub fn restore_pending_recoveries(&mut self) -> usize {
         let entries = self.discover_pending_recoveries();
         let mut restored = 0usize;
+        let hist_root = self.history_root();
+        let policy = self.history_policy;
+
         for entry in entries {
             let meaningful = entry.report.state != DocState::Clean
                 || entry.report.content != entry.report.base_content;
             if !meaningful {
+                discard_pending_recovery_entry(&entry);
                 continue;
             }
             let entry_canonical = entry
@@ -634,7 +698,12 @@ impl AppWorkbench {
                 }) {
                     if tab.session.state == DocState::Clean {
                         let rec_dir = tab.session.recovery_dir.clone();
-                        tab.session = DocumentSession::from_pending_recovery(&entry, rec_dir);
+                        tab.session = DocumentSession::from_pending_recovery_with_recovery(
+                            &entry,
+                            rec_dir,
+                            hist_root.clone(),
+                            policy,
+                        );
                         let caret = tab.session.buffer.len_bytes();
                         tab.view.selection = Selection::caret(caret);
                         *tab.ast_cache.borrow_mut() = None;
@@ -648,7 +717,12 @@ impl AppWorkbench {
             let id = self.next_tab_id;
             self.next_tab_id += 1;
             let rec_dir = self.recovery_dir_for_tab(id);
-            let session = DocumentSession::from_pending_recovery(&entry, rec_dir);
+            let session = DocumentSession::from_pending_recovery_with_recovery(
+                &entry,
+                rec_dir,
+                hist_root.clone(),
+                policy,
+            );
             let caret = session.buffer.len_bytes();
             self.tabs.push(DocumentTab {
                 id,
@@ -664,7 +738,229 @@ impl AppWorkbench {
             self.active_tab_idx = Some(self.tabs.len() - 1);
             restored += 1;
         }
+        self.maintain_recovery_storage();
         restored
+    }
+
+    /// Archive an unrecovered pending crash snapshot into bounded historical backups and clean up
+    /// its protected current snapshot directory (PRD 4.5.1 F).
+    pub fn dismiss_pending_recovery_to_history(
+        &self,
+        entry: &PendingRecoveryEntry,
+    ) -> Result<Option<PathBuf>, SessionError> {
+        let Some(hist_root) = self.history_root() else {
+            discard_pending_recovery_entry(entry);
+            return Ok(None);
+        };
+        let path = archive_pending_recovery_to_history(
+            hist_root,
+            entry,
+            HistoricalBackupReason::UnrecoveredCrashSnapshot,
+            self.history_policy,
+        )?;
+        Ok(Some(path))
+    }
+
+    /// Explicitly discard an unrecovered pending crash snapshot without creating a historical backup.
+    pub fn discard_pending_recovery(&self, entry: &PendingRecoveryEntry) {
+        discard_pending_recovery_entry(entry);
+    }
+
+    /// List verified historical backups stored under this workbench's recovery root (newest first).
+    pub fn list_history_backups(&self) -> Vec<HistoricalBackupEntry> {
+        match self.history_root() {
+            Some(hist) => list_historical_backups(hist),
+            None => Vec::new(),
+        }
+    }
+
+    /// Maintain recovery root synchronously: prune expired/over-quota historical backups, clean
+    /// stale temp/corrupt files, expired legacy backups, and orphan empty dirs, and audit
+    /// protected snapshot capacity.
+    pub fn maintain_recovery_storage(&mut self) -> Option<RecoveryMaintenanceReport> {
+        self.maintain_recovery_storage_with_grace(DEFAULT_ORPHAN_GRACE_SECS)
+    }
+
+    /// Run `maintain_recovery_storage` synchronously at most once every
+    /// `DEFAULT_MAINTENANCE_INTERVAL_SECS`.
+    pub fn maybe_maintain_recovery_storage(&mut self) -> Option<RecoveryMaintenanceReport> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(last) = self.last_maintenance_unix_secs {
+            if now.saturating_sub(last) < DEFAULT_MAINTENANCE_INTERVAL_SECS {
+                return None;
+            }
+        }
+        self.maintain_recovery_storage()
+    }
+
+    /// Launch `maintain_recovery_root` on a background worker thread if one is not already active
+    /// and the maintenance throttle window has elapsed.
+    pub fn maybe_maintain_recovery_storage_async(&mut self) -> bool {
+        self.poll_recovery_maintenance();
+        if self.pending_maintenance.is_some() {
+            return false;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(last) = self.last_maintenance_unix_secs {
+            if now.saturating_sub(last) < DEFAULT_MAINTENANCE_INTERVAL_SECS {
+                return false;
+            }
+        }
+        self.maintain_recovery_storage_async()
+    }
+
+    /// Unconditionally schedule a background recovery maintenance pass unless one is already running.
+    pub fn maintain_recovery_storage_async(&mut self) -> bool {
+        self.poll_recovery_maintenance();
+        if self.pending_maintenance.is_some() {
+            return false;
+        }
+        let Some(root) = self.recovery_root.clone() else {
+            return false;
+        };
+        let active_dirs: Vec<PathBuf> = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.session.recovery_dir.clone())
+            .collect();
+        let policy = self.history_policy;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.last_maintenance_unix_secs = Some(now);
+
+        let (tx, rx) = mpsc::channel();
+        match thread::Builder::new()
+            .name("vellmark-recovery-maint".into())
+            .spawn(move || {
+                let report = maintain_recovery_root(
+                    &root,
+                    &active_dirs,
+                    policy,
+                    DEFAULT_ORPHAN_GRACE_SECS,
+                    now,
+                );
+                let _ = tx.send((now, report));
+            }) {
+            Ok(handle) => {
+                self.pending_maintenance = Some(MaintenanceJob {
+                    rx,
+                    handle: Some(handle),
+                });
+                true
+            }
+            Err(_) => {
+                self.maintain_recovery_storage();
+                false
+            }
+        }
+    }
+
+    /// Poll a background recovery maintenance task without blocking the GUI event loop.
+    pub fn poll_recovery_maintenance(&mut self) -> Option<RecoveryMaintenanceReport> {
+        let recv_result = match self.pending_maintenance.as_ref() {
+            Some(job) => job.rx.try_recv(),
+            None => return None,
+        };
+        match recv_result {
+            Ok((ts, report)) => {
+                if let Some(mut job) = self.pending_maintenance.take() {
+                    if let Some(h) = job.handle.take() {
+                        let _ = h.join();
+                    }
+                }
+                self.last_maintenance_unix_secs = Some(ts);
+                self.last_recovery_maintenance = Some(report.clone());
+                Some(report)
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if let Some(mut job) = self.pending_maintenance.take() {
+                    if let Some(h) = job.handle.take() {
+                        let _ = h.join();
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Block until any in-flight background recovery maintenance thread completes.
+    pub fn finish_pending_recovery_maintenance(&mut self) -> Option<RecoveryMaintenanceReport> {
+        let mut job = self.pending_maintenance.take()?;
+        if let Some(handle) = job.handle.take() {
+            let _ = handle.join();
+        }
+        if let Ok((ts, report)) = job.rx.try_recv() {
+            self.last_maintenance_unix_secs = Some(ts);
+            self.last_recovery_maintenance = Some(report.clone());
+            return Some(report);
+        }
+        None
+    }
+
+    pub fn maintain_recovery_storage_with_grace(
+        &mut self,
+        orphan_grace_secs: u64,
+    ) -> Option<RecoveryMaintenanceReport> {
+        self.finish_pending_recovery_maintenance();
+        let root = self.recovery_root.as_ref()?;
+        let active_dirs: Vec<PathBuf> = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.session.recovery_dir.clone())
+            .collect();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let report = maintain_recovery_root(
+            root,
+            &active_dirs,
+            self.history_policy,
+            orphan_grace_secs,
+            now,
+        );
+        self.last_maintenance_unix_secs = Some(now);
+        self.last_recovery_maintenance = Some(report.clone());
+        Some(report)
+    }
+
+    /// Explicitly delete a single historical / conflict safety backup file under `history/`.
+    pub fn delete_history_backup(&mut self, backup_path: &Path) -> io::Result<bool> {
+        let Some(hist) = self.history_root() else {
+            return Ok(false);
+        };
+        delete_historical_backup(hist, backup_path)
+    }
+
+    /// Explicitly remove all conflict-resolution safety backups for `source_path`.
+    pub fn clear_conflict_backups_for_path(&mut self, source_path: Option<&Path>) -> usize {
+        match self.history_root() {
+            Some(hist) => clear_conflict_backups_for_path(hist, source_path),
+            None => 0,
+        }
+    }
+
+    /// Explicitly remove all historical backups (conflict + close + crash archive) for `source_path`.
+    pub fn clear_history_backups_for_path(&mut self, source_path: Option<&Path>) -> usize {
+        match self.history_root() {
+            Some(hist) => clear_historical_backups_for_path(hist, source_path),
+            None => 0,
+        }
+    }
+
+    pub fn protected_snapshots_exceed_limit(&self) -> bool {
+        self.last_recovery_maintenance
+            .as_ref()
+            .is_some_and(|r| r.protected_exceeds_limit)
     }
 
     /// Synchronously flush recovery snapshots for all unsaved tabs in the workbench.
@@ -994,5 +1290,192 @@ mod tests {
         assert_eq!(wrapped.range, vellmark_core::ByteRange::empty(0));
         let m2_again = tab.find_next("^", true, opts).unwrap().unwrap();
         assert_eq!(m2_again.range, vellmark_core::ByteRange::empty(l2));
+    }
+
+    #[test]
+    fn test_recovery_dirs_do_not_accumulate_on_save_force_close_or_restore_maintenance() {
+        let root = unique_temp_dir("no-recovery-leak");
+        let rec_root = root.join("recovery");
+        let doc1 = root.join("doc1.md");
+        let doc2 = root.join("doc2.md");
+        let missing_doc = root.join("missing.md");
+        fs::write(&doc1, "initial 1").unwrap();
+        fs::write(&doc2, "initial 2").unwrap();
+        fs::write(&missing_doc, "initial missing").unwrap();
+
+        // Session 1: edit -> save clean -> tab dir must be completely removed (no empty session dir!)
+        let doc1_rec_dir;
+        {
+            let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root.clone()));
+            wb.open_document(&doc1).unwrap();
+            let t1 = wb.active_tab_mut().unwrap();
+            t1.edit(|ctx| ctx.insert_text(" edited")).unwrap();
+            t1.session.flush_current_recovery_snapshot().unwrap();
+            doc1_rec_dir = t1.session.recovery_dir.clone().unwrap();
+            assert!(doc1_rec_dir.exists());
+
+            assert_eq!(t1.save(), SaveOutcome::SavedClean);
+            assert!(
+                !doc1_rec_dir.exists(),
+                "clean save must delete slot/meta files AND remove the empty per-session directory"
+            );
+        }
+
+        // Session 2: force-close Missing tab with local edits archives historical backup and removes current snapshot dir
+        let missing_rec_dir;
+        {
+            let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root.clone()));
+            let tid = wb.open_document(&missing_doc).unwrap();
+            {
+                let t = wb.active_tab_mut().unwrap();
+                t.edit(|ctx| ctx.insert_text(" unsaved local edit"))
+                    .unwrap();
+                t.session.flush_current_recovery_snapshot().unwrap();
+                missing_rec_dir = t.session.recovery_dir.clone().unwrap();
+                fs::remove_file(&missing_doc).unwrap();
+                t.session.on_external_deleted();
+            }
+            assert!(wb.try_close_tab(tid, true).unwrap());
+            assert!(!missing_rec_dir.exists());
+            let hist = wb.list_history_backups();
+            assert_eq!(hist.len(), 1);
+            assert_eq!(
+                hist[0].reason,
+                HistoricalBackupReason::ClosedMissingUnsaved
+            );
+        }
+
+        // Session 3: crash snapshot from doc2 can be dismissed into history without leaving orphan crash dir,
+        // and maintenance leaves recovery_root clean except `history/`.
+        {
+            let mut wb_crash = AppWorkbench::new(AppConfig::default(), Some(rec_root.clone()));
+            wb_crash.open_document(&doc2).unwrap();
+            let t = wb_crash.active_tab_mut().unwrap();
+            t.edit(|ctx| ctx.insert_text(" crashed draft")).unwrap();
+            t.session.flush_current_recovery_snapshot().unwrap();
+        }
+        {
+            let mut wb3 = AppWorkbench::new(AppConfig::default(), Some(rec_root.clone()));
+            let pending = wb3.discover_pending_recoveries();
+            assert_eq!(pending.len(), 1);
+            let backup_path = wb3.dismiss_pending_recovery_to_history(&pending[0]).unwrap().unwrap();
+            assert!(backup_path.exists());
+            assert!(vellmark_core::scan_recovery_root(&rec_root).is_empty());
+            assert_eq!(wb3.list_history_backups().len(), 2);
+            wb3.maintain_recovery_storage_with_grace(0);
+        }
+
+        // Only `history/` should remain under `rec_root`!
+        let remaining_top_dirs: Vec<_> = fs::read_dir(&rec_root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(remaining_top_dirs, vec![HISTORICAL_BACKUPS_DIR_NAME.to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_clean_tabs_skip_snapshots_normal_save_creates_no_history_and_conflict_backups_clear() {
+        let root = std::env::temp_dir().join(format!(
+            "vellmark-wb-lifecycle-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rec_root = root.join("recovery");
+        let doc = root.join("doc.md");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&doc, "Original\n").unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root.clone()));
+        let untitled_id = wb.new_document();
+        let doc_id = wb.open_document(&doc).unwrap();
+        wb.flush_all_recoveries();
+        assert!(
+            vellmark_core::scan_recovery_root(&rec_root).is_empty(),
+            "Clean untitled and Clean opened tabs must never write recovery snapshots"
+        );
+        assert!(wb.try_close_tab(untitled_id, true).unwrap());
+        assert!(wb.list_history_backups().is_empty());
+
+        // Normal edit -> flush snapshot -> normal save: cleans snapshot and creates NO history backup
+        {
+            let tab = wb.active_tab_mut().unwrap();
+            assert_eq!(tab.id, doc_id);
+            tab.edit(|ctx| ctx.insert_text("Update 1\n")).unwrap();
+            tab.session.flush_current_recovery_snapshot().unwrap();
+            assert_eq!(vellmark_core::scan_recovery_root(&rec_root).len(), 1);
+            assert_eq!(tab.save(), SaveOutcome::SavedClean);
+            assert!(vellmark_core::scan_recovery_root(&rec_root).is_empty());
+        }
+        assert!(
+            wb.list_history_backups().is_empty(),
+            "normal save must never write historical backups"
+        );
+
+        // Conflict resolution creates safety backup (bounded by TTL/caps), and can be explicitly cleared
+        {
+            let tab = wb.active_tab_mut().unwrap();
+            tab.edit(|ctx| ctx.insert_text("Local\n")).unwrap();
+            let rev = tab.session.buffer.revision();
+            let rope = tab.session.buffer.snapshot_rope();
+            fs::write(&doc, "External conflict\n").unwrap();
+            assert_eq!(tab.save(), SaveOutcome::EnteredConflict);
+            assert_eq!(
+                tab.session.resolve_conflict_keep_mine(rev, rope),
+                ConflictActionOutcome::ResolvedClean
+            );
+        }
+        assert_eq!(wb.list_history_backups().len(), 1);
+        assert_eq!(
+            wb.list_history_backups()[0].reason,
+            HistoricalBackupReason::ConflictOverwrittenTheirs
+        );
+        assert_eq!(wb.clear_conflict_backups_for_path(Some(&doc)), 1);
+        assert!(wb.list_history_backups().is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_async_recovery_maintenance_runs_off_thread_and_updates_report() {
+        let root = std::env::temp_dir().join(format!(
+            "vellmark-wb-async-maint-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rec_root = root.join("recovery");
+        fs::create_dir_all(&rec_root).unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root.clone()));
+        wb.new_document();
+        {
+            let tab = wb.active_tab_mut().unwrap();
+            tab.edit(|ctx| ctx.insert_text("active unsaved content")).unwrap();
+            tab.session.flush_current_recovery_snapshot().unwrap();
+        }
+        assert!(wb.last_recovery_maintenance.is_none());
+        assert!(wb.maintain_recovery_storage_async());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let report = loop {
+            if let Some(r) = wb.poll_recovery_maintenance() {
+                break r;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for background maintenance worker"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(report.protected_snapshot_bytes > 0);
+        assert!(wb.last_recovery_maintenance.is_some());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

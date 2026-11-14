@@ -9,7 +9,7 @@ pub mod workbench;
 use std::path::{Path, PathBuf};
 
 use config::AppConfig;
-use gui::{GuiController, WELCOME_MARKDOWN, VellmarkApp};
+use gui::{GuiController, PROTECTED_SNAPSHOT_LIMIT_NOTICE, WELCOME_MARKDOWN, VellmarkApp};
 use vellmark_core::Selection;
 use workbench::AppWorkbench;
 
@@ -119,8 +119,11 @@ fn main() {
 
     let (workbench, recovered) =
         build_initial_workbench_with_recovery(&paths, Some(default_recovery_root()));
+    let protected_warn = workbench.protected_snapshots_exceed_limit();
     let mut controller = GuiController::new(workbench);
-    if recovered > 0 {
+    if protected_warn {
+        controller.set_notice(PROTECTED_SNAPSHOT_LIMIT_NOTICE);
+    } else if recovered > 0 {
         controller.set_notice(format!("Recovered {recovered} unsaved document(s)"));
     }
     if let Err(err) = VellmarkApp::run(controller) {

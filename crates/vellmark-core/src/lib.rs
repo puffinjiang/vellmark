@@ -9,6 +9,7 @@ pub mod buffer;
 pub mod editor;
 pub mod encoding;
 pub mod find_replace;
+pub mod recovery_history;
 pub mod state;
 pub mod stats;
 pub mod undo;
@@ -23,10 +24,22 @@ pub use encoding::{
     DetectedEncoding, EncodingDecision, EncodingError, FileFormatMeta, LineEnding,
     detect_and_decode, encode_for_save,
 };
+pub use recovery_history::{
+    DEFAULT_BACKUP_MAX_AGE_SECS, DEFAULT_MAX_BACKUPS_PER_FILE, DEFAULT_MAX_TOTAL_HISTORY_BYTES,
+    DEFAULT_ORPHAN_GRACE_SECS, HISTORICAL_BACKUPS_DIR_NAME, HistoricalBackupData,
+    HistoricalBackupEntry, HistoricalBackupPolicy, HistoricalBackupReason, PruneHistoryReport,
+    RecoveryMaintenanceReport, archive_pending_recovery_to_history,
+    archive_pending_recovery_to_history_at, clear_conflict_backups_for_path,
+    clear_historical_backups_for_path, delete_historical_backup, discard_pending_recovery_entry,
+    doc_history_key, doc_history_key_for_draft, list_historical_backups,
+    list_historical_backups_for_path, maintain_recovery_root, measure_protected_snapshots_bytes,
+    prune_historical_backups, prune_historical_backups_at, read_historical_backup,
+};
 pub use state::{
     AutoMergeOutcome, ConflictActionOutcome, DiskSnapshot, DocState, DocumentSession,
-    MergeConflictHunk, PendingRecoveryEntry, RecoveryMeta, RecoveryPayload, RecoverySlotReport,
-    RecoveryWorker, SaveOutcome, SessionError, scan_recovery_root,
+    MergeConflictHunk, PendingRecoveryEntry, RECOVERY_META_FILENAME, RecoveryMeta,
+    RecoveryPayload, RecoverySlotReport, RecoveryWorker, SaveOutcome, SessionError,
+    scan_recovery_root,
 };
 pub use stats::{DocumentStats, count_text_metrics};
 pub use find_replace::{

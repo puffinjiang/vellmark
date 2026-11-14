@@ -1,10 +1,10 @@
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -19,7 +19,24 @@ use crate::encoding::{
     DetectedEncoding, EncodingDecision, FileFormatMeta, LineEnding, detect_and_decode,
     encode_for_save,
 };
+use crate::recovery_history::{
+    HISTORICAL_BACKUPS_DIR_NAME, HistoricalBackupPolicy, HistoricalBackupReason,
+    WriteHistoricalBackupRequest, write_historical_backup_entry,
+};
 use crate::undo::{EditKind, UndoHistory};
+
+static NEXT_ATOMIC_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+static NEXT_UNTITLED_DRAFT_SEQ: AtomicU64 = AtomicU64::new(1);
+pub(crate) const MAX_RECOVERY_HEADER_BYTES: usize = 64 * 1024;
+
+fn next_untitled_draft_id() -> String {
+    let seq = NEXT_UNTITLED_DRAFT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("p{}-t{nanos}-d{seq}", std::process::id())
+}
 
 /// Document state machine per PRD 4.5.1 B.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +142,7 @@ pub struct RecoverySlotReport {
 #[derive(Debug, Clone)]
 pub struct RecoveryPayload {
     pub source_path: Option<PathBuf>,
+    pub draft_id: Option<String>,
     pub revision: u64,
     pub state: DocState,
     pub content_rope: Rope,
@@ -322,7 +340,7 @@ fn handle_non_schedule_cmd(
         WorkerCommand::Clear(ack) => {
             *pending = None;
             *deadline = None;
-            remove_recovery_dir_files(recovery_dir);
+            remove_recovery_dir_and_empty_dir(recovery_dir);
             let _ = ack.send(());
             false
         }
@@ -372,6 +390,7 @@ fn write_payload_to_next_slot(
     atomic_write_file(&target, encoded.as_bytes())?;
     let meta = RecoveryMeta {
         source_path: payload.source_path.clone(),
+        draft_id: payload.draft_id.clone(),
         updated_unix_secs: current_unix_secs(),
     };
     let meta_json = serialize_recovery_meta_json(&meta);
@@ -396,6 +415,7 @@ pub enum SessionError {
 /// state transitions, and non-blocking throttled dual-slot atomic crash recovery (PRD 4.5.1).
 pub struct DocumentSession {
     pub path: Option<PathBuf>,
+    pub draft_id: Option<String>,
     pub buffer: TextBuffer,
     pub undo: UndoHistory,
     pub format: FileFormatMeta,
@@ -403,10 +423,16 @@ pub struct DocumentSession {
     pub base: DiskSnapshot,
     pub theirs: Option<DiskSnapshot>,
     pub recovery_dir: Option<PathBuf>,
+    pub history_root: Option<PathBuf>,
+    pub history_policy: HistoricalBackupPolicy,
     recovery_worker: Option<RecoveryWorker>,
     pub recovery_degraded: bool,
     /// Revision whose recovery snapshot has been scheduled/dirty since last flush.
     pending_recovery_revision: Option<u64>,
+}
+
+fn default_history_root_for(recovery_dir: Option<&Path>) -> Option<PathBuf> {
+    recovery_dir.map(|d| d.join(HISTORICAL_BACKUPS_DIR_NAME))
 }
 
 impl DocumentSession {
@@ -417,12 +443,36 @@ impl DocumentSession {
         path: impl AsRef<Path>,
         recovery_dir: Option<PathBuf>,
     ) -> Result<Self, SessionError> {
-        Self::open_file_with_throttle(path, recovery_dir, Duration::from_millis(200))
+        let history_root = default_history_root_for(recovery_dir.as_deref());
+        Self::open_file_with_recovery(
+            path,
+            recovery_dir,
+            history_root,
+            HistoricalBackupPolicy::default(),
+            Duration::from_millis(200),
+        )
     }
 
     pub fn open_file_with_throttle(
         path: impl AsRef<Path>,
         recovery_dir: Option<PathBuf>,
+        throttle_window: Duration,
+    ) -> Result<Self, SessionError> {
+        let history_root = default_history_root_for(recovery_dir.as_deref());
+        Self::open_file_with_recovery(
+            path,
+            recovery_dir,
+            history_root,
+            HistoricalBackupPolicy::default(),
+            throttle_window,
+        )
+    }
+
+    pub fn open_file_with_recovery(
+        path: impl AsRef<Path>,
+        recovery_dir: Option<PathBuf>,
+        history_root: Option<PathBuf>,
+        history_policy: HistoricalBackupPolicy,
         throttle_window: Duration,
     ) -> Result<Self, SessionError> {
         let path = normalize_session_path(path.as_ref());
@@ -433,9 +483,12 @@ impl DocumentSession {
         let recovery_worker = recovery_dir
             .clone()
             .map(|dir| RecoveryWorker::spawn(dir, throttle_window));
+        let history_root =
+            history_root.or_else(|| default_history_root_for(recovery_dir.as_deref()));
 
         Ok(Self {
             path: Some(path),
+            draft_id: None,
             buffer,
             undo: UndoHistory::new(),
             format,
@@ -443,6 +496,8 @@ impl DocumentSession {
             base,
             theirs: None,
             recovery_dir,
+            history_root,
+            history_policy,
             recovery_worker,
             recovery_degraded: false,
             pending_recovery_revision: None,
@@ -454,6 +509,21 @@ impl DocumentSession {
     pub fn from_pending_recovery(
         entry: &PendingRecoveryEntry,
         new_recovery_dir: Option<PathBuf>,
+    ) -> Self {
+        let history_root = default_history_root_for(new_recovery_dir.as_deref());
+        Self::from_pending_recovery_with_recovery(
+            entry,
+            new_recovery_dir,
+            history_root,
+            HistoricalBackupPolicy::default(),
+        )
+    }
+
+    pub fn from_pending_recovery_with_recovery(
+        entry: &PendingRecoveryEntry,
+        new_recovery_dir: Option<PathBuf>,
+        new_history_root: Option<PathBuf>,
+        history_policy: HistoricalBackupPolicy,
     ) -> Self {
         let buffer = TextBuffer::from_str(&entry.report.content);
         let base = DiskSnapshot::from_str(&entry.report.base_content);
@@ -514,9 +584,23 @@ impl DocumentSession {
         let recovery_worker = new_recovery_dir
             .clone()
             .map(|dir| RecoveryWorker::spawn(dir, Duration::from_millis(200)));
+        let history_root =
+            new_history_root.or_else(|| default_history_root_for(new_recovery_dir.as_deref()));
+
+        let draft_id = if path.is_none() {
+            Some(
+                entry
+                    .draft_id
+                    .clone()
+                    .unwrap_or_else(|| entry.recovery_dir.to_string_lossy().into_owned()),
+            )
+        } else {
+            None
+        };
 
         let mut session = Self {
             path,
+            draft_id,
             buffer,
             undo: UndoHistory::new(),
             format,
@@ -524,32 +608,55 @@ impl DocumentSession {
             base,
             theirs,
             recovery_dir: new_recovery_dir.clone(),
+            history_root,
+            history_policy,
             recovery_worker,
             recovery_degraded: false,
             pending_recovery_revision: None,
         };
 
-        let migrated = if state == DocState::Clean {
-            true
-        } else if new_recovery_dir.is_some() {
-            session.flush_current_recovery_snapshot().is_ok()
-        } else {
-            false
-        };
-        if migrated && new_recovery_dir.as_ref() != Some(&entry.recovery_dir) {
-            remove_recovery_dir_files(&entry.recovery_dir);
-            let _ = fs::remove_dir(&entry.recovery_dir);
+        if state == DocState::Clean {
+            session.clear_current_recovery_snapshot();
+            if new_recovery_dir.as_ref() != Some(&entry.recovery_dir) {
+                remove_recovery_dir_and_empty_dir(&entry.recovery_dir);
+            }
+        } else if new_recovery_dir.is_some()
+            && session.flush_current_recovery_snapshot().is_ok()
+            && new_recovery_dir.as_ref() != Some(&entry.recovery_dir)
+        {
+            remove_recovery_dir_and_empty_dir(&entry.recovery_dir);
         }
         session
     }
 
     /// Create a brand-new untitled UTF-8 LF document session (PRD 4.5 F-01).
     pub fn new_untitled(recovery_dir: Option<PathBuf>) -> Self {
-        Self::new_untitled_with_throttle(recovery_dir, Duration::from_millis(200))
+        let history_root = default_history_root_for(recovery_dir.as_deref());
+        Self::new_untitled_with_recovery(
+            recovery_dir,
+            history_root,
+            HistoricalBackupPolicy::default(),
+            Duration::from_millis(200),
+        )
     }
 
     pub fn new_untitled_with_throttle(
         recovery_dir: Option<PathBuf>,
+        throttle_window: Duration,
+    ) -> Self {
+        let history_root = default_history_root_for(recovery_dir.as_deref());
+        Self::new_untitled_with_recovery(
+            recovery_dir,
+            history_root,
+            HistoricalBackupPolicy::default(),
+            throttle_window,
+        )
+    }
+
+    pub fn new_untitled_with_recovery(
+        recovery_dir: Option<PathBuf>,
+        history_root: Option<PathBuf>,
+        history_policy: HistoricalBackupPolicy,
         throttle_window: Duration,
     ) -> Self {
         let format = FileFormatMeta {
@@ -562,9 +669,12 @@ impl DocumentSession {
         let recovery_worker = recovery_dir
             .clone()
             .map(|dir| RecoveryWorker::spawn(dir, throttle_window));
+        let history_root =
+            history_root.or_else(|| default_history_root_for(recovery_dir.as_deref()));
 
         Self {
             path: None,
+            draft_id: Some(next_untitled_draft_id()),
             buffer,
             undo: UndoHistory::new(),
             format,
@@ -572,6 +682,8 @@ impl DocumentSession {
             base,
             theirs: None,
             recovery_dir,
+            history_root,
+            history_policy,
             recovery_worker,
             recovery_degraded: false,
             pending_recovery_revision: None,
@@ -587,6 +699,20 @@ impl DocumentSession {
         self.buffer.crc32() == self.base.crc32
             && self.buffer.len_bytes() == self.base.len_bytes
             && self.buffer.rope().bytes().eq(self.base.rope.bytes())
+    }
+
+    /// True when the document has unsaved changes or an unpersisted state (`Dirty`, `Conflict`, or `Missing`).
+    /// `Clean` documents must not persist crash-recovery snapshots.
+    pub fn has_unsaved_content(&self) -> bool {
+        self.state != DocState::Clean
+    }
+
+    fn clear_recovery_snapshot_if_present(&mut self) {
+        if self.pending_recovery_revision.is_some()
+            || self.recovery_dir.as_ref().is_some_and(|d| d.exists())
+        {
+            self.clear_current_recovery_snapshot();
+        }
     }
 
     fn sync_state_after_buffer_mutation(&mut self) {
@@ -605,7 +731,7 @@ impl DocumentSession {
             }
             DocState::Missing { .. } => {
                 self.state = DocState::Missing {
-                    has_local_edits: true,
+                    has_local_edits: !self.buffers_match_base(),
                 };
                 self.schedule_recovery_snapshot();
             }
@@ -756,6 +882,7 @@ impl DocumentSession {
         }
 
         self.path = Some(normalize_session_path(&target));
+        self.draft_id = None;
         self.base = DiskSnapshot::from_rope(written_rope);
         self.theirs = None;
 
@@ -783,14 +910,7 @@ impl DocumentSession {
     ) {
         self.undo
             .apply_edit(&mut self.buffer, range, replacement, sel_before, sel_after, kind);
-        self.state = match self.state {
-            DocState::Clean | DocState::Dirty => DocState::Dirty,
-            DocState::Conflict => DocState::Conflict,
-            DocState::Missing { .. } => DocState::Missing {
-                has_local_edits: true,
-            },
-        };
-        self.schedule_recovery_snapshot();
+        self.sync_state_after_buffer_mutation();
     }
 
     /// Handle external file modification event per PRD 4.5.1 C.
@@ -832,10 +952,14 @@ impl DocumentSession {
                     } else {
                         DocState::Clean
                     };
+                    if self.state == DocState::Clean {
+                        self.clear_current_recovery_snapshot();
+                    }
                 } else if !has_local_edits {
                     self.apply_external_reload_to_buffer(new_disk_text, selection_pair);
                     self.base = disk_snap;
                     self.state = DocState::Clean;
+                    self.clear_current_recovery_snapshot();
                 } else {
                     self.theirs = Some(disk_snap);
                     self.state = DocState::Conflict;
@@ -991,7 +1115,7 @@ impl DocumentSession {
 
         // 2. Precondition: save `theirs` exact bytes to historical recovery backup BEFORE overwriting (PRD 4.5.1 D)
         if let Err(e) = self.write_historical_backup_bytes(
-            "conflict-overwritten-theirs",
+            HistoricalBackupReason::ConflictOverwrittenTheirs,
             &expected_theirs.to_backup_bytes(),
         ) {
             self.recovery_degraded = true;
@@ -1094,7 +1218,9 @@ impl DocumentSession {
 
         // 1. Precondition: save my version to historical backup first
         let my_content = self.buffer.to_string();
-        if let Err(e) = self.write_historical_backup("conflict-discarded-mine", &my_content) {
+        if let Err(e) =
+            self.write_historical_backup(HistoricalBackupReason::ConflictDiscardedMine, &my_content)
+        {
             self.recovery_degraded = true;
             return (
                 ConflictActionOutcome::AbortedStillConflict(format!(
@@ -1179,6 +1305,11 @@ impl DocumentSession {
     fn build_recovery_payload(&self) -> RecoveryPayload {
         RecoveryPayload {
             source_path: self.path.as_ref().map(|p| normalize_session_path(p)),
+            draft_id: if self.path.is_none() {
+                self.draft_id.clone()
+            } else {
+                None
+            },
             revision: self.buffer.revision(),
             state: self.state,
             content_rope: self.buffer.snapshot_rope(),
@@ -1187,8 +1318,13 @@ impl DocumentSession {
         }
     }
 
-    /// Non-blocking: schedules a throttled recovery snapshot on the background worker thread.
+    /// Non-blocking: schedules a throttled recovery snapshot on the background worker thread
+    /// only when the document has unsaved content (`state != Clean`).
     pub fn schedule_recovery_snapshot(&mut self) {
+        if !self.has_unsaved_content() {
+            self.clear_recovery_snapshot_if_present();
+            return;
+        }
         if let Some(worker) = &self.recovery_worker {
             let payload = self.build_recovery_payload();
             self.pending_recovery_revision = Some(payload.revision);
@@ -1198,8 +1334,12 @@ impl DocumentSession {
     }
 
     /// Synchronously flush the current recovery snapshot to disk via the background worker
-    /// (used in tests, explicit flushes, or state boundaries).
+    /// only when the document has unsaved content (`state != Clean`).
     pub fn flush_current_recovery_snapshot(&mut self) -> Result<(), SessionError> {
+        if !self.has_unsaved_content() {
+            self.clear_recovery_snapshot_if_present();
+            return Ok(());
+        }
         if let Some(worker) = &self.recovery_worker {
             let payload = self.build_recovery_payload();
             let res = worker.flush_sync(payload);
@@ -1217,32 +1357,86 @@ impl DocumentSession {
     /// falling back to the older slot if the newer slot was corrupted mid-write (PRD 4.5.1 F).
     pub fn read_latest_intact_snapshot(dir: impl AsRef<Path>) -> Option<RecoverySlotReport> {
         let dir = dir.as_ref();
-        let mut valid_slots = Vec::new();
+        let mut candidates = Vec::with_capacity(2);
         for slot in [0u8, 1u8] {
             let p = dir.join(format!("current.slot{slot}.rec"));
+            if let SlotInspect::HeaderValid(summary) = inspect_slot_report_header(&p) {
+                candidates.push((summary.sequence.unwrap_or(0), summary.revision, p));
+            }
+        }
+        candidates.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+        for (_, _, p) in candidates {
             if let Ok(raw) = fs::read_to_string(&p) {
                 if let Some(rep) = deserialize_and_verify_slot_report(&raw) {
-                    valid_slots.push(rep);
+                    return Some(rep);
                 }
             }
         }
-        valid_slots
-            .into_iter()
-            .max_by_key(|r| (r.sequence, r.revision))
+        None
     }
 
-    fn write_historical_backup(&self, reason: &str, content: &str) -> std::io::Result<()> {
+    fn write_historical_backup(
+        &self,
+        reason: HistoricalBackupReason,
+        content: &str,
+    ) -> std::io::Result<PathBuf> {
         self.write_historical_backup_bytes(reason, content.as_bytes())
     }
 
-    fn write_historical_backup_bytes(&self, reason: &str, bytes: &[u8]) -> std::io::Result<()> {
-        let Some(dir) = &self.recovery_dir else {
-            return Ok(());
+    fn write_historical_backup_bytes(
+        &self,
+        reason: HistoricalBackupReason,
+        bytes: &[u8],
+    ) -> std::io::Result<PathBuf> {
+        let Some(history_root) = self
+            .history_root
+            .clone()
+            .or_else(|| default_history_root_for(self.recovery_dir.as_deref()))
+        else {
+            return Ok(PathBuf::new());
         };
-        fs::create_dir_all(dir)?;
-        let rev = self.buffer.revision();
-        let backup_path = dir.join(format!("history-{reason}-rev{rev}.bak"));
-        atomic_write_file(&backup_path, bytes)
+        let base_str = self.base.content_string();
+        write_historical_backup_entry(WriteHistoricalBackupRequest {
+            history_root: &history_root,
+            source_path: self.path.as_deref(),
+            draft_id: if self.path.is_none() {
+                self.draft_id.as_deref()
+            } else {
+                None
+            },
+            doc_state: self.state,
+            reason,
+            base_content: Some(&base_str),
+            payload: bytes,
+            policy: self.history_policy,
+            now_unix_secs: current_unix_secs(),
+        })
+    }
+
+    /// Archive unsaved local edits into a bounded historical backup on close, then remove the
+    /// protected current crash-recovery snapshot so it will not reopen as an unrecovered crash.
+    pub fn archive_unsaved_on_close(&mut self) -> Result<Option<PathBuf>, SessionError> {
+        let reason = match self.state {
+            DocState::Clean
+            | DocState::Missing {
+                has_local_edits: false,
+            } => {
+                self.clear_current_recovery_snapshot();
+                return Ok(None);
+            }
+            DocState::Missing {
+                has_local_edits: true,
+            } => HistoricalBackupReason::ClosedMissingUnsaved,
+            DocState::Dirty | DocState::Conflict => HistoricalBackupReason::ClosedUnsaved,
+        };
+        let content = self.buffer.to_string();
+        let written = self.write_historical_backup(reason, &content)?;
+        self.clear_current_recovery_snapshot();
+        if written.as_os_str().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(written))
+        }
     }
 
     /// Explicitly discard any persisted crash recovery snapshot for this session
@@ -1251,17 +1445,17 @@ impl DocumentSession {
         self.clear_current_recovery_snapshot();
     }
 
-    fn clear_current_recovery_snapshot(&mut self) {
+    pub fn clear_current_recovery_snapshot(&mut self) {
         self.pending_recovery_revision = None;
         if let Some(worker) = &self.recovery_worker {
             worker.clear_sync();
         } else if let Some(dir) = &self.recovery_dir {
-            remove_recovery_dir_files(dir);
+            remove_recovery_dir_and_empty_dir(dir);
         }
     }
 }
 
-fn canonicalize_lossy(p: &Path) -> PathBuf {
+pub(crate) fn canonicalize_lossy(p: &Path) -> PathBuf {
     if let Ok(c) = fs::canonicalize(p) {
         return c;
     }
@@ -1295,20 +1489,73 @@ fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
     a == b || canonicalize_lossy(a) == canonicalize_lossy(b)
 }
 
-/// Write to temporary sibling file, `fsync`, and atomically rename (PRD 4.5.1 G).
+/// Write to a unique temporary sibling file, `fsync`, and atomically rename (PRD 4.5.1 G).
+/// Cleans up the temp file on any error so failed writes do not accumulate debris.
 pub fn atomic_write_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     let file_name = target
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("vellmark");
-    let tmp_path = parent.join(format!(".{file_name}.vellmark.tmp"));
-    {
+    let seq = NEXT_ATOMIC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(
+        ".{file_name}.{}.{seq}.vellmark.tmp",
+        std::process::id()
+    ));
+    let write_res = (|| -> std::io::Result<()> {
         let mut f = File::create(&tmp_path)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
     }
-    fs::rename(&tmp_path, target)
+    if let Err(e) = fs::rename(&tmp_path, target) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    #[cfg(unix)]
+    {
+        let _ = File::open(parent).and_then(|d| d.sync_all());
+    }
+    Ok(())
+}
+
+pub(crate) fn compute_bytes_crc32(bytes: &[u8]) -> u32 {
+    let mut h = crc32fast::Hasher::new();
+    h.update(bytes);
+    h.finalize()
+}
+
+pub(crate) fn doc_state_to_tag(state: DocState) -> &'static str {
+    match state {
+        DocState::Clean => "Clean",
+        DocState::Dirty => "Dirty",
+        DocState::Conflict => "Conflict",
+        DocState::Missing {
+            has_local_edits: true,
+        } => "MissingDirty",
+        DocState::Missing {
+            has_local_edits: false,
+        } => "MissingClean",
+    }
+}
+
+pub(crate) fn doc_state_from_tag(tag: &str) -> Option<DocState> {
+    match tag {
+        "Clean" => Some(DocState::Clean),
+        "Dirty" => Some(DocState::Dirty),
+        "Conflict" => Some(DocState::Conflict),
+        "MissingDirty" => Some(DocState::Missing {
+            has_local_edits: true,
+        }),
+        "MissingClean" => Some(DocState::Missing {
+            has_local_edits: false,
+        }),
+        _ => None,
+    }
 }
 
 fn compute_snapshot_crc(
@@ -1336,17 +1583,7 @@ fn compute_snapshot_crc(
 }
 
 fn serialize_slot_report(r: &RecoverySlotReport) -> String {
-    let state_tag = match r.state {
-        DocState::Clean => "Clean",
-        DocState::Dirty => "Dirty",
-        DocState::Conflict => "Conflict",
-        DocState::Missing {
-            has_local_edits: true,
-        } => "MissingDirty",
-        DocState::Missing {
-            has_local_edits: false,
-        } => "MissingClean",
-    };
+    let state_tag = doc_state_to_tag(r.state);
     let theirs_len = r.theirs_content.as_ref().map(|s| s.len()).unwrap_or(0);
     let has_theirs = u8::from(r.theirs_content.is_some());
     let mut out = format!(
@@ -1369,9 +1606,124 @@ fn serialize_slot_report(r: &RecoverySlotReport) -> String {
     out
 }
 
-fn deserialize_and_verify_slot_report(raw: &str) -> Option<RecoverySlotReport> {
-    let (header, body) = raw.split_once("\n---\n")?;
-    let mut lines = header.lines();
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SlotHeaderSummary {
+    pub slot: u8,
+    pub sequence: Option<u64>,
+    pub revision: u64,
+    pub state: DocState,
+    pub crc32: u32,
+    pub data_offset: usize,
+    pub content_len: usize,
+    pub base_len: usize,
+    pub has_theirs: bool,
+    pub theirs_len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SlotInspect {
+    Missing,
+    Corrupt,
+    Unreadable,
+    HeaderValid(SlotHeaderSummary),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotVerify {
+    Valid,
+    Corrupt,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BoundedFileHeader {
+    Missing,
+    Corrupt,
+    IoError(std::io::ErrorKind),
+    Valid {
+        file_size_bytes: u64,
+        data_offset: usize,
+        body_header: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeaderReadStatus {
+    Found(Vec<u8>),
+    MalformedOrTooLarge,
+    IoError(std::io::ErrorKind),
+}
+
+/// Read at most `max_bytes` from `file` until a standalone `---\n` header terminator line,
+/// distinguishing OS I/O errors from malformed/oversized headers lacking `\n---\n`.
+fn read_bounded_header_until_sep(file: File, max_bytes: usize) -> HeaderReadStatus {
+    let mut reader = BufReader::new(file);
+    let mut header_buf = Vec::with_capacity(512);
+    let mut line = Vec::new();
+
+    while header_buf.len() < max_bytes {
+        line.clear();
+        let remaining = max_bytes - header_buf.len();
+        let n = match reader
+            .by_ref()
+            .take(remaining as u64)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(n) => n,
+            Err(e) => return HeaderReadStatus::IoError(e.kind()),
+        };
+        if n == 0 {
+            break;
+        }
+        header_buf.extend_from_slice(&line);
+        if line == b"---\n" {
+            return HeaderReadStatus::Found(header_buf);
+        }
+    }
+    HeaderReadStatus::MalformedOrTooLarge
+}
+
+/// Inspect a regular non-symlink file and read its bounded `---\n`-terminated header
+/// while distinguishing missing files, OS read/permission errors, and confirmed format corruption.
+pub(crate) fn read_file_bounded_header(path: &Path, max_bytes: usize) -> BoundedFileHeader {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BoundedFileHeader::Missing,
+        Err(e) => return BoundedFileHeader::IoError(e.kind()),
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return BoundedFileHeader::Corrupt;
+    }
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BoundedFileHeader::Missing,
+        Err(e) => return BoundedFileHeader::IoError(e.kind()),
+    };
+    let header_buf = match read_bounded_header_until_sep(file, max_bytes) {
+        HeaderReadStatus::Found(buf) => buf,
+        HeaderReadStatus::MalformedOrTooLarge => return BoundedFileHeader::Corrupt,
+        HeaderReadStatus::IoError(kind) => return BoundedFileHeader::IoError(kind),
+    };
+    let data_offset = header_buf.len();
+    let Ok(header_str) = String::from_utf8(header_buf) else {
+        return BoundedFileHeader::Corrupt;
+    };
+    let Some(body_header) = header_str.strip_suffix("---\n") else {
+        return BoundedFileHeader::Corrupt;
+    };
+    BoundedFileHeader::Valid {
+        file_size_bytes: meta.len(),
+        data_offset,
+        body_header: body_header.to_string(),
+    }
+}
+
+fn parse_slot_header_fields(
+    body_header: &str,
+    data_offset: usize,
+    file_size_bytes: u64,
+) -> Option<SlotHeaderSummary> {
+    let mut lines = body_header.lines();
     if lines.next()? != "VELLMARK_REC_V1" {
         return None;
     }
@@ -1391,20 +1743,7 @@ fn deserialize_and_verify_slot_report(raw: &str) -> Option<RecoverySlotReport> {
             "slot" => slot = v.parse().ok()?,
             "seq" => seq = Some(v.parse().ok()?),
             "rev" => revision = v.parse().ok()?,
-            "state" => {
-                state = match v {
-                    "Clean" => DocState::Clean,
-                    "Dirty" => DocState::Dirty,
-                    "Conflict" => DocState::Conflict,
-                    "MissingDirty" => DocState::Missing {
-                        has_local_edits: true,
-                    },
-                    "MissingClean" => DocState::Missing {
-                        has_local_edits: false,
-                    },
-                    _ => return None,
-                };
-            }
+            "state" => state = doc_state_from_tag(v)?,
             "crc32" => crc32 = v.parse().ok()?,
             "content_len" => content_len = v.parse().ok()?,
             "base_len" => base_len = v.parse().ok()?,
@@ -1414,40 +1753,210 @@ fn deserialize_and_verify_slot_report(raw: &str) -> Option<RecoverySlotReport> {
         }
     }
 
-    if body.len() != content_len + base_len + theirs_len {
+    let payload_total = (content_len as u64)
+        .checked_add(base_len as u64)?
+        .checked_add(theirs_len as u64)?;
+    let expected_total = (data_offset as u64).checked_add(payload_total)?;
+    if expected_total != file_size_bytes {
         return None;
     }
-    let content = body.get(0..content_len)?.to_string();
-    let base_content = body.get(content_len..content_len + base_len)?.to_string();
-    let theirs_content = if has_theirs {
+    if !has_theirs && theirs_len != 0 {
+        return None;
+    }
+
+    Some(SlotHeaderSummary {
+        slot,
+        sequence: seq,
+        revision,
+        state,
+        crc32,
+        data_offset,
+        content_len,
+        base_len,
+        has_theirs,
+        theirs_len,
+    })
+}
+
+pub(crate) fn inspect_slot_report_header(path: &Path) -> SlotInspect {
+    match read_file_bounded_header(path, MAX_RECOVERY_HEADER_BYTES) {
+        BoundedFileHeader::Missing => SlotInspect::Missing,
+        BoundedFileHeader::Corrupt => SlotInspect::Corrupt,
+        BoundedFileHeader::IoError(_) => SlotInspect::Unreadable,
+        BoundedFileHeader::Valid {
+            file_size_bytes,
+            data_offset,
+            body_header,
+        } => match parse_slot_header_fields(&body_header, data_offset, file_size_bytes) {
+            Some(summary) => SlotInspect::HeaderValid(summary),
+            None => SlotInspect::Corrupt,
+        },
+    }
+}
+
+enum StreamReadOutcome {
+    Ok,
+    Truncated,
+    IoError,
+}
+
+fn stream_exact_into_hasher(
+    file: &mut File,
+    mut remaining: usize,
+    hasher: &mut crc32fast::Hasher,
+    buf: &mut [u8],
+) -> StreamReadOutcome {
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len());
+        if let Err(e) = file.read_exact(&mut buf[..to_read]) {
+            return if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                StreamReadOutcome::Truncated
+            } else {
+                StreamReadOutcome::IoError
+            };
+        }
+        hasher.update(&buf[..to_read]);
+        remaining -= to_read;
+    }
+    StreamReadOutcome::Ok
+}
+
+/// Stream-verify slot payload CRC32 using a fixed 64 KB buffer (zero multi-MB heap allocation),
+/// matching both legacy V1 snapshots (without `seq=`) and current snapshots (with `seq=`).
+pub(crate) fn verify_slot_report_crc_streaming(
+    path: &Path,
+    summary: &SlotHeaderSummary,
+) -> SlotVerify {
+    let Ok(mut file) = File::open(path) else {
+        return SlotVerify::Unreadable;
+    };
+    if file.seek(SeekFrom::Start(summary.data_offset as u64)).is_err() {
+        return SlotVerify::Unreadable;
+    }
+    let mut h = crc32fast::Hasher::new();
+    h.update(&summary.revision.to_le_bytes());
+    if let Some(seq) = summary.sequence {
+        h.update(b"seq=");
+        h.update(&seq.to_le_bytes());
+        h.update(b"\0");
+    }
+
+    let mut buf = [0u8; 64 * 1024];
+    match stream_exact_into_hasher(&mut file, summary.content_len, &mut h, &mut buf) {
+        StreamReadOutcome::Ok => {}
+        StreamReadOutcome::Truncated => return SlotVerify::Corrupt,
+        StreamReadOutcome::IoError => return SlotVerify::Unreadable,
+    }
+    h.update(b"\0");
+    match stream_exact_into_hasher(&mut file, summary.base_len, &mut h, &mut buf) {
+        StreamReadOutcome::Ok => {}
+        StreamReadOutcome::Truncated => return SlotVerify::Corrupt,
+        StreamReadOutcome::IoError => return SlotVerify::Unreadable,
+    }
+    if summary.has_theirs {
+        h.update(b"\0");
+        match stream_exact_into_hasher(&mut file, summary.theirs_len, &mut h, &mut buf) {
+            StreamReadOutcome::Ok => {}
+            StreamReadOutcome::Truncated => return SlotVerify::Corrupt,
+            StreamReadOutcome::IoError => return SlotVerify::Unreadable,
+        }
+    }
+    if h.finalize() == summary.crc32 {
+        SlotVerify::Valid
+    } else {
+        SlotVerify::Corrupt
+    }
+}
+
+/// Stream-compare `content` vs `base` bytes inside a slot file with a 64 KB stack buffer.
+pub(crate) fn slot_content_equals_base_streaming(
+    path: &Path,
+    summary: &SlotHeaderSummary,
+) -> Option<bool> {
+    if summary.content_len != summary.base_len {
+        return Some(false);
+    }
+    if summary.content_len == 0 {
+        return Some(true);
+    }
+    let mut f_content = File::open(path).ok()?;
+    let mut f_base = File::open(path).ok()?;
+    f_content
+        .seek(SeekFrom::Start(summary.data_offset as u64))
+        .ok()?;
+    f_base
+        .seek(SeekFrom::Start(
+            (summary.data_offset + summary.content_len) as u64,
+        ))
+        .ok()?;
+
+    let mut buf_a = [0u8; 64 * 1024];
+    let mut buf_b = [0u8; 64 * 1024];
+    let mut remaining = summary.content_len;
+    while remaining > 0 {
+        let to_read = remaining.min(buf_a.len());
+        f_content.read_exact(&mut buf_a[..to_read]).ok()?;
+        f_base.read_exact(&mut buf_b[..to_read]).ok()?;
+        if buf_a[..to_read] != buf_b[..to_read] {
+            return Some(false);
+        }
+        remaining -= to_read;
+    }
+    Some(true)
+}
+
+fn deserialize_and_verify_slot_report(raw: &str) -> Option<RecoverySlotReport> {
+    let sep = if raw.starts_with("---\n") {
+        return None;
+    } else if let Some(idx) = raw.find("\n---\n") {
+        idx + 1
+    } else {
+        return None;
+    };
+    if sep + 4 > MAX_RECOVERY_HEADER_BYTES {
+        return None;
+    }
+    let body_header = &raw[..sep];
+    let data_offset = sep + 4;
+    let body = &raw[data_offset..];
+    let summary = parse_slot_header_fields(body_header, data_offset, raw.len() as u64)?;
+
+    let content = body.get(0..summary.content_len)?.to_string();
+    let base_content = body
+        .get(summary.content_len..summary.content_len + summary.base_len)?
+        .to_string();
+    let theirs_content = if summary.has_theirs {
         Some(
-            body.get(content_len + base_len..content_len + base_len + theirs_len)?
-                .to_string(),
+            body.get(
+                summary.content_len + summary.base_len
+                    ..summary.content_len + summary.base_len + summary.theirs_len,
+            )?
+            .to_string(),
         )
     } else {
         None
     };
 
     let expected_crc = compute_snapshot_crc(
-        revision,
-        seq,
+        summary.revision,
+        summary.sequence,
         &content,
         &base_content,
         theirs_content.as_deref(),
     );
-    if expected_crc != crc32 {
+    if expected_crc != summary.crc32 {
         return None;
     }
 
     Some(RecoverySlotReport {
-        slot,
-        sequence: seq.unwrap_or(0),
-        revision,
-        state,
+        slot: summary.slot,
+        sequence: summary.sequence.unwrap_or(0),
+        revision: summary.revision,
+        state: summary.state,
         content,
         base_content,
         theirs_content,
-        crc32,
+        crc32: summary.crc32,
     })
 }
 
@@ -1458,6 +1967,7 @@ pub const RECOVERY_META_FILENAME: &str = "recovery-meta.json";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryMeta {
     pub source_path: Option<PathBuf>,
+    pub draft_id: Option<String>,
     pub updated_unix_secs: u64,
 }
 
@@ -1466,25 +1976,42 @@ pub struct RecoveryMeta {
 pub struct PendingRecoveryEntry {
     pub recovery_dir: PathBuf,
     pub source_path: Option<PathBuf>,
+    pub draft_id: Option<String>,
     pub updated_unix_secs: Option<u64>,
     pub report: RecoverySlotReport,
 }
 
-fn current_unix_secs() -> u64 {
+pub(crate) fn current_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-fn remove_recovery_dir_files(dir: &Path) {
+pub(crate) fn remove_recovery_dir_and_empty_dir(dir: &Path) {
     for slot in [0u8, 1u8] {
         let _ = fs::remove_file(dir.join(format!("current.slot{slot}.rec")));
     }
     let _ = fs::remove_file(dir.join(RECOVERY_META_FILENAME));
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_rec_tmp = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| {
+                    n.ends_with(".vellmark.tmp")
+                        && (n.starts_with(".current.slot") || n.starts_with(".recovery-meta.json"))
+                });
+            if is_rec_tmp {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    let _ = fs::remove_dir(dir);
 }
 
-fn json_escape_str(s: &str) -> String {
+pub(crate) fn json_escape_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {
@@ -1509,13 +2036,17 @@ fn serialize_recovery_meta_json(meta: &RecoveryMeta) -> String {
         Some(p) => json_escape_str(&p.to_string_lossy()),
         None => "null".to_string(),
     };
+    let draft_json = match &meta.draft_id {
+        Some(id) => format!(",\"draft_id\":{}", json_escape_str(id)),
+        None => String::new(),
+    };
     format!(
-        "{{\"source_path\":{path_json},\"updated_unix_secs\":{}}}\n",
+        "{{\"source_path\":{path_json}{draft_json},\"updated_unix_secs\":{}}}\n",
         meta.updated_unix_secs
     )
 }
 
-fn parse_json_string_at(raw: &str, start: usize) -> Option<(String, usize)> {
+pub(crate) fn parse_json_string_at(raw: &str, start: usize) -> Option<(String, usize)> {
     let bytes = raw.as_bytes();
     if bytes.get(start) != Some(&b'"') {
         return None;
@@ -1567,6 +2098,7 @@ fn deserialize_recovery_meta_json(raw: &str) -> Option<RecoveryMeta> {
     let mut i = 1usize;
     let end = bytes.len() - 1;
     let mut source_path: Option<PathBuf> = None;
+    let mut draft_id: Option<String> = None;
     let mut updated_unix_secs: Option<u64> = None;
 
     while i < end {
@@ -1589,14 +2121,18 @@ fn deserialize_recovery_meta_json(raw: &str) -> Option<RecoveryMeta> {
             i += 1;
         }
         if trimmed[i..end].starts_with("null") {
-            if key == "source_path" {
-                source_path = None;
+            match key.as_str() {
+                "source_path" => source_path = None,
+                "draft_id" => draft_id = None,
+                _ => {}
             }
             i += 4;
         } else if bytes.get(i) == Some(&b'"') {
             let (val, after_val) = parse_json_string_at(trimmed, i)?;
-            if key == "source_path" {
-                source_path = Some(PathBuf::from(val));
+            match key.as_str() {
+                "source_path" => source_path = Some(PathBuf::from(val)),
+                "draft_id" => draft_id = Some(val),
+                _ => {}
             }
             i = after_val;
         } else {
@@ -1616,6 +2152,7 @@ fn deserialize_recovery_meta_json(raw: &str) -> Option<RecoveryMeta> {
 
     Some(RecoveryMeta {
         source_path,
+        draft_id,
         updated_unix_secs: updated_unix_secs.unwrap_or(0),
     })
 }
@@ -1642,13 +2179,14 @@ fn scan_recovery_dir_recursive(dir: &Path, depth: usize, out: &mut Vec<PendingRe
         let meta = fs::read_to_string(dir.join(RECOVERY_META_FILENAME))
             .ok()
             .and_then(|s| deserialize_recovery_meta_json(&s));
-        let (source_path, updated_unix_secs) = match meta {
-            Some(m) => (m.source_path, Some(m.updated_unix_secs)),
-            None => (None, None),
+        let (source_path, draft_id, updated_unix_secs) = match meta {
+            Some(m) => (m.source_path, m.draft_id, Some(m.updated_unix_secs)),
+            None => (None, None, None),
         };
         out.push(PendingRecoveryEntry {
             recovery_dir: dir.to_path_buf(),
             source_path,
+            draft_id,
             updated_unix_secs,
             report,
         });
@@ -1657,7 +2195,13 @@ fn scan_recovery_dir_recursive(dir: &Path, depth: usize, out: &mut Vec<PendingRe
         return;
     };
     for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+        if entry
+            .file_type()
+            .is_ok_and(|t| !t.is_symlink() && t.is_dir())
+        {
+            if entry.file_name().to_str() == Some(HISTORICAL_BACKUPS_DIR_NAME) {
+                continue;
+            }
             scan_recovery_dir_recursive(&entry.path(), depth + 1, out);
         }
     }
@@ -1750,8 +2294,10 @@ impl DocumentSession {
         let ours_text = self.buffer.to_string();
         match three_way_merge_lines(&base_text, &ours_text, &disk_text) {
             Ok(merged) => {
-                if let Err(e) = self.write_historical_backup("conflict-pre-merge-mine", &ours_text)
-                {
+                if let Err(e) = self.write_historical_backup(
+                    HistoricalBackupReason::ConflictPreMergeMine,
+                    &ours_text,
+                ) {
                     return AutoMergeOutcome::AbortedStillConflict(format!(
                         "failed to write historical backup: {e}"
                     ));
@@ -2452,10 +2998,18 @@ mod tests {
             );
         }
 
-        // Wait for the 60ms throttle timer to fire on the background worker
-        thread::sleep(Duration::from_millis(120));
-
-        let snap = DocumentSession::read_latest_intact_snapshot(&rec_dir).unwrap();
+        // Wait for the 60ms throttle timer + atomic fsyncs to settle on the background worker
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let snap = loop {
+            if let Some(s) = DocumentSession::read_latest_intact_snapshot(&rec_dir) {
+                break s;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "throttled recovery snapshot was not flushed within 2s"
+            );
+            thread::sleep(Duration::from_millis(15));
+        };
         assert_eq!(snap.revision, 20);
         assert_eq!(snap.content, "x".repeat(20));
 
@@ -2539,10 +3093,17 @@ mod tests {
             "Base\nMy local version\n"
         );
 
-        // Historical backup must match `undecodable_theirs` byte-for-byte
-        let backup_path = rec_dir.join(format!("history-conflict-overwritten-theirs-rev{rev}.bak"));
-        let backed_up_bytes = fs::read(&backup_path).unwrap();
-        assert_eq!(backed_up_bytes, undecodable_theirs);
+        // Historical backup must live under `history/`, carry metadata + CRC32, and match `undecodable_theirs` byte-for-byte
+        let hist_root = rec_dir.join(HISTORICAL_BACKUPS_DIR_NAME);
+        let backups = crate::recovery_history::list_historical_backups(&hist_root);
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            backups[0].reason,
+            HistoricalBackupReason::ConflictOverwrittenTheirs
+        );
+        let loaded = crate::recovery_history::read_historical_backup(&backups[0].path).unwrap();
+        assert_eq!(loaded.payload, undecodable_theirs);
+        assert!(scan_recovery_root(&rec_dir).is_empty());
 
         drop(session);
         let _ = fs::remove_dir_all(&dir);
@@ -3079,6 +3640,171 @@ mod tests {
         );
         drop(recovered_ok);
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_missing_clean_recovery_and_bounded_per_file_history_via_session() {
+        let root = unique_temp_dir("missing-clean-and-cap");
+        let file_path = root.join("bounded.md");
+        let rec_root = root.join("recovery");
+        let session_dir = rec_root.join("tab-1");
+        let hist_root = rec_root.join(HISTORICAL_BACKUPS_DIR_NAME);
+        fs::write(&file_path, "Base v0\n").unwrap();
+
+        let policy = HistoricalBackupPolicy {
+            max_backups_per_file: 3,
+            max_age_secs: 14 * 24 * 60 * 60,
+            max_total_bytes: 500 * 1024 * 1024,
+        };
+        let mut session = DocumentSession::open_file_with_recovery(
+            &file_path,
+            Some(session_dir.clone()),
+            Some(hist_root.clone()),
+            policy,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+
+        // Missing without local edits returning to Clean must clean snapshot files AND empty dir
+        session.on_external_deleted();
+        session.flush_current_recovery_snapshot().unwrap();
+        assert!(session_dir.exists());
+        session.on_external_modified("Base v0\n");
+        assert_eq!(session.state, DocState::Clean);
+        assert!(
+            !session_dir.exists(),
+            "returning from Missing(no local edits) to Clean must remove snapshot and empty dir"
+        );
+
+        // Make local edits and resolve 5 repeated conflicts via keep_mine
+        session.edit(
+            ByteRange::new(8, 8),
+            "Mine\n",
+            Selection::caret(8),
+            Selection::caret(13),
+            EditKind::Typing,
+        );
+        for n in 1..=5u32 {
+            let rev = session.buffer.revision();
+            let rope = session.buffer.snapshot_rope();
+            let ext = format!("External v{n}\n");
+            fs::write(&file_path, &ext).unwrap();
+            assert_eq!(session.save(), SaveOutcome::EnteredConflict);
+            assert_eq!(
+                session.resolve_conflict_keep_mine(rev, rope),
+                ConflictActionOutcome::ResolvedClean
+            );
+            if n < 5 {
+                // Re-dirty to trigger another save-time external conflict check
+                let end = session.buffer.len_bytes();
+                session.edit(
+                    ByteRange::new(end, end),
+                    " ",
+                    Selection::caret(end),
+                    Selection::caret(end + 1),
+                    EditKind::Typing,
+                );
+            }
+        }
+        // Notice first iteration kept mine at `rev`, later iterations had incremented rev, let's also write 2 backups
+        // at identical state/revision by toggling undo/disk in `use_theirs` / keep_mine or checking total <= cap (3):
+        let backups =
+            crate::recovery_history::list_historical_backups_for_path(&hist_root, Some(&file_path));
+        assert_eq!(
+            backups.len(),
+            3,
+            "per-file retention cap must bound history to newest 3 backups"
+        );
+        let newest_data = crate::recovery_history::read_historical_backup(&backups[0].path).unwrap();
+        assert_eq!(newest_data.payload, b"External v5\n");
+        assert!(
+            !session_dir.exists(),
+            "clean session must not leave empty session recovery dir behind"
+        );
+
+        drop(session);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_clean_session_never_writes_snapshot_and_normal_save_creates_no_history() {
+        let root = unique_temp_dir("clean-no-snapshot-normal-save-no-history");
+        fs::create_dir_all(&root).unwrap();
+        let file_path = root.join("note.md");
+        let save_as_path = root.join("note-copy.md");
+        let rec_root = root.join("recovery");
+        let rec_dir = rec_root.join("tab-1");
+        let hist_root = rec_root.join(HISTORICAL_BACKUPS_DIR_NAME);
+        fs::write(&file_path, "Hello\n").unwrap();
+
+        let mut session = DocumentSession::open_file_with_recovery(
+            &file_path,
+            Some(rec_dir.clone()),
+            Some(hist_root.clone()),
+            HistoricalBackupPolicy::default(),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        // Calling flush / schedule on a Clean session must NEVER write recovery files
+        assert!(!session.has_unsaved_content());
+        session.schedule_recovery_snapshot();
+        session.flush_current_recovery_snapshot().unwrap();
+        assert!(!rec_dir.exists(), "Clean doc must not write recovery snapshot");
+
+        // Local edit makes it Dirty and DOES write recovery snapshot, then reverting to `base` clears it
+        session.edit(
+            ByteRange::new(6, 6),
+            "Temp",
+            Selection::caret(6),
+            Selection::caret(10),
+            EditKind::Typing,
+        );
+        assert!(session.has_unsaved_content());
+        session.flush_current_recovery_snapshot().unwrap();
+        assert!(DocumentSession::read_latest_intact_snapshot(&rec_dir).is_some());
+
+        session.edit(
+            ByteRange::new(6, 10),
+            "",
+            Selection::caret(10),
+            Selection::caret(6),
+            EditKind::Typing,
+        );
+        assert_eq!(session.state, DocState::Clean);
+        assert!(
+            !rec_dir.exists(),
+            "reverting edit back to base must return Clean and clear recovery dir"
+        );
+
+        // Normal Save & SaveAs must clear current snapshot and create ZERO historical backups
+        session.edit(
+            ByteRange::new(6, 6),
+            "Saved cleanly\n",
+            Selection::caret(6),
+            Selection::caret(20),
+            EditKind::Typing,
+        );
+        session.flush_current_recovery_snapshot().unwrap();
+        assert_eq!(session.save(), SaveOutcome::SavedClean);
+        assert!(!rec_dir.exists());
+
+        session.edit(
+            ByteRange::new(20, 20),
+            "Copied\n",
+            Selection::caret(20),
+            Selection::caret(27),
+            EditKind::Typing,
+        );
+        assert_eq!(session.save_as(&save_as_path), SaveOutcome::SavedClean);
+        assert!(!rec_dir.exists());
+        assert!(
+            crate::recovery_history::list_historical_backups(&hist_root).is_empty(),
+            "normal save / save_as must never create historical backups"
+        );
+
+        drop(session);
         let _ = fs::remove_dir_all(&root);
     }
 }
