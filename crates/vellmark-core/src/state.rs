@@ -1,13 +1,14 @@
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{
-    Arc,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
@@ -124,6 +125,329 @@ pub enum ConflictActionOutcome {
     ResolvedDirty,
     AbortedStillConflict(String),
     TransitionedToMissing,
+}
+
+/// Result of synchronizing an open `DocumentSession` against the file on disk (PRD 4.5.1 C & G).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalSyncResult {
+    NoChange,
+    ReloadedClean,
+    EnteredConflict,
+    ConflictTheirsUpdated,
+    BecameMissing,
+    ReappearedClean { reloaded: bool },
+    ReappearedDirty,
+    Renamed { old_path: PathBuf, new_path: PathBuf },
+    ReadError(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskFileStat {
+    len_bytes: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    dev_ino: (u64, u64),
+}
+
+impl DiskFileStat {
+    fn from_metadata(meta: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len_bytes: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            dev_ino: (meta.dev(), meta.ino()),
+        }
+    }
+
+    fn capture(path: &Path) -> Option<Self> {
+        fs::metadata(path).ok().map(|m| Self::from_metadata(&m))
+    }
+}
+
+#[cfg(unix)]
+fn find_renamed_sibling_by_inode(old_path: &Path, expected_dev_ino: (u64, u64)) -> Option<PathBuf> {
+    let parent = old_path.parent()?;
+    let entries = fs::read_dir(parent).ok()?;
+    for entry in entries.take(512).flatten() {
+        let cand = entry.path();
+        if cand == old_path {
+            continue;
+        }
+        if cand
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| n.ends_with(".vellmark.tmp"))
+        {
+            continue;
+        }
+        if let Ok(meta) = fs::metadata(&cand) {
+            if meta.is_file() && DiskFileStat::from_metadata(&meta).dev_ino == expected_dev_ino {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone)]
+struct SaveRequest {
+    path: PathBuf,
+    written_revision: u64,
+    written_rope: Rope,
+    expected_base: DiskSnapshot,
+    known_applied_write_id: u64,
+    format: FileFormatMeta,
+    current_state: DocState,
+}
+
+#[derive(Debug, Clone)]
+enum DiskWriteResult {
+    Written {
+        written_base: DiskSnapshot,
+        disk_stat: Option<DiskFileStat>,
+    },
+    EnteredConflict {
+        theirs: DiskSnapshot,
+        disk_stat: Option<DiskFileStat>,
+    },
+    MissingTarget,
+    WriteFailed {
+        error: String,
+    },
+}
+
+struct FinishedWrite {
+    write_id: u64,
+    path: PathBuf,
+    written_revision: u64,
+    result: DiskWriteResult,
+}
+
+#[derive(Default)]
+struct SaveQueueState {
+    in_flight: bool,
+    pending: Option<SaveRequest>,
+    completed: VecDeque<FinishedWrite>,
+    next_write_id: u64,
+    unreconciled_base: Option<(u64, PathBuf, DiskSnapshot)>,
+    shutdown: bool,
+}
+
+/// Single serialized background write queue per `DocumentSession`, coalescing rapid auto-save requests
+/// and chaining updated `expected_base` snapshots across unapplied writes (PRD 4.5.1 A).
+struct SaveWorker {
+    queue: Arc<(Mutex<SaveQueueState>, Condvar)>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl SaveWorker {
+    fn spawn() -> Self {
+        let queue = Arc::new((Mutex::new(SaveQueueState::default()), Condvar::new()));
+        let queue_worker = Arc::clone(&queue);
+        let handle = thread::spawn(move || loop {
+            let (req, write_id) = {
+                let (lock, cv) = &*queue_worker;
+                let mut guard = match lock.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                loop {
+                    if guard.shutdown {
+                        return;
+                    }
+                    if let Some(mut req) = guard.pending.take() {
+                        guard.in_flight = true;
+                        guard.next_write_id += 1;
+                        let write_id = guard.next_write_id;
+                        // Retain written_base across idle gaps until DocumentSession applies `write_id`
+                        // so subsequent auto-saves before UI reconciliation never compare against stale base.
+                        if let Some((wid, ref prev_path, ref prev_base)) = guard.unreconciled_base {
+                            if *prev_path == req.path && wid > req.known_applied_write_id {
+                                req.expected_base = prev_base.clone();
+                            }
+                        }
+                        break (req, write_id);
+                    }
+                    guard.in_flight = false;
+                    cv.notify_all();
+                    guard = match cv.wait(guard) {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                }
+            };
+
+            let res = perform_versioned_disk_write(&req);
+            let (lock, cv) = &*queue_worker;
+            let mut guard = match lock.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            match &res {
+                DiskWriteResult::Written { written_base, .. } => {
+                    guard.unreconciled_base =
+                        Some((write_id, req.path.clone(), written_base.clone()));
+                }
+                _ => {
+                    guard.unreconciled_base = None;
+                    guard.pending = None;
+                }
+            }
+            guard.completed.push_back(FinishedWrite {
+                write_id,
+                path: req.path,
+                written_revision: req.written_revision,
+                result: res,
+            });
+            if guard.pending.is_none() || guard.shutdown {
+                guard.in_flight = false;
+            }
+            cv.notify_all();
+        });
+        Self {
+            queue,
+            handle: Some(handle),
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        let (lock, _) = &*self.queue;
+        let Ok(guard) = lock.lock() else {
+            return false;
+        };
+        guard.in_flight || guard.pending.is_some()
+    }
+
+    fn schedule(&self, req: SaveRequest) {
+        let (lock, cv) = &*self.queue;
+        if let Ok(mut guard) = lock.lock() {
+            guard.pending = Some(req);
+            cv.notify_all();
+        }
+    }
+
+    fn drain_completions(&self) -> Vec<FinishedWrite> {
+        let (lock, _) = &*self.queue;
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        guard.completed.drain(..).collect()
+    }
+
+    fn wait_and_drain(&self) -> Vec<FinishedWrite> {
+        let (lock, cv) = &*self.queue;
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        while !guard.shutdown && (guard.in_flight || guard.pending.is_some()) {
+            guard = match cv.wait(guard) {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+        }
+        guard.completed.drain(..).collect()
+    }
+}
+
+impl Drop for SaveWorker {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.queue;
+        if let Ok(mut guard) = lock.lock() {
+            guard.shutdown = true;
+            guard.pending = None;
+            cv.notify_all();
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn perform_versioned_disk_write(req: &SaveRequest) -> DiskWriteResult {
+    if req.current_state == DocState::Conflict {
+        return match fs::read(&req.path) {
+            Ok(disk_bytes) => {
+                let disk_stat = DiskFileStat::capture(&req.path);
+                let snap = match detect_and_decode(&disk_bytes) {
+                    Ok((disk_text, _)) => DiskSnapshot::from_str(&disk_text),
+                    Err(_) => DiskSnapshot::from_undecodable_bytes(&disk_bytes),
+                };
+                DiskWriteResult::EnteredConflict {
+                    theirs: snap,
+                    disk_stat,
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => DiskWriteResult::MissingTarget,
+            Err(e) => DiskWriteResult::WriteFailed {
+                error: format!("failed to verify disk file: {e}"),
+            },
+        };
+    }
+
+    match fs::read(&req.path) {
+        Ok(disk_bytes) => match detect_and_decode(&disk_bytes) {
+            Ok((disk_text, _)) => {
+                let disk_snap = DiskSnapshot::from_str(&disk_text);
+                if disk_snap.crc32 != req.expected_base.crc32
+                    || disk_snap.len_bytes != req.expected_base.len_bytes
+                {
+                    return DiskWriteResult::EnteredConflict {
+                        theirs: disk_snap,
+                        disk_stat: DiskFileStat::capture(&req.path),
+                    };
+                }
+            }
+            Err(_) => {
+                return DiskWriteResult::EnteredConflict {
+                    theirs: DiskSnapshot::from_undecodable_bytes(&disk_bytes),
+                    disk_stat: DiskFileStat::capture(&req.path),
+                };
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if !matches!(req.current_state, DocState::Missing { .. }) {
+                return DiskWriteResult::MissingTarget;
+            }
+            if let Some(parent) = req.path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    if let Err(dir_err) = fs::create_dir_all(parent) {
+                        return DiskWriteResult::WriteFailed {
+                            error: dir_err.to_string(),
+                        };
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            return DiskWriteResult::WriteFailed {
+                error: format!("failed to verify disk file: {e}"),
+            };
+        }
+    }
+
+    let written_text = req.written_rope.to_string();
+    let bytes = match encode_for_save(&written_text, &req.format) {
+        Ok(b) => b,
+        Err(e) => {
+            return DiskWriteResult::WriteFailed {
+                error: e.to_string(),
+            }
+        }
+    };
+    if let Err(e) = atomic_write_file(&req.path, &bytes) {
+        return DiskWriteResult::WriteFailed {
+            error: e.to_string(),
+        };
+    }
+
+    DiskWriteResult::Written {
+        written_base: DiskSnapshot::from_rope(req.written_rope.clone()),
+        disk_stat: DiskFileStat::capture(&req.path),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -426,6 +750,9 @@ pub struct DocumentSession {
     pub history_root: Option<PathBuf>,
     pub history_policy: HistoricalBackupPolicy,
     recovery_worker: Option<RecoveryWorker>,
+    save_worker: Option<SaveWorker>,
+    disk_stat: Option<DiskFileStat>,
+    last_applied_async_write_id: u64,
     pub recovery_degraded: bool,
     /// Revision whose recovery snapshot has been scheduled/dirty since last flush.
     pending_recovery_revision: Option<u64>,
@@ -477,6 +804,7 @@ impl DocumentSession {
     ) -> Result<Self, SessionError> {
         let path = normalize_session_path(path.as_ref());
         let raw = fs::read(&path)?;
+        let disk_stat = DiskFileStat::capture(&path);
         let (text, format) = detect_and_decode(&raw)?;
         let buffer = TextBuffer::from_str(&text);
         let base = DiskSnapshot::from_rope(buffer.snapshot_rope());
@@ -499,6 +827,9 @@ impl DocumentSession {
             history_root,
             history_policy,
             recovery_worker,
+            save_worker: None,
+            disk_stat,
+            last_applied_async_write_id: 0,
             recovery_degraded: false,
             pending_recovery_revision: None,
         })
@@ -534,8 +865,9 @@ impl DocumentSession {
             .map(DiskSnapshot::from_str);
         let mut format = FileFormatMeta {
             decision: EncodingDecision::Editable(DetectedEncoding::Utf8),
-            dominant_line_ending: crate::encoding::LineEnding::detect_dominant(
+            dominant_line_ending: crate::encoding::LineEnding::detect_dominant_or(
                 &entry.report.content,
+                crate::encoding::LineEnding::detect_dominant(&entry.report.base_content),
             ),
             has_trailing_newline: entry.report.content.ends_with('\n')
                 || entry.report.content.ends_with('\r'),
@@ -555,22 +887,27 @@ impl DocumentSession {
             .as_ref()
             .map(|p| normalize_session_path(p));
 
+        let mut disk_stat = None;
         if let Some(p) = &path {
             match fs::read(p) {
-                Ok(raw) => match detect_and_decode(&raw) {
-                    Ok((disk_text, disk_fmt)) => {
-                        format = disk_fmt;
-                        let disk_snap = DiskSnapshot::from_str(&disk_text);
-                        if disk_snap.crc32 != base.crc32 || disk_snap.len_bytes != base.len_bytes {
-                            theirs = Some(disk_snap);
+                Ok(raw) => {
+                    disk_stat = DiskFileStat::capture(p);
+                    match detect_and_decode(&raw) {
+                        Ok((disk_text, disk_fmt)) => {
+                            format = disk_fmt;
+                            let disk_snap = DiskSnapshot::from_str(&disk_text);
+                            if disk_snap.crc32 != base.crc32 || disk_snap.len_bytes != base.len_bytes
+                            {
+                                theirs = Some(disk_snap);
+                                state = DocState::Conflict;
+                            }
+                        }
+                        Err(_) => {
+                            theirs = Some(DiskSnapshot::from_undecodable_bytes(&raw));
                             state = DocState::Conflict;
                         }
                     }
-                    Err(_) => {
-                        theirs = Some(DiskSnapshot::from_undecodable_bytes(&raw));
-                        state = DocState::Conflict;
-                    }
-                },
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     state = DocState::Missing {
                         has_local_edits: buffer.crc32() != base.crc32
@@ -611,6 +948,9 @@ impl DocumentSession {
             history_root,
             history_policy,
             recovery_worker,
+            save_worker: None,
+            disk_stat,
+            last_applied_async_write_id: 0,
             recovery_degraded: false,
             pending_recovery_revision: None,
         };
@@ -685,6 +1025,9 @@ impl DocumentSession {
             history_root,
             history_policy,
             recovery_worker,
+            save_worker: None,
+            disk_stat: None,
+            last_applied_async_write_id: 0,
             recovery_degraded: false,
             pending_recovery_revision: None,
         }
@@ -752,7 +1095,11 @@ impl DocumentSession {
         }
         let rev_before = self.buffer.revision();
         {
-            let mut ctx = view.context(&mut self.buffer, &mut self.undo);
+            let mut ctx = view.context_with_line_ending(
+                &mut self.buffer,
+                &mut self.undo,
+                self.format.dominant_line_ending,
+            );
             f(&mut ctx);
         }
         let changed = self.buffer.revision() != rev_before;
@@ -831,6 +1178,7 @@ impl DocumentSession {
         if self.is_read_only() {
             return SaveOutcome::WriteFailed("read-only document cannot be saved".to_string());
         }
+        let _ = self.drain_pending_async_save();
         let target = new_path.as_ref().to_path_buf();
 
         if let Some(current_path) = &self.path {
@@ -838,6 +1186,7 @@ impl DocumentSession {
                 if self.state == DocState::Conflict {
                     match fs::read(&target) {
                         Ok(disk_bytes) => {
+                            self.disk_stat = DiskFileStat::capture(&target);
                             let snap = match detect_and_decode(&disk_bytes) {
                                 Ok((disk_text, _)) => DiskSnapshot::from_str(&disk_text),
                                 Err(_) => DiskSnapshot::from_undecodable_bytes(&disk_bytes),
@@ -846,11 +1195,17 @@ impl DocumentSession {
                             let _ = self.flush_current_recovery_snapshot();
                             return SaveOutcome::EnteredConflict;
                         }
-                        Err(_) => {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            self.disk_stat = None;
                             self.on_external_deleted();
                             return SaveOutcome::WriteFailed(
                                 "target file disappeared before write".to_string(),
                             );
+                        }
+                        Err(e) => {
+                            return SaveOutcome::WriteFailed(format!(
+                                "failed to verify disk file: {e}"
+                            ));
                         }
                     }
                 }
@@ -881,7 +1236,9 @@ impl DocumentSession {
             return SaveOutcome::WriteFailed(e.to_string());
         }
 
-        self.path = Some(normalize_session_path(&target));
+        let normalized = normalize_session_path(&target);
+        self.disk_stat = DiskFileStat::capture(&normalized);
+        self.path = Some(normalized);
         self.draft_id = None;
         self.base = DiskSnapshot::from_rope(written_rope);
         self.theirs = None;
@@ -1002,6 +1359,267 @@ impl DocumentSession {
         self.schedule_recovery_snapshot();
     }
 
+    fn apply_finished_write(
+        &mut self,
+        finished: FinishedWrite,
+        flush_recovery_sync: bool,
+    ) -> SaveOutcome {
+        self.last_applied_async_write_id = self.last_applied_async_write_id.max(finished.write_id);
+        if self.path.as_ref() != Some(&finished.path) {
+            return SaveOutcome::WriteFailed("document path changed while saving".to_string());
+        }
+        match finished.result {
+            DiskWriteResult::Written {
+                written_base,
+                disk_stat,
+            } => {
+                self.base = written_base;
+                self.disk_stat = disk_stat;
+                self.theirs = None;
+                if self.buffer.revision() == finished.written_revision
+                    && self.buffer.crc32() == self.base.crc32
+                {
+                    self.state = DocState::Clean;
+                    self.clear_current_recovery_snapshot();
+                    SaveOutcome::SavedClean
+                } else {
+                    self.state = DocState::Dirty;
+                    if flush_recovery_sync {
+                        let _ = self.flush_current_recovery_snapshot();
+                    } else {
+                        self.schedule_recovery_snapshot();
+                    }
+                    SaveOutcome::SavedButStillDirty {
+                        written_revision: finished.written_revision,
+                    }
+                }
+            }
+            DiskWriteResult::EnteredConflict { theirs, disk_stat } => {
+                self.disk_stat = disk_stat;
+                self.theirs = Some(theirs);
+                self.state = DocState::Conflict;
+                if flush_recovery_sync {
+                    let _ = self.flush_current_recovery_snapshot();
+                } else {
+                    self.schedule_recovery_snapshot();
+                }
+                SaveOutcome::EnteredConflict
+            }
+            DiskWriteResult::MissingTarget => {
+                self.disk_stat = None;
+                self.on_external_deleted();
+                SaveOutcome::WriteFailed("target file disappeared before write".to_string())
+            }
+            DiskWriteResult::WriteFailed { error } => SaveOutcome::WriteFailed(error),
+        }
+    }
+
+    /// True if a background serialized save is currently executing or queued.
+    pub fn is_async_save_in_flight(&self) -> bool {
+        self.save_worker.as_ref().is_some_and(SaveWorker::is_busy)
+    }
+
+    /// Queue a non-blocking version-bound disk write on this session's serialized write worker (PRD 4.5.1 A).
+    /// Returns `false` if the document has no path, is read-only, or is not currently `Dirty`.
+    pub fn schedule_async_save(&mut self) -> bool {
+        // Reconcile any finished async writes first so base/state/conflict status are current.
+        let _ = self.poll_async_save();
+        if self.is_read_only() || self.state != DocState::Dirty {
+            return false;
+        }
+        let Some(path) = self.path.clone() else {
+            return false;
+        };
+        let req = SaveRequest {
+            path,
+            written_revision: self.buffer.revision(),
+            written_rope: self.buffer.snapshot_rope(),
+            expected_base: self.base.clone(),
+            known_applied_write_id: self.last_applied_async_write_id,
+            format: self.format,
+            current_state: self.state,
+        };
+        let worker = self.save_worker.get_or_insert_with(SaveWorker::spawn);
+        worker.schedule(req);
+        true
+    }
+
+    /// Reconcile any completed background serialized save outcomes against current buffer/disk state.
+    pub fn poll_async_save(&mut self) -> Option<SaveOutcome> {
+        let finished = self
+            .save_worker
+            .as_ref()
+            .map(SaveWorker::drain_completions)
+            .unwrap_or_default();
+        let mut last = None;
+        for item in finished {
+            last = Some(self.apply_finished_write(item, false));
+        }
+        last
+    }
+
+    /// Wait for any in-flight or queued serialized save to finish and reconcile its outcome.
+    pub fn drain_pending_async_save(&mut self) -> Option<SaveOutcome> {
+        let finished = self
+            .save_worker
+            .as_ref()
+            .map(SaveWorker::wait_and_drain)
+            .unwrap_or_default();
+        let mut last = None;
+        for item in finished {
+            last = Some(self.apply_finished_write(item, false));
+        }
+        last
+    }
+
+    /// Poll/synchronize this open session against external changes on disk (PRD 4.5.1 C & G).
+    /// Set `bypass_stat_cache` to `true` on window focus gain or explicit refresh.
+    pub fn sync_from_disk_with_view(
+        &mut self,
+        view: &mut EditorViewState,
+        bypass_stat_cache: bool,
+    ) -> ExternalSyncResult {
+        let _ = self.drain_pending_async_save();
+        let Some(path) = self.path.clone() else {
+            return ExternalSyncResult::NoChange;
+        };
+
+        let meta = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                #[cfg(unix)]
+                if !matches!(self.state, DocState::Missing { .. }) {
+                    if let Some(prev_stat) = self.disk_stat {
+                        if let Some(new_cand) =
+                            find_renamed_sibling_by_inode(&path, prev_stat.dev_ino)
+                        {
+                            let new_path = normalize_session_path(&new_cand);
+                            self.path = Some(new_path.clone());
+                            // Leave `disk_stat` unset until `new_path` contents are actually read & reconciled,
+                            // so simultaneous rename + external content modifications are never masked by cache.
+                            self.disk_stat = None;
+                            if self.has_unsaved_content() {
+                                self.schedule_recovery_snapshot();
+                            }
+                            return ExternalSyncResult::Renamed {
+                                old_path: path,
+                                new_path,
+                            };
+                        }
+                    }
+                }
+                self.disk_stat = None;
+                if matches!(self.state, DocState::Missing { .. }) {
+                    return ExternalSyncResult::NoChange;
+                }
+                self.on_external_deleted();
+                return ExternalSyncResult::BecameMissing;
+            }
+            Err(e) => {
+                return ExternalSyncResult::ReadError(e.to_string());
+            }
+        };
+
+        let stat = DiskFileStat::from_metadata(&meta);
+        if !bypass_stat_cache && self.disk_stat == Some(stat) {
+            return ExternalSyncResult::NoChange;
+        }
+
+        let disk_bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.disk_stat = None;
+                if matches!(self.state, DocState::Missing { .. }) {
+                    return ExternalSyncResult::NoChange;
+                }
+                self.on_external_deleted();
+                return ExternalSyncResult::BecameMissing;
+            }
+            Err(e) => return ExternalSyncResult::ReadError(e.to_string()),
+        };
+        self.disk_stat = DiskFileStat::capture(&path).or(Some(stat));
+
+        match detect_and_decode(&disk_bytes) {
+            Ok((disk_text, new_format)) => {
+                let disk_snap = DiskSnapshot::from_str(&disk_text);
+                let differs_from_base = disk_snap.crc32 != self.base.crc32
+                    || disk_snap.len_bytes != self.base.len_bytes
+                    || new_format.decision != self.format.decision;
+
+                match self.state {
+                    DocState::Clean => {
+                        if !differs_from_base {
+                            self.format = new_format;
+                            return ExternalSyncResult::NoChange;
+                        }
+                        self.on_external_modified_with_view(&disk_text, view);
+                        self.format = new_format;
+                        ExternalSyncResult::ReloadedClean
+                    }
+                    DocState::Dirty => {
+                        if differs_from_base {
+                            self.theirs = Some(disk_snap);
+                            self.state = DocState::Conflict;
+                            self.schedule_recovery_snapshot();
+                            ExternalSyncResult::EnteredConflict
+                        } else {
+                            ExternalSyncResult::NoChange
+                        }
+                    }
+                    DocState::Conflict => {
+                        let unchanged = self.theirs.as_ref().is_some_and(|t| {
+                            t.raw_bytes.is_none()
+                                && t.crc32 == disk_snap.crc32
+                                && t.len_bytes == disk_snap.len_bytes
+                        });
+                        if unchanged {
+                            ExternalSyncResult::NoChange
+                        } else {
+                            self.theirs = Some(disk_snap);
+                            self.schedule_recovery_snapshot();
+                            ExternalSyncResult::ConflictTheirsUpdated
+                        }
+                    }
+                    DocState::Missing { has_local_edits } => {
+                        self.on_external_modified_with_view(&disk_text, view);
+                        if !has_local_edits {
+                            self.format = new_format;
+                        }
+                        match self.state {
+                            DocState::Clean => ExternalSyncResult::ReappearedClean {
+                                reloaded: differs_from_base,
+                            },
+                            DocState::Dirty => ExternalSyncResult::ReappearedDirty,
+                            DocState::Conflict => ExternalSyncResult::EnteredConflict,
+                            DocState::Missing { .. } => ExternalSyncResult::NoChange,
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                let snap = DiskSnapshot::from_undecodable_bytes(&disk_bytes);
+                let unchanged = self.state == DocState::Conflict
+                    && self.theirs.as_ref().is_some_and(|t| {
+                        t.raw_bytes.is_some()
+                            && t.crc32 == snap.crc32
+                            && t.len_bytes == snap.len_bytes
+                    });
+                if unchanged {
+                    return ExternalSyncResult::NoChange;
+                }
+                let already_conflict = self.state == DocState::Conflict;
+                self.theirs = Some(snap);
+                self.state = DocState::Conflict;
+                self.schedule_recovery_snapshot();
+                if already_conflict {
+                    ExternalSyncResult::ConflictTheirsUpdated
+                } else {
+                    ExternalSyncResult::EnteredConflict
+                }
+            }
+        }
+    }
+
     /// Execute a version-bound save: snapshots `written_revision` and `written_rope`,
     /// verifies disk == `base` before atomic write, and re-evaluates state upon completion
     /// against `self.buffer.revision()` so concurrent edits during write are never marked Clean (PRD 4.5.1 A & C).
@@ -1010,63 +1628,32 @@ impl DocumentSession {
         written_revision: u64,
         written_rope: Rope,
     ) -> SaveOutcome {
+        if self.is_read_only() {
+            return SaveOutcome::WriteFailed("read-only document cannot be saved".to_string());
+        }
+        let _ = self.drain_pending_async_save();
         let Some(path) = self.path.clone() else {
             return SaveOutcome::WriteFailed("no file path bound".to_string());
         };
-
-        // Pre-write verification against `base` (PRD 4.5.1 C).
-        // Issue 1 fix: If disk file was modified into undecodable/binary bytes (e.g. containing NUL),
-        // `detect_and_decode` returns `Err` — we MUST treat this as a conflict and refuse to overwrite!
-        if let Ok(disk_bytes) = fs::read(&path) {
-            match detect_and_decode(&disk_bytes) {
-                Ok((disk_text, _)) => {
-                    let disk_snap = DiskSnapshot::from_str(&disk_text);
-                    if disk_snap.crc32 != self.base.crc32
-                        || disk_snap.len_bytes != self.base.len_bytes
-                    {
-                        self.theirs = Some(disk_snap);
-                        self.state = DocState::Conflict;
-                        let _ = self.flush_current_recovery_snapshot();
-                        return SaveOutcome::EnteredConflict;
-                    }
-                }
-                Err(_) => {
-                    self.theirs = Some(DiskSnapshot::from_undecodable_bytes(&disk_bytes));
-                    self.state = DocState::Conflict;
-                    let _ = self.flush_current_recovery_snapshot();
-                    return SaveOutcome::EnteredConflict;
-                }
-            }
-        } else {
-            self.on_external_deleted();
-            return SaveOutcome::WriteFailed("target file disappeared before write".to_string());
-        }
-
-        let written_text = written_rope.to_string();
-        let bytes = match encode_for_save(&written_text, &self.format) {
-            Ok(b) => b,
-            Err(e) => return SaveOutcome::WriteFailed(e.to_string()),
+        let req = SaveRequest {
+            path: path.clone(),
+            written_revision,
+            written_rope,
+            expected_base: self.base.clone(),
+            known_applied_write_id: self.last_applied_async_write_id,
+            format: self.format,
+            current_state: self.state,
         };
-
-        if let Err(e) = atomic_write_file(&path, &bytes) {
-            return SaveOutcome::WriteFailed(e.to_string());
-        }
-
-        // Update `base` to the snapshot that was actually written (PRD 4.5.1 A)
-        self.base = DiskSnapshot::from_rope(written_rope);
-
-        // Compare current buffer revision with the written snapshot revision
-        if self.buffer.revision() == written_revision
-            && self.buffer.crc32() == self.base.crc32
-        {
-            self.state = DocState::Clean;
-            self.clear_current_recovery_snapshot();
-            SaveOutcome::SavedClean
-        } else {
-            self.state = DocState::Dirty;
-            let _ = self.flush_current_recovery_snapshot();
-            SaveOutcome::SavedButStillDirty { written_revision }
-        }
+        let result = perform_versioned_disk_write(&req);
+        self.apply_finished_write(
+            FinishedWrite {
+                write_id: 0,
+                path,
+                written_revision,
+                result,
+            },
+            true,
+        )
     }
 
     /// Convenience synchronous save of current buffer state.
@@ -1084,6 +1671,7 @@ impl DocumentSession {
         captured_revision: u64,
         captured_rope: Rope,
     ) -> ConflictActionOutcome {
+        let _ = self.drain_pending_async_save();
         let Some(path) = self.path.clone() else {
             return ConflictActionOutcome::AbortedStillConflict("no path".to_string());
         };
@@ -1093,10 +1681,19 @@ impl DocumentSession {
 
         // 1. Verify disk still matches the `theirs` the user saw
         let disk_bytes = match fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => {
+            Ok(b) => {
+                self.disk_stat = DiskFileStat::capture(&path);
+                b
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.disk_stat = None;
                 self.on_external_deleted();
                 return ConflictActionOutcome::TransitionedToMissing;
+            }
+            Err(e) => {
+                return ConflictActionOutcome::AbortedStillConflict(format!(
+                    "failed to read disk file: {e}"
+                ));
             }
         };
         let latest_disk = match detect_and_decode(&disk_bytes) {
@@ -1134,6 +1731,7 @@ impl DocumentSession {
             return ConflictActionOutcome::AbortedStillConflict(e.to_string());
         }
 
+        self.disk_stat = DiskFileStat::capture(&path);
         self.base = DiskSnapshot::from_rope(captured_rope);
         self.theirs = None;
 
@@ -1165,6 +1763,7 @@ impl DocumentSession {
         captured_revision: u64,
         view_selection: Option<(&str, Selection)>,
     ) -> (ConflictActionOutcome, Option<Selection>) {
+        let _ = self.drain_pending_async_save();
         let Some(path) = self.path.clone() else {
             return (
                 ConflictActionOutcome::AbortedStillConflict("no path".to_string()),
@@ -1180,10 +1779,22 @@ impl DocumentSession {
 
         // Check if file still exists on disk
         let initial_disk_bytes = match fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => {
+            Ok(b) => {
+                self.disk_stat = DiskFileStat::capture(&path);
+                b
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.disk_stat = None;
                 self.on_external_deleted();
                 return (ConflictActionOutcome::TransitionedToMissing, None);
+            }
+            Err(e) => {
+                return (
+                    ConflictActionOutcome::AbortedStillConflict(format!(
+                        "failed to read disk file: {e}"
+                    )),
+                    None,
+                );
             }
         };
 
@@ -1241,14 +1852,26 @@ impl DocumentSession {
         }
 
         let post_backup_bytes = match fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => {
+            Ok(b) => {
+                self.disk_stat = DiskFileStat::capture(&path);
+                b
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.disk_stat = None;
                 self.on_external_deleted();
                 return (ConflictActionOutcome::TransitionedToMissing, None);
             }
+            Err(e) => {
+                return (
+                    ConflictActionOutcome::AbortedStillConflict(format!(
+                        "failed to read disk file: {e}"
+                    )),
+                    None,
+                );
+            }
         };
-        match detect_and_decode(&post_backup_bytes) {
-            Ok((disk_text, _)) => {
+        let loaded_format = match detect_and_decode(&post_backup_bytes) {
+            Ok((disk_text, fmt)) => {
                 let latest_disk = DiskSnapshot::from_str(&disk_text);
                 if latest_disk.crc32 != expected_theirs.crc32
                     || latest_disk.len_bytes != expected_theirs.len_bytes
@@ -1262,6 +1885,7 @@ impl DocumentSession {
                         None,
                     );
                 }
+                fmt
             }
             Err(e) => {
                 self.theirs = Some(DiskSnapshot::from_undecodable_bytes(&post_backup_bytes));
@@ -1273,7 +1897,7 @@ impl DocumentSession {
                     None,
                 );
             }
-        }
+        };
 
         let theirs_text = expected_theirs.content_string();
         let (sel_before, sel_after, mapped_ret) = match view_selection {
@@ -1295,6 +1919,7 @@ impl DocumentSession {
             sel_after,
             EditKind::Structural,
         );
+        self.format = loaded_format;
         self.base = expected_theirs;
         self.theirs = None;
         self.state = DocState::Clean;
@@ -1416,6 +2041,7 @@ impl DocumentSession {
     /// Archive unsaved local edits into a bounded historical backup on close, then remove the
     /// protected current crash-recovery snapshot so it will not reopen as an unrecovered crash.
     pub fn archive_unsaved_on_close(&mut self) -> Result<Option<PathBuf>, SessionError> {
+        let _ = self.drain_pending_async_save();
         let reason = match self.state {
             DocState::Clean
             | DocState::Missing {
@@ -1485,7 +2111,7 @@ fn normalize_session_path(p: &Path) -> PathBuf {
     }
 }
 
-fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
+pub fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
     a == b || canonicalize_lossy(a) == canonicalize_lossy(b)
 }
 
@@ -2237,13 +2863,141 @@ pub enum AutoMergeOutcome {
     AbortedStillConflict(String),
 }
 
+/// Line classification for rendering a concise conflict diff preview (`Ours` vs `Theirs`, PRD 4.5.1 D).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictDiffKind {
+    SectionHeader,
+    Context,
+    Mine,
+    Theirs,
+}
+
+/// One formatted line in a conflict diff preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictDiffLine {
+    pub kind: ConflictDiffKind,
+    pub text: String,
+}
+
 impl DocumentSession {
+    /// Compute a compact unified-style diff preview comparing current buffer (`ours`) against `theirs`
+    /// and highlighting overlapping 3-way merge hunks if present (PRD 4.5.1 D).
+    pub fn compute_conflict_diff_lines(&self) -> Vec<ConflictDiffLine> {
+        let Some(theirs) = &self.theirs else {
+            return Vec::new();
+        };
+        let ours_text = self.buffer.to_string();
+        if theirs.raw_bytes.is_some() {
+            return vec![
+                ConflictDiffLine {
+                    kind: ConflictDiffKind::SectionHeader,
+                    text: format!(
+                        "@@ Disk file is binary/undecodable ({} bytes); Keep Mine backs up exact raw bytes @@",
+                        theirs.len_bytes
+                    ),
+                },
+                ConflictDiffLine {
+                    kind: ConflictDiffKind::Mine,
+                    text: format!("My local version: {} bytes", ours_text.len()),
+                },
+            ];
+        }
+        let base_text = self.base.content_string();
+        let theirs_text = theirs.content_string();
+        if let Err(overlaps) = three_way_merge_lines(&base_text, &ours_text, &theirs_text) {
+            let mut out = Vec::new();
+            for (idx, h) in overlaps.iter().enumerate() {
+                out.push(ConflictDiffLine {
+                    kind: ConflictDiffKind::SectionHeader,
+                    text: format!(
+                        "@@ Overlap #{idx_one} (base lines {}..{}) @@",
+                        h.base_start_line + 1,
+                        h.base_end_line.max(h.base_start_line + 1),
+                        idx_one = idx + 1
+                    ),
+                });
+                for line in &h.ours_lines {
+                    out.push(ConflictDiffLine {
+                        kind: ConflictDiffKind::Mine,
+                        text: format!("- [Mine]   {}", line.trim_end_matches(&['\r', '\n'][..])),
+                    });
+                }
+                for line in &h.theirs_lines {
+                    out.push(ConflictDiffLine {
+                        kind: ConflictDiffKind::Theirs,
+                        text: format!("+ [Disk]   {}", line.trim_end_matches(&['\r', '\n'][..])),
+                    });
+                }
+            }
+            return out;
+        }
+
+        let ours_lines = split_lines_with_eol(&ours_text);
+        let theirs_lines = split_lines_with_eol(&theirs_text);
+        let ours_refs: Vec<&str> = ours_lines.iter().map(|l| l.raw).collect();
+        let theirs_refs: Vec<&str> = theirs_lines.iter().map(|l| l.raw).collect();
+        let anchors = lcs_matching_lines(&ours_refs, &theirs_refs);
+
+        let mut out = Vec::new();
+        let mut oi = 0usize;
+        let mut ti = 0usize;
+        for (ao, at) in anchors
+            .into_iter()
+            .chain(std::iter::once((ours_lines.len(), theirs_lines.len())))
+        {
+            if oi < ao || ti < at {
+                out.push(ConflictDiffLine {
+                    kind: ConflictDiffKind::SectionHeader,
+                    text: format!(
+                        "@@ Mine L{}..L{} vs Disk L{}..L{} @@",
+                        oi + 1,
+                        ao.max(oi + 1),
+                        ti + 1,
+                        at.max(ti + 1),
+                    ),
+                });
+                if oi > 0 {
+                    out.push(ConflictDiffLine {
+                        kind: ConflictDiffKind::Context,
+                        text: format!(
+                            "  {}",
+                            ours_lines[oi - 1].content
+                        ),
+                    });
+                }
+                for line in &ours_lines[oi..ao] {
+                    out.push(ConflictDiffLine {
+                        kind: ConflictDiffKind::Mine,
+                        text: format!("- [Mine]   {}", line.content),
+                    });
+                }
+                for line in &theirs_lines[ti..at] {
+                    out.push(ConflictDiffLine {
+                        kind: ConflictDiffKind::Theirs,
+                        text: format!("+ [Disk]   {}", line.content),
+                    });
+                }
+            }
+            oi = ao.saturating_add(1);
+            ti = at.saturating_add(1);
+        }
+        if out.is_empty() {
+            out.push(ConflictDiffLine {
+                kind: ConflictDiffKind::Context,
+                text: "No line differences remain between Mine and Disk (formatting/metadata differs)."
+                    .to_string(),
+            });
+        }
+        out
+    }
+
     /// Attempt line-level three-way auto-merge between `self.base`, current buffer (`ours`),
     /// and live disk (`theirs`) per PRD 4.5.1 D.
     ///
     /// Succeeds cleanly when hunks do not overlap; aborts without altering the buffer and returns
     /// `HasOverlappingConflicts` (staying in `Conflict`) if any hunks conflict.
     pub fn resolve_conflict_auto_merge(&mut self, captured_revision: u64) -> AutoMergeOutcome {
+        let _ = self.drain_pending_async_save();
         if self.buffer.revision() != captured_revision {
             return AutoMergeOutcome::AbortedStillConflict(
                 "document changed before auto-merge executed".to_string(),
@@ -2260,10 +3014,19 @@ impl DocumentSession {
         };
 
         let disk_bytes = match fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => {
+            Ok(b) => {
+                self.disk_stat = DiskFileStat::capture(&path);
+                b
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.disk_stat = None;
                 self.on_external_deleted();
                 return AutoMergeOutcome::TransitionedToMissing;
+            }
+            Err(e) => {
+                return AutoMergeOutcome::AbortedStillConflict(format!(
+                    "failed to read disk file: {e}"
+                ));
             }
         };
 
@@ -2330,6 +3093,32 @@ impl DocumentSession {
                 conflicting_hunks,
             },
         }
+    }
+
+    /// Perform 3-way auto-merge while clearing IME preedit state and clamping/updating `view.selection`.
+    pub fn resolve_conflict_auto_merge_with_view(
+        &mut self,
+        captured_revision: u64,
+        view: &mut EditorViewState,
+    ) -> AutoMergeOutcome {
+        let old_text = self.buffer.to_string();
+        let mut old_head = view.selection.head.min(old_text.len());
+        while old_head > 0 && !old_text.is_char_boundary(old_head) {
+            old_head -= 1;
+        }
+        let outcome = self.resolve_conflict_auto_merge(captured_revision);
+        match &outcome {
+            AutoMergeOutcome::MergedClean | AutoMergeOutcome::MergedDirty { .. } => {
+                let merged_text = self.buffer.to_string();
+                let mapped_pos = map_offset_across_reload(&old_text, &merged_text, old_head);
+                view.selection = Selection::caret(mapped_pos);
+                view.ime_preedit = None;
+                view.ime_composition_selection = None;
+                view.expansion_frozen = false;
+            }
+            _ => {}
+        }
+        outcome
     }
 }
 
@@ -3805,6 +4594,382 @@ mod tests {
         );
 
         drop(session);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_async_save_worker_coalesces_consecutive_writes_and_preserves_later_dirty_edit() {
+        let root = unique_temp_dir("async-save-coalesce");
+        let rec_root = root.join("rec");
+        let file = root.join("note.md");
+        fs::create_dir_all(&rec_root).unwrap();
+        fs::write(&file, "v0\n").unwrap();
+
+        let mut session = DocumentSession::open_file(&file, Some(rec_root.clone())).unwrap();
+        let mut view = EditorViewState::default();
+
+        session.with_editor_view(&mut view, |ctx| {
+            ctx.set_selection(0, 3);
+            ctx.insert_text("v1\n");
+        })
+        .unwrap();
+        assert!(session.schedule_async_save());
+
+        session.with_editor_view(&mut view, |ctx| {
+            ctx.set_selection(0, 3);
+            ctx.insert_text("v2\n");
+        })
+        .unwrap();
+        assert!(session.schedule_async_save());
+
+        // Edit a third time WITHOUT scheduling async save; queued writes must chain cleanly without false conflict
+        session.with_editor_view(&mut view, |ctx| {
+            ctx.set_selection(0, 3);
+            ctx.insert_text("v3\n");
+        })
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while session.is_async_save_in_flight() {
+            let _ = session.poll_async_save();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "async save worker timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        while session.poll_async_save().is_some() {}
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), "v2\n");
+        assert_eq!(session.state, DocState::Dirty);
+        assert_eq!(session.buffer.to_string(), "v3\n");
+        assert_eq!(session.save(), SaveOutcome::SavedClean);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "v3\n");
+
+        drop(session);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_sync_from_disk_handles_clean_reload_conflict_missing_reappear_and_unix_rename() {
+        let root = unique_temp_dir("sync-from-disk-fsm");
+        let rec_root = root.join("rec");
+        let file = root.join("doc.md");
+        fs::create_dir_all(&rec_root).unwrap();
+        fs::write(&file, "v1\n").unwrap();
+
+        let mut session = DocumentSession::open_file(&file, Some(rec_root.clone())).unwrap();
+        let mut view = EditorViewState::default();
+        assert_eq!(session.sync_from_disk_with_view(&mut view, true), ExternalSyncResult::NoChange);
+
+        // Clean external change reloads & supports Undo (PRD 4.5.1 C)
+        fs::write(&file, "disk-v2\n").unwrap();
+        assert_eq!(
+            session.sync_from_disk_with_view(&mut view, true),
+            ExternalSyncResult::ReloadedClean
+        );
+        assert_eq!(session.state, DocState::Clean);
+        assert_eq!(session.buffer.to_string(), "disk-v2\n");
+        session.with_editor_view(&mut view, |ctx| ctx.undo()).unwrap();
+        assert_eq!(session.buffer.to_string(), "v1\n");
+        assert_eq!(session.state, DocState::Dirty);
+        // External write after local undo -> save detects Conflict without overwriting disk
+        fs::write(&file, "disk-v3\n").unwrap();
+        assert_eq!(session.save(), SaveOutcome::EnteredConflict);
+
+        // Repeated external write while in Conflict updates `theirs`
+        fs::write(&file, "disk-v4\n").unwrap();
+        assert_eq!(
+            session.sync_from_disk_with_view(&mut view, true),
+            ExternalSyncResult::ConflictTheirsUpdated
+        );
+        assert_eq!(session.state, DocState::Conflict);
+        assert!(!session.compute_conflict_diff_lines().is_empty());
+        // save() must never overwrite disk during Conflict
+        assert_eq!(session.save(), SaveOutcome::EnteredConflict);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "disk-v4\n");
+
+        let rev = session.buffer.revision();
+        let rope = session.buffer.snapshot_rope();
+        assert_eq!(
+            session.resolve_conflict_keep_mine(rev, rope),
+            ConflictActionOutcome::ResolvedClean
+        );
+
+        // External delete when Clean -> Missing, then identical reappearance -> Clean
+        fs::remove_file(&file).unwrap();
+        assert_eq!(
+            session.sync_from_disk_with_view(&mut view, true),
+            ExternalSyncResult::BecameMissing
+        );
+        assert_eq!(session.state, DocState::Missing { has_local_edits: false });
+        fs::write(&file, "v1\n").unwrap();
+        assert_eq!(
+            session.sync_from_disk_with_view(&mut view, true),
+            ExternalSyncResult::ReappearedClean { reloaded: false }
+        );
+        assert_eq!(session.state, DocState::Clean);
+
+        // Delete + edit local + re-save recreates original file; if replaced externally, enters Conflict
+        fs::remove_file(&file).unwrap();
+        assert_eq!(
+            session.sync_from_disk_with_view(&mut view, true),
+            ExternalSyncResult::BecameMissing
+        );
+        session
+            .with_editor_view(&mut view, |ctx| ctx.insert_text("more\n"))
+            .unwrap();
+        assert_eq!(session.state, DocState::Missing { has_local_edits: true });
+        assert_eq!(session.save(), SaveOutcome::SavedClean);
+        assert_eq!(session.state, DocState::Clean);
+        assert!(file.exists());
+
+        fs::remove_file(&file).unwrap();
+        assert_eq!(
+            session.sync_from_disk_with_view(&mut view, true),
+            ExternalSyncResult::BecameMissing
+        );
+        fs::write(&file, "reappeared-different\n").unwrap();
+        assert_eq!(session.save(), SaveOutcome::EnteredConflict);
+        let rev2 = session.buffer.revision();
+        assert_eq!(
+            session.resolve_conflict_use_theirs_with_view(rev2, &mut view),
+            ConflictActionOutcome::ResolvedClean
+        );
+
+        #[cfg(unix)]
+        {
+            let renamed = root.join("renamed.md");
+            fs::rename(&file, &renamed).unwrap();
+            let res = session.sync_from_disk_with_view(&mut view, true);
+            assert_eq!(
+                res,
+                ExternalSyncResult::Renamed {
+                    old_path: file.clone(),
+                    new_path: renamed.clone(),
+                }
+            );
+            assert_eq!(session.path.as_deref(), Some(renamed.as_path()));
+            assert_eq!(session.state, DocState::Clean);
+        }
+
+        drop(session);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_async_save_after_idle_completion_before_poll_does_not_false_conflict() {
+        let root = unique_temp_dir("async-save-idle-gap");
+        let rec_root = root.join("rec");
+        let file = root.join("note.md");
+        fs::create_dir_all(&rec_root).unwrap();
+        fs::write(&file, "v0\n").unwrap();
+
+        let mut session = DocumentSession::open_file(&file, Some(rec_root.clone())).unwrap();
+        let mut view = EditorViewState::default();
+
+        // 1. Complete a background write W1 and let the worker return to idle BEFORE calling poll_async_save().
+        session
+            .with_editor_view(&mut view, |ctx| {
+                ctx.set_selection(0, 3);
+                ctx.insert_text("v1\n");
+            })
+            .unwrap();
+        assert!(session.schedule_async_save());
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while session.is_async_save_in_flight() {
+            assert!(Instant::now() < deadline, "W1 timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // Edit and schedule W2 without the caller explicitly calling poll_async_save() first.
+        session
+            .with_editor_view(&mut view, |ctx| {
+                ctx.set_selection(0, 3);
+                ctx.insert_text("v2\n");
+            })
+            .unwrap();
+        assert!(session.schedule_async_save());
+        while session.is_async_save_in_flight() {
+            assert!(Instant::now() < deadline, "W2 timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let outcome = session.poll_async_save();
+        assert_eq!(outcome, Some(SaveOutcome::SavedClean));
+        assert_eq!(session.state, DocState::Clean);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "v2\n");
+
+        // 2. Also exercise the SaveWorker queue directly with stale known_applied_write_id == 0 across idle gaps.
+        let b2 = DiskSnapshot::from_str("v2\n");
+        let fmt = session.format;
+        let worker = SaveWorker::spawn();
+        worker.schedule(SaveRequest {
+            path: file.clone(),
+            written_revision: 10,
+            written_rope: Rope::from_str("v3\n"),
+            expected_base: b2.clone(),
+            known_applied_write_id: 0,
+            format: fmt,
+            current_state: DocState::Dirty,
+        });
+        while worker.is_busy() {
+            assert!(Instant::now() < deadline, "direct W1 timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Submit W2 STILL carrying known_applied_write_id: 0 and old expected_base: b2 before draining completions.
+        worker.schedule(SaveRequest {
+            path: file.clone(),
+            written_revision: 11,
+            written_rope: Rope::from_str("v4\n"),
+            expected_base: b2,
+            known_applied_write_id: 0,
+            format: fmt,
+            current_state: DocState::Dirty,
+        });
+        while worker.is_busy() {
+            assert!(Instant::now() < deadline, "direct W2 timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let finished = worker.wait_and_drain();
+        assert_eq!(finished.len(), 2);
+        assert!(finished
+            .iter()
+            .all(|f| matches!(f.result, DiskWriteResult::Written { .. })));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "v4\n");
+
+        drop(session);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unix_rename_plus_simultaneous_edit_reconciles_without_stale_stat_cache() {
+        let root = unique_temp_dir("rename-and-edit");
+        let rec_root = root.join("rec");
+        let file_a = root.join("a.md");
+        let file_b = root.join("b.md");
+        fs::create_dir_all(&rec_root).unwrap();
+        fs::write(&file_a, "v1\n").unwrap();
+
+        let mut session = DocumentSession::open_file(&file_a, Some(rec_root)).unwrap();
+        let mut view = EditorViewState::default();
+
+        // External tool modifies file AND renames it before next poll
+        fs::write(&file_a, "v2-after-rename\n").unwrap();
+        fs::rename(&file_a, &file_b).unwrap();
+
+        let first = session.sync_from_disk_with_view(&mut view, false);
+        assert_eq!(
+            first,
+            ExternalSyncResult::Renamed {
+                old_path: file_a.clone(),
+                new_path: file_b.clone(),
+            }
+        );
+        assert!(session.disk_stat.is_none());
+
+        // Subsequent non-bypass poll must NOT skip reading `file_b`!
+        let second = session.sync_from_disk_with_view(&mut view, false);
+        assert_eq!(second, ExternalSyncResult::ReloadedClean);
+        assert_eq!(session.buffer.to_string(), "v2-after-rename\n");
+        assert_eq!(session.state, DocState::Clean);
+
+        drop(session);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_poll_async_save_does_not_synchronously_flush_recovery_on_dirty_or_conflict() {
+        let root = unique_temp_dir("async-poll-nonblocking-recovery");
+        let rec_dir = root.join("rec");
+        let file = root.join("big.md");
+        fs::create_dir_all(&rec_dir).unwrap();
+        fs::write(&file, "Initial\n").unwrap();
+
+        // Large throttle window ensures scheduled recovery does NOT hit disk synchronously unless FlushNow ran
+        let mut session =
+            DocumentSession::open_file_with_throttle(&file, Some(rec_dir.clone()), Duration::from_secs(60))
+                .unwrap();
+        let mut view = EditorViewState::default();
+
+        session
+            .with_editor_view(&mut view, |ctx| ctx.insert_text("V1-"))
+            .unwrap();
+        assert!(session.schedule_async_save());
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while session.is_async_save_in_flight() {
+            assert!(Instant::now() < deadline, "W1 timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // Concurrent edit after W1 was captured makes W1 return SavedButStillDirty
+        session
+            .with_editor_view(&mut view, |ctx| ctx.insert_text("V2-"))
+            .unwrap();
+        let outcome = session.poll_async_save();
+        assert!(matches!(outcome, Some(SaveOutcome::SavedButStillDirty { .. })));
+        assert_eq!(session.state, DocState::Dirty);
+
+        // `poll_async_save` must have used async `schedule_recovery_snapshot()`, NOT blocking `flush_sync()`
+        assert!(
+            DocumentSession::read_latest_intact_snapshot(&rec_dir).is_none(),
+            "poll_async_save must schedule recovery asynchronously instead of synchronously flushing"
+        );
+
+        // Explicit flush (e.g., on shutdown) persists the latest content deterministically
+        session.flush_current_recovery_snapshot().unwrap();
+        let snap = DocumentSession::read_latest_intact_snapshot(&rec_dir).unwrap();
+        assert_eq!(snap.content, "V1-V2-Initial\n");
+
+        drop(session);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_deleting_last_crlf_preserves_session_dominant_crlf_preference_on_enter() {
+        let root = unique_temp_dir("preserve-eol-after-delete-last-crlf");
+        let file = root.join("win.md");
+        fs::write(&file, b"A\r\nB").unwrap();
+
+        let mut session = DocumentSession::open_file(&file, None).unwrap();
+        assert_eq!(
+            session.format.dominant_line_ending,
+            crate::encoding::LineEnding::CrLf
+        );
+        let mut view = EditorViewState::default();
+
+        session
+            .with_editor_view(&mut view, |ctx| {
+                ctx.set_caret("A\r\n".len());
+                ctx.backspace();
+            })
+            .unwrap();
+        assert_eq!(session.buffer.to_string(), "AB");
+
+        session
+            .with_editor_view(&mut view, |ctx| {
+                ctx.enter();
+            })
+            .unwrap();
+        assert_eq!(session.buffer.to_string(), "A\r\nB");
+        assert_eq!(session.save(), SaveOutcome::SavedClean);
+        assert_eq!(fs::read(&file).unwrap(), b"A\r\nB");
+
+        // Also verify table Enter after deleting the only `\r\n` in buffer preserves CRLF
+        session
+            .with_editor_view(&mut view, |ctx| {
+                ctx.set_selection(0, ctx.buffer.len_bytes());
+                ctx.insert_text("| a | b |");
+                ctx.set_caret("| ".len());
+                ctx.enter();
+            })
+            .unwrap();
+        assert_eq!(
+            session.buffer.to_string(),
+            "| a | b |\r\n| --- | --- |\r\n|  |  |"
+        );
+
         let _ = fs::remove_dir_all(&root);
     }
 }

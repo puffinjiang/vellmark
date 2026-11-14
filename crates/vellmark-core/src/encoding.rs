@@ -40,6 +40,12 @@ impl LineEnding {
     }
 
     pub fn detect_dominant(text: &str) -> Self {
+        Self::detect_dominant_or(text, LineEnding::Lf)
+    }
+
+    /// Detect the dominant line ending in `text`, falling back to `fallback` when `text`
+    /// contains no line breaks (or when `fallback` participates in a tie).
+    pub fn detect_dominant_or(text: &str, fallback: Self) -> Self {
         let mut lf = 0usize;
         let mut crlf = 0usize;
         let mut cr = 0usize;
@@ -59,9 +65,18 @@ impl LineEnding {
             }
             i += 1;
         }
+        if lf == 0 && crlf == 0 && cr == 0 {
+            return fallback;
+        }
         if crlf > lf && crlf >= cr {
             LineEnding::CrLf
         } else if cr > lf && cr > crlf {
+            LineEnding::Cr
+        } else if lf > crlf && lf > cr {
+            LineEnding::Lf
+        } else if fallback == LineEnding::CrLf && crlf == lf && crlf >= cr {
+            LineEnding::CrLf
+        } else if fallback == LineEnding::Cr && cr == lf && cr >= crlf {
             LineEnding::Cr
         } else {
             LineEnding::Lf
@@ -303,5 +318,20 @@ mod tests {
             encode_for_save("中文", &meta),
             Err(EncodingError::ReadOnlyDocument)
         );
+    }
+
+    #[test]
+    fn test_detect_dominant_or_preserves_fallback_when_no_newlines_or_tie() {
+        assert_eq!(LineEnding::detect_dominant_or("AB", LineEnding::CrLf), LineEnding::CrLf);
+        assert_eq!(LineEnding::detect_dominant_or("", LineEnding::Cr), LineEnding::Cr);
+        assert_eq!(
+            LineEnding::detect_dominant_or("a\nb\r\nc", LineEnding::CrLf),
+            LineEnding::CrLf
+        );
+        assert_eq!(
+            LineEnding::detect_dominant_or("a\nb\nc\r\nd", LineEnding::CrLf),
+            LineEnding::Lf
+        );
+        assert_eq!(LineEnding::detect_dominant("a\nb\r\nc"), LineEnding::Lf);
     }
 }

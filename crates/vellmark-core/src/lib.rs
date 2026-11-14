@@ -36,10 +36,10 @@ pub use recovery_history::{
     prune_historical_backups, prune_historical_backups_at, read_historical_backup,
 };
 pub use state::{
-    AutoMergeOutcome, ConflictActionOutcome, DiskSnapshot, DocState, DocumentSession,
-    MergeConflictHunk, PendingRecoveryEntry, RECOVERY_META_FILENAME, RecoveryMeta,
-    RecoveryPayload, RecoverySlotReport, RecoveryWorker, SaveOutcome, SessionError,
-    scan_recovery_root,
+    AutoMergeOutcome, ConflictActionOutcome, ConflictDiffKind, ConflictDiffLine, DiskSnapshot,
+    DocState, DocumentSession, ExternalSyncResult, MergeConflictHunk, PendingRecoveryEntry,
+    RECOVERY_META_FILENAME, RecoveryMeta, RecoveryPayload, RecoverySlotReport, RecoveryWorker,
+    SaveOutcome, SessionError, paths_refer_to_same_file, scan_recovery_root,
 };
 pub use stats::{DocumentStats, count_text_metrics};
 pub use find_replace::{

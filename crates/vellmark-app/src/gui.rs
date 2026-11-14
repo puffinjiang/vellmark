@@ -5,12 +5,14 @@
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vellmark_core::{
-    ByteRange, DocState, DocumentStats, EditorAction, EncodingDecision, FindMatch, FindOptions,
-    SaveOutcome, Selection, ViewMode,
+    AutoMergeOutcome, ByteRange, ConflictActionOutcome, ConflictDiffKind, DocState, DocumentStats,
+    EditorAction, EncodingDecision, ExternalSyncResult, FindMatch, FindOptions, SaveOutcome,
+    Selection, ViewMode,
 };
 use vellmark_parser::{OutlineItem, active_outline_index};
 use vellmark_render::{
@@ -27,13 +29,147 @@ use winit::window::{CursorIcon, Theme as WindowTheme, Window, WindowAttributes, 
 
 use crate::clipboard::{ClipboardBackend, NativeClipboard};
 use crate::gpu::WgpuRenderer;
-use crate::workbench::AppWorkbench;
+use crate::workbench::{AppWorkbench, WorkbenchRuntimeEvent};
 
 const TAB_BAR_H: f32 = 36.0;
 const STATUS_BAR_H: f32 = 26.0;
 const SIDEBAR_W: f32 = 248.0;
 const FIND_BAR_H: f32 = 38.0;
+const ALERT_BANNER_H: f32 = 42.0;
+const CLEANUP_BANNER_H: f32 = 30.0;
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
+const EXTERNAL_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// Persistent warning displayed when the recovery directory cannot be written (PRD 4.5.1 F).
+pub const RECOVERY_DEGRADED_NOTICE: &str =
+    "Crash recovery unavailable (dir unwritable) — 3s recovery target degraded";
+
+/// Abstract Save-As file picker backend (`osascript`/native dialog at runtime; deterministic mock in tests).
+pub trait SaveDialogBackend: Send + Sync {
+    fn pick_save_as_path(&self, current_path: Option<&Path>, default_name: &str) -> Option<PathBuf>;
+}
+
+/// Non-interactive Save-As backend for headless tests (`with_clipboard` default).
+#[derive(Debug, Default)]
+pub struct NoopSaveDialog;
+
+impl SaveDialogBackend for NoopSaveDialog {
+    fn pick_save_as_path(&self, _current_path: Option<&Path>, _default_name: &str) -> Option<PathBuf> {
+        None
+    }
+}
+
+/// Deterministic in-memory Save-As dialog backend for unit tests.
+#[derive(Debug, Default)]
+pub struct MemorySaveDialog {
+    next_path: Mutex<Option<PathBuf>>,
+}
+
+impl MemorySaveDialog {
+    pub fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            next_path: Mutex::new(path),
+        }
+    }
+
+    pub fn set_next_path(&self, path: Option<PathBuf>) {
+        if let Ok(mut g) = self.next_path.lock() {
+            *g = path;
+        }
+    }
+}
+
+impl SaveDialogBackend for MemorySaveDialog {
+    fn pick_save_as_path(&self, _current_path: Option<&Path>, _default_name: &str) -> Option<PathBuf> {
+        self.next_path.lock().ok().and_then(|g| g.clone())
+    }
+}
+
+fn parse_dialog_stdout_path(stdout: &[u8]) -> Option<PathBuf> {
+    // Strip ONLY the single trailing LF appended by the Unix dialog CLI (`osascript`/`zenity`).
+    // Never call `.trim()` or strip CRLF, so valid filenames ending in spaces or `\r` (e.g. `Icon\r`)
+    // are preserved verbatim instead of silently targeting a different file.
+    let raw_bytes = stdout.strip_suffix(b"\n").unwrap_or(stdout);
+    if raw_bytes.is_empty() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        Some(PathBuf::from(OsStr::from_bytes(raw_bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        let s = String::from_utf8(raw_bytes.to_vec()).ok()?;
+        Some(PathBuf::from(s))
+    }
+}
+
+fn existing_default_dialog_dir(current_path: Option<&Path>) -> Option<&Path> {
+    let start = current_path.and_then(|p| p.parent())?;
+    start
+        .ancestors()
+        .find(|p| !p.as_os_str().is_empty() && p.is_dir())
+}
+
+/// Native desktop Save-As dialog adapter.
+#[derive(Debug, Default)]
+pub struct NativeSaveDialog;
+
+impl SaveDialogBackend for NativeSaveDialog {
+    fn pick_save_as_path(&self, current_path: Option<&Path>, default_name: &str) -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            let dir_arg = existing_default_dialog_dir(current_path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let script = "on run argv\n\
+                set defName to item 1 of argv\n\
+                set defDir to item 2 of argv\n\
+                if defDir is not \"\" then\n\
+                    set chosen to choose file name with prompt \"Save Markdown As\" default name defName default location (POSIX file defDir)\n\
+                else\n\
+                    set chosen to choose file name with prompt \"Save Markdown As\" default name defName\n\
+                end if\n\
+                return POSIX path of chosen\n\
+            end run";
+            let out = Command::new("osascript")
+                .arg("-e")
+                .arg(script)
+                .arg(default_name)
+                .arg(dir_arg)
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            parse_dialog_stdout_path(&out.stdout)
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let mut cmd = Command::new("zenity");
+            cmd.arg("--file-selection")
+                .arg("--save")
+                .arg("--confirm-overwrite");
+            if let Some(cur) = current_path {
+                cmd.arg("--filename").arg(cur);
+            } else {
+                cmd.arg("--filename").arg(default_name);
+            }
+            let out = cmd.output().ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            parse_dialog_stdout_path(&out.stdout)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (current_path, default_name);
+            None
+        }
+    }
+}
 
 pub const WELCOME_MARKDOWN: &str = "\
 # Vellmark — Native WYSIWYG Markdown Studio\n\
@@ -91,6 +227,17 @@ enum UiAction {
     FindNext,
     CloseFind,
     FocusFindInput,
+    ToggleConflictDiff,
+    ResolveConflictKeepMine,
+    ResolveConflictUseTheirs,
+    ResolveConflictAutoMerge,
+    SaveAsActive,
+    ResaveMissingFile,
+    RetrySaveActive,
+    ForceCloseActiveMissing,
+    ClearConflictBackups,
+    DismissConflictBackupNotice,
+    SaveActiveNow,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +253,34 @@ struct FlatTreeRow {
     name: String,
     path: PathBuf,
     is_dir: bool,
+}
+
+#[derive(Debug, Clone)]
+enum DocBannerKind {
+    Conflict {
+        theirs_updated: bool,
+    },
+    Missing {
+        has_local_edits: bool,
+        write_error: Option<String>,
+    },
+    WriteError {
+        error: String,
+    },
+    RecoveryDegraded,
+    ConflictBackupCleanup {
+        count: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LayoutRegions {
+    tab_bar: Rect,
+    sidebar: Option<Rect>,
+    alert_banner: Option<Rect>,
+    diff_panel: Option<Rect>,
+    editor: Rect,
+    status_bar: Rect,
 }
 
 struct CachedTabMeta {
@@ -150,12 +325,15 @@ pub struct GuiController {
     pub ime_enabled: bool,
     pub caret_visible: bool,
     pub last_caret_blink: Instant,
+    pub last_external_poll: Instant,
     pub clipboard_text: String,
     pub status_notice: Option<(String, Instant)>,
     pub last_ime_cursor_area: Option<Rect>,
     pub untitled_save_dir: Option<PathBuf>,
     pub close_confirm_armed: bool,
+    pub conflict_diff_open: bool,
     clipboard: Box<dyn ClipboardBackend>,
+    save_dialog: Box<dyn SaveDialogBackend>,
     ime_target: ImeTarget,
     cached_meta: Option<CachedTabMeta>,
     ui_hit_zones: Vec<UiHitZone>,
@@ -168,10 +346,22 @@ pub struct GuiController {
 
 impl GuiController {
     pub fn new(workbench: AppWorkbench) -> Self {
-        Self::with_clipboard(workbench, Box::new(NativeClipboard::new()))
+        Self::with_backends(
+            workbench,
+            Box::new(NativeClipboard::new()),
+            Box::new(NativeSaveDialog),
+        )
     }
 
     pub fn with_clipboard(workbench: AppWorkbench, clipboard: Box<dyn ClipboardBackend>) -> Self {
+        Self::with_backends(workbench, clipboard, Box::new(NoopSaveDialog))
+    }
+
+    pub fn with_backends(
+        workbench: AppWorkbench,
+        clipboard: Box<dyn ClipboardBackend>,
+        save_dialog: Box<dyn SaveDialogBackend>,
+    ) -> Self {
         let style = style_from_workbench(&workbench);
         let sidebar_section = if workbench.file_tree.is_some() {
             SidebarSection::Files
@@ -179,6 +369,7 @@ impl GuiController {
             SidebarSection::Outline
         };
         let protected_limit_warned = workbench.protected_snapshots_exceed_limit();
+        let now = Instant::now();
         Self {
             workbench,
             shaper: ShapedDocumentCache::new(),
@@ -196,13 +387,16 @@ impl GuiController {
             pointer_pos: (0.0, 0.0),
             ime_enabled: false,
             caret_visible: true,
-            last_caret_blink: Instant::now(),
+            last_caret_blink: now,
+            last_external_poll: now,
             clipboard_text: String::new(),
             status_notice: None,
             last_ime_cursor_area: None,
             untitled_save_dir: None,
             close_confirm_armed: false,
+            conflict_diff_open: false,
             clipboard,
+            save_dialog,
             ime_target: ImeTarget::None,
             cached_meta: None,
             ui_hit_zones: Vec::new(),
@@ -214,6 +408,10 @@ impl GuiController {
         }
     }
 
+    pub fn set_save_dialog(&mut self, save_dialog: Box<dyn SaveDialogBackend>) {
+        self.save_dialog = save_dialog;
+    }
+
     pub fn refresh_style(&mut self) {
         self.style = style_from_workbench(&self.workbench);
     }
@@ -222,20 +420,38 @@ impl GuiController {
         self.status_notice = Some((msg.into(), Instant::now()));
     }
 
-    /// Return the active status-bar notice text, keeping the protected-snapshot capacity warning
-    /// visible beyond the 3-second transient notice timeout until storage drops back within budget.
+    /// Return the active status-bar notice text, keeping persistent warnings
+    /// visible beyond the 3-second transient notice timeout until resolved.
     pub fn active_status_notice(&self) -> Option<String> {
         let transient = self
             .status_notice
             .as_ref()
             .and_then(|(msg, ts)| (ts.elapsed() < Duration::from_secs(3)).then_some(msg.as_str()));
-        match (transient, self.workbench.protected_snapshots_exceed_limit()) {
-            (Some(msg), true) if msg != PROTECTED_SNAPSHOT_LIMIT_NOTICE => {
-                Some(format!("{msg}   |   {PROTECTED_SNAPSHOT_LIMIT_NOTICE}"))
+        let mut persistent: Vec<&str> = Vec::new();
+        if self
+            .workbench
+            .active_tab()
+            .is_some_and(|t| t.session.recovery_degraded)
+        {
+            persistent.push(RECOVERY_DEGRADED_NOTICE);
+        }
+        if self.workbench.protected_snapshots_exceed_limit() {
+            persistent.push(PROTECTED_SNAPSHOT_LIMIT_NOTICE);
+        }
+        let persistent_joined = if persistent.is_empty() {
+            None
+        } else {
+            Some(persistent.join("   |   "))
+        };
+        match (transient, persistent_joined) {
+            (Some(msg), Some(pers))
+                if !persistent.contains(&msg) && !pers.contains(msg) =>
+            {
+                Some(format!("{msg}   |   {pers}"))
             }
             (Some(msg), _) => Some(msg.to_string()),
-            (None, true) => Some(PROTECTED_SNAPSHOT_LIMIT_NOTICE.to_string()),
-            (None, false) => None,
+            (None, Some(pers)) => Some(pers),
+            (None, None) => None,
         }
     }
 
@@ -284,6 +500,123 @@ impl GuiController {
         }
     }
 
+    fn apply_runtime_events(&mut self, events: Vec<WorkbenchRuntimeEvent>) -> bool {
+        if events.is_empty() {
+            return false;
+        }
+        let active_id = self.workbench.active_tab().map(|t| t.id);
+        let mut changed = false;
+        for ev in events {
+            changed = true;
+            match ev {
+                WorkbenchRuntimeEvent::AutoSavedClean { .. } => {
+                    self.trigger_background_maintenance(true);
+                }
+                WorkbenchRuntimeEvent::EnteredConflict { tab_id, title } => {
+                    if Some(tab_id) == active_id {
+                        self.set_notice(format!(
+                            "Conflict detected in '{title}' — review Diff / Keep Mine / Use Disk"
+                        ));
+                    } else {
+                        self.set_notice(format!("Conflict detected in '{title}'"));
+                    }
+                }
+                WorkbenchRuntimeEvent::ConflictTheirsUpdated { title, .. } => {
+                    self.set_notice(format!(
+                        "Disk content changed again for '{title}' — refreshed external snapshot"
+                    ));
+                }
+                WorkbenchRuntimeEvent::ReloadedClean { title, .. } => {
+                    self.set_notice(format!(
+                        "Reloaded '{title}' from disk (Undo with Cmd/Ctrl+Z)"
+                    ));
+                }
+                WorkbenchRuntimeEvent::BecameMissing {
+                    title,
+                    has_local_edits,
+                    ..
+                } => {
+                    if has_local_edits {
+                        self.set_notice(format!(
+                            "'{title}' was deleted or moved (local changes kept)"
+                        ));
+                    } else {
+                        self.set_notice(format!("'{title}' was deleted or moved"));
+                    }
+                }
+                WorkbenchRuntimeEvent::Reappeared {
+                    title, reloaded, ..
+                } => {
+                    if reloaded {
+                        self.set_notice(format!("'{title}' reappeared and reloaded from disk"));
+                    } else {
+                        self.set_notice(format!("'{title}' restored on disk"));
+                    }
+                }
+                WorkbenchRuntimeEvent::Renamed { new_path, .. } => {
+                    let name = new_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("renamed file");
+                    self.set_notice(format!("File renamed externally -> {name}"));
+                }
+                WorkbenchRuntimeEvent::WriteFailed { title, error, .. } => {
+                    self.set_notice(format!("Save failed for '{title}': {error}"));
+                }
+                WorkbenchRuntimeEvent::ReadError { title, error, .. } => {
+                    self.set_notice(format!("Read error for '{title}': {error}"));
+                }
+            }
+        }
+        changed
+    }
+
+    /// Drive 2s idle auto-save, 5s/15s/60s failure retry backoff, and periodic external disk polling.
+    pub fn tick_runtime_at(&mut self, now: Instant) -> bool {
+        let auto_events = self.workbench.tick_auto_save_at(now);
+        let mut changed = self.apply_runtime_events(auto_events);
+        if now.duration_since(self.last_external_poll) >= EXTERNAL_POLL_INTERVAL {
+            self.last_external_poll = now;
+            let poll_events = self.workbench.poll_external_changes(false);
+            changed |= self.apply_runtime_events(poll_events);
+        }
+        changed
+    }
+
+    /// Earliest wake deadline for the event loop combining caret blink, external poll, and auto-save.
+    pub fn next_wake_deadline(&self) -> Instant {
+        let mut next = self.last_caret_blink + BLINK_INTERVAL;
+        next = next.min(self.last_external_poll + EXTERNAL_POLL_INTERVAL);
+        if let Some(auto_dl) = self.workbench.next_auto_save_deadline() {
+            next = next.min(auto_dl);
+        }
+        next
+    }
+
+    /// Immediately auto-save all eligible dirty named tabs when window loses focus (PRD 4.5.1 A).
+    pub fn handle_focus_lost(&mut self) -> bool {
+        let events = self.workbench.flush_all_dirty_auto_saves(Instant::now());
+        self.apply_runtime_events(events)
+    }
+
+    /// Re-verify open files bypassing stat cache when window regains focus (PRD 4.5.1 G).
+    pub fn handle_focus_gained(&mut self) -> bool {
+        self.last_external_poll = Instant::now();
+        let events = self.workbench.poll_external_changes(true);
+        let changed = self.apply_runtime_events(events);
+        self.trigger_background_maintenance(false);
+        self.reset_blink();
+        changed
+    }
+
+    fn flush_active_tab_before_switch(&mut self) {
+        self.conflict_diff_open = false;
+        if let Some(id) = self.workbench.active_tab().map(|t| t.id) {
+            let events = self.workbench.flush_auto_save_for_tab(id, Instant::now());
+            self.apply_runtime_events(events);
+        }
+    }
+
     fn reset_blink(&mut self) {
         self.caret_visible = true;
         self.last_caret_blink = Instant::now();
@@ -298,8 +631,30 @@ impl GuiController {
         false
     }
 
-    /// Recompute layout regions for `(win_w, win_h)` logical window dimensions.
-    pub fn regions(&self) -> (Rect, Option<Rect>, Rect, Rect) {
+    fn active_doc_banner_kind(&self) -> Option<DocBannerKind> {
+        let tab = self.workbench.active_tab()?;
+        match tab.session.state {
+            DocState::Conflict => Some(DocBannerKind::Conflict {
+                theirs_updated: tab.conflict_theirs_updated,
+            }),
+            DocState::Missing { has_local_edits } => Some(DocBannerKind::Missing {
+                has_local_edits,
+                write_error: tab.last_write_error.clone(),
+            }),
+            DocState::Dirty if tab.last_write_error.is_some() => Some(DocBannerKind::WriteError {
+                error: tab.last_write_error.clone().unwrap_or_default(),
+            }),
+            _ if tab.session.recovery_degraded => Some(DocBannerKind::RecoveryDegraded),
+            _ if tab.conflict_backup_count > 0 && !tab.conflict_backup_notice_dismissed => {
+                Some(DocBannerKind::ConflictBackupCleanup {
+                    count: tab.conflict_backup_count,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn layout_regions(&self) -> LayoutRegions {
         let (w, h) = (self.window_size.0.max(320.0), self.window_size.1.max(200.0));
         let tab_bar = Rect::new(0.0, 0.0, w, TAB_BAR_H);
         let status_bar = Rect::new(0.0, (h - STATUS_BAR_H).max(TAB_BAR_H), w, STATUS_BAR_H);
@@ -310,8 +665,59 @@ impl GuiController {
             None
         };
         let ed_x = sidebar.map(|s| s.w).unwrap_or(0.0);
-        let editor = Rect::new(ed_x, TAB_BAR_H, (w - ed_x).max(80.0), body_h);
-        (tab_bar, sidebar, editor, status_bar)
+        let ed_w = (w - ed_x).max(80.0);
+        let mut cursor_y = TAB_BAR_H;
+        let mut rem_h = body_h;
+
+        let banner_h = match self.active_doc_banner_kind() {
+            Some(DocBannerKind::ConflictBackupCleanup { .. }) => CLEANUP_BANNER_H,
+            Some(_) => ALERT_BANNER_H,
+            None => 0.0,
+        }
+        .min((rem_h - 40.0).max(0.0));
+        let alert_banner = if banner_h > 0.0 {
+            let r = Rect::new(ed_x, cursor_y, ed_w, banner_h);
+            cursor_y += banner_h;
+            rem_h -= banner_h;
+            Some(r)
+        } else {
+            None
+        };
+
+        let show_diff = self.conflict_diff_open
+            && self
+                .workbench
+                .active_tab()
+                .is_some_and(|t| t.session.state == DocState::Conflict);
+        let diff_h = if show_diff {
+            (body_h * 0.36).clamp(110.0, 230.0).min((rem_h - 40.0).max(0.0))
+        } else {
+            0.0
+        };
+        let diff_panel = if diff_h > 0.0 {
+            let r = Rect::new(ed_x, cursor_y, ed_w, diff_h);
+            cursor_y += diff_h;
+            rem_h -= diff_h;
+            Some(r)
+        } else {
+            None
+        };
+
+        let editor = Rect::new(ed_x, cursor_y, ed_w, rem_h.max(40.0));
+        LayoutRegions {
+            tab_bar,
+            sidebar,
+            alert_banner,
+            diff_panel,
+            editor,
+            status_bar,
+        }
+    }
+
+    /// Recompute layout regions for `(win_w, win_h)` logical window dimensions.
+    pub fn regions(&self) -> (Rect, Option<Rect>, Rect, Rect) {
+        let l = self.layout_regions();
+        (l.tab_bar, l.sidebar, l.editor, l.status_bar)
     }
 
     /// Build layered GPU-agnostic draw lists (`[editor_layer, chrome_layer]`) and hit zones.
@@ -319,20 +725,27 @@ impl GuiController {
         self.refresh_style();
         self.ui_hit_zones.clear();
 
-        let (tab_bar, sidebar_opt, editor_rect, status_bar) = self.regions();
-        self.last_editor_rect = editor_rect;
+        let layout = self.layout_regions();
+        self.last_editor_rect = layout.editor;
 
-        let editor_layer = self.build_editor_layer(editor_rect);
+        let editor_layer = self.build_editor_layer(layout.editor);
         let mut chrome_layer = DrawList::default();
 
-        self.build_tab_bar(&mut chrome_layer, tab_bar);
-        if let Some(sb_rect) = sidebar_opt {
+        self.build_tab_bar(&mut chrome_layer, layout.tab_bar);
+        if let Some(sb_rect) = layout.sidebar {
             self.build_sidebar(&mut chrome_layer, sb_rect);
         }
-        if self.find_open {
-            self.build_find_bar(&mut chrome_layer, editor_rect);
+        if let (Some(banner_rect), Some(kind)) = (layout.alert_banner, self.active_doc_banner_kind())
+        {
+            self.build_doc_alert_banner(&mut chrome_layer, banner_rect, &kind);
         }
-        self.build_status_bar(&mut chrome_layer, status_bar);
+        if let Some(diff_rect) = layout.diff_panel {
+            self.build_conflict_diff_panel(&mut chrome_layer, diff_rect);
+        }
+        if self.find_open {
+            self.build_find_bar(&mut chrome_layer, layout.editor);
+        }
+        self.build_status_bar(&mut chrome_layer, layout.status_bar);
 
         (editor_layer, chrome_layer)
     }
@@ -1032,6 +1445,297 @@ impl GuiController {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn push_action_button(
+        &mut self,
+        dl: &mut DrawList,
+        right_edge: f32,
+        y: f32,
+        h: f32,
+        label: &str,
+        bg: vellmark_render::RgbaColor,
+        border: vellmark_render::RgbaColor,
+        fg: vellmark_render::RgbaColor,
+        action: UiAction,
+        clip: Rect,
+    ) -> f32 {
+        let bw = (label.chars().count() as f32 * 6.4 + 14.0).max(24.0);
+        let x = right_edge - bw;
+        if x < clip.x + 8.0 {
+            return right_edge;
+        }
+        let rect = Rect::new(x, y, bw, h);
+        dl.rects
+            .push(SceneRect::rounded(rect, bg, 5.0).with_border(1.0, border));
+        self.push_ui_text(
+            dl,
+            label,
+            rect.x + 7.0,
+            rect.y + ((h - 14.0) * 0.5).max(1.0),
+            11.0,
+            600,
+            fg,
+            Some((bw - 10.0).max(10.0)),
+            Some(rect),
+        );
+        self.ui_hit_zones.push(UiHitZone {
+            rect,
+            action,
+            pointer_cursor: true,
+        });
+        x - 6.0
+    }
+
+    fn build_doc_alert_banner(&mut self, dl: &mut DrawList, banner: Rect, kind: &DocBannerKind) {
+        let chrome = self.style.chrome;
+        let diff_label = if self.conflict_diff_open {
+            "Hide Diff"
+        } else {
+            "Diff"
+        };
+        let (accent, tint_alpha, message, buttons): (
+            vellmark_render::RgbaColor,
+            u8,
+            String,
+            Vec<(&str, UiAction, vellmark_render::RgbaColor, vellmark_render::RgbaColor, vellmark_render::RgbaColor)>,
+        ) = match kind {
+            DocBannerKind::Conflict { theirs_updated } => (
+                chrome.danger,
+                26,
+                if *theirs_updated {
+                    "External conflict (disk changed again) — compare Diff or choose Merge / Keep Mine / Use Disk"
+                        .to_string()
+                } else {
+                    "External file conflict detected — local buffer differs from file on disk"
+                        .to_string()
+                },
+                vec![
+                    ("Save As...", UiAction::SaveAsActive, chrome.panel_bg, chrome.border, chrome.text),
+                    ("Use Disk", UiAction::ResolveConflictUseTheirs, chrome.panel_bg, chrome.border, chrome.text),
+                    ("Keep Mine", UiAction::ResolveConflictKeepMine, chrome.danger.with_alpha(38), chrome.danger, chrome.text),
+                    ("Auto Merge", UiAction::ResolveConflictAutoMerge, chrome.accent.with_alpha(38), chrome.accent, chrome.text),
+                    (
+                        diff_label,
+                        UiAction::ToggleConflictDiff,
+                        if self.conflict_diff_open { chrome.accent.with_alpha(55) } else { chrome.panel_bg },
+                        if self.conflict_diff_open { chrome.accent } else { chrome.border },
+                        chrome.text,
+                    ),
+                ],
+            ),
+            DocBannerKind::Missing {
+                has_local_edits,
+                write_error,
+            } => (
+                chrome.danger,
+                24,
+                if let Some(err) = write_error {
+                    format!("File missing on disk ({err}) — Re-save, Save As..., or Close Tab")
+                } else if *has_local_edits {
+                    "File deleted or moved externally (unsaved local edits kept)".to_string()
+                } else {
+                    "File deleted or moved externally".to_string()
+                },
+                vec![
+                    ("Close Tab", UiAction::ForceCloseActiveMissing, chrome.panel_bg, chrome.border, chrome.text),
+                    ("Save As...", UiAction::SaveAsActive, chrome.panel_bg, chrome.border, chrome.text),
+                    ("Re-save", UiAction::ResaveMissingFile, chrome.danger.with_alpha(38), chrome.danger, chrome.text),
+                ],
+            ),
+            DocBannerKind::WriteError { error } => (
+                chrome.danger,
+                24,
+                format!("Auto-save write failed: {error}"),
+                vec![
+                    ("Save As...", UiAction::SaveAsActive, chrome.panel_bg, chrome.border, chrome.text),
+                    ("Retry", UiAction::RetrySaveActive, chrome.danger.with_alpha(38), chrome.danger, chrome.text),
+                ],
+            ),
+            DocBannerKind::RecoveryDegraded => (
+                chrome.warning,
+                24,
+                RECOVERY_DEGRADED_NOTICE.to_string(),
+                vec![
+                    ("Save As...", UiAction::SaveAsActive, chrome.panel_bg, chrome.border, chrome.text),
+                    ("Save Now", UiAction::SaveActiveNow, chrome.warning.with_alpha(38), chrome.warning, chrome.text),
+                ],
+            ),
+            DocBannerKind::ConflictBackupCleanup { count } => (
+                chrome.warning,
+                18,
+                format!("{count} conflict backup copy(s) stored in history for this file"),
+                vec![
+                    ("×", UiAction::DismissConflictBackupNotice, chrome.panel_bg, chrome.border, chrome.muted_text),
+                    ("Clean Backups", UiAction::ClearConflictBackups, chrome.warning.with_alpha(34), chrome.warning, chrome.text),
+                ],
+            ),
+        };
+
+        dl.rects.push(SceneRect::solid(banner, chrome.panel_bg));
+        dl.rects
+            .push(SceneRect::solid(banner, accent.with_alpha(tint_alpha)));
+        dl.rects.push(SceneRect::solid(
+            Rect::new(banner.x, banner.y, 4.0, banner.h),
+            accent,
+        ));
+        dl.rects.push(SceneRect::solid(
+            Rect::new(banner.x, banner.y + banner.h - 1.0, banner.w, 1.0),
+            chrome.border,
+        ));
+
+        let btn_h = (banner.h - 12.0).clamp(20.0, 24.0);
+        let btn_y = banner.y + (banner.h - btn_h) * 0.5;
+        let mut right_edge = banner.x + banner.w - 10.0;
+        for (label, action, bg, border, fg) in buttons {
+            right_edge = self.push_action_button(
+                dl,
+                right_edge,
+                btn_y,
+                btn_h,
+                label,
+                bg,
+                border,
+                fg,
+                action,
+                banner,
+            );
+        }
+
+        let text_max_w = (right_edge - (banner.x + 14.0)).max(40.0);
+        self.push_ui_text(
+            dl,
+            &message,
+            banner.x + 12.0,
+            banner.y + ((banner.h - 15.0) * 0.5).max(3.0),
+            11.5,
+            600,
+            chrome.text,
+            Some(text_max_w),
+            Some(banner),
+        );
+    }
+
+    fn build_conflict_diff_panel(&mut self, dl: &mut DrawList, diff_rect: Rect) {
+        let chrome = self.style.chrome;
+        dl.rects.push(SceneRect::solid(diff_rect, chrome.tab_bar_bg));
+        dl.rects.push(SceneRect::solid(
+            Rect::new(diff_rect.x, diff_rect.y + diff_rect.h - 1.0, diff_rect.w, 1.0),
+            chrome.border,
+        ));
+
+        let header_h = 24.0;
+        dl.rects
+            .push(SceneRect::solid(Rect::new(diff_rect.x, diff_rect.y, diff_rect.w, header_h), chrome.panel_bg));
+        dl.rects.push(SceneRect::solid(
+            Rect::new(diff_rect.x, diff_rect.y + header_h - 1.0, diff_rect.w, 1.0),
+            chrome.border,
+        ));
+        self.push_ui_text(
+            dl,
+            "Conflict Diff (Mine vs Disk)",
+            diff_rect.x + 12.0,
+            diff_rect.y + 4.0,
+            11.5,
+            600,
+            chrome.text,
+            Some((diff_rect.w - 56.0).max(40.0)),
+            Some(diff_rect),
+        );
+        self.push_action_button(
+            dl,
+            diff_rect.x + diff_rect.w - 8.0,
+            diff_rect.y + 2.0,
+            20.0,
+            "×",
+            chrome.panel_bg,
+            chrome.border,
+            chrome.muted_text,
+            UiAction::ToggleConflictDiff,
+            diff_rect,
+        );
+
+        let lines = self
+            .workbench
+            .active_tab()
+            .map(|t| t.session.compute_conflict_diff_lines())
+            .unwrap_or_default();
+
+        let body_y = diff_rect.y + header_h + 4.0;
+        let body_clip = Rect::new(
+            diff_rect.x,
+            diff_rect.y + header_h,
+            diff_rect.w,
+            (diff_rect.h - header_h).max(0.0),
+        );
+        if lines.is_empty() {
+            self.push_ui_text(
+                dl,
+                "No text differences detected between local buffer and disk snapshot.",
+                diff_rect.x + 12.0,
+                body_y,
+                11.5,
+                400,
+                chrome.muted_text,
+                Some((diff_rect.w - 24.0).max(40.0)),
+                Some(body_clip),
+            );
+            return;
+        }
+
+        let line_h = 17.0;
+        let max_lines = ((diff_rect.y + diff_rect.h - body_y - 4.0) / line_h)
+            .floor()
+            .max(0.0) as usize;
+        if max_lines == 0 {
+            return;
+        }
+        let truncated = lines.len() > max_lines && max_lines > 1;
+        let visible_count = if truncated { max_lines - 1 } else { max_lines.min(lines.len()) };
+
+        for (i, line) in lines.iter().take(visible_count).enumerate() {
+            let y = body_y + i as f32 * line_h;
+            let (fg, bg_opt, weight) = match line.kind {
+                ConflictDiffKind::SectionHeader => (chrome.accent, Some(chrome.accent.with_alpha(18)), 600),
+                ConflictDiffKind::Context => (chrome.muted_text, None, 400),
+                ConflictDiffKind::Mine => (chrome.warning, Some(chrome.warning.with_alpha(24)), 500),
+                ConflictDiffKind::Theirs => (chrome.success, Some(chrome.success.with_alpha(22)), 500),
+            };
+            if let Some(bg) = bg_opt {
+                dl.rects.push(SceneRect::solid(
+                    Rect::new(diff_rect.x + 8.0, y, (diff_rect.w - 16.0).max(20.0), line_h),
+                    bg,
+                ));
+            }
+            self.push_ui_text(
+                dl,
+                &line.text,
+                diff_rect.x + 14.0,
+                y + 1.0,
+                11.5,
+                weight,
+                fg,
+                Some((diff_rect.w - 28.0).max(40.0)),
+                Some(body_clip),
+            );
+        }
+        if truncated {
+            let y = body_y + visible_count as f32 * line_h;
+            let omitted = lines.len() - visible_count;
+            let footer = format!("... ({omitted} more diff lines)");
+            self.push_ui_text(
+                dl,
+                &footer,
+                diff_rect.x + 14.0,
+                y + 1.0,
+                11.0,
+                500,
+                chrome.muted_text,
+                Some((diff_rect.w - 28.0).max(40.0)),
+                Some(body_clip),
+            );
+        }
+    }
+
     fn build_status_bar(&mut self, dl: &mut DrawList, sb: Rect) {
         let chrome = self.style.chrome;
         dl.rects.push(SceneRect::solid(sb, chrome.status_bar_bg));
@@ -1270,9 +1974,14 @@ impl GuiController {
         }
     }
 
-    /// Close guard for window shutdown: flushes recovery snapshots synchronously, blocks first close
-    /// when any tab has unsaved changes, and requires an explicit second unedited confirmation to discard.
+    /// Close guard for window shutdown: auto-saves eligible dirty named files, flushes recovery
+    /// snapshots synchronously, blocks first close when any tab remains unsaved/conflicted/missing,
+    /// archives conflicted/missing unsaved tabs or discards untitled drafts on second confirmation.
     pub fn handle_close_requested(&mut self) -> bool {
+        if !self.close_confirm_armed {
+            let auto_events = self.workbench.flush_all_dirty_auto_saves(Instant::now());
+            let _ = self.apply_runtime_events(auto_events);
+        }
         self.workbench.flush_all_recoveries();
         let first_unsaved = self
             .workbench
@@ -1287,13 +1996,51 @@ impl GuiController {
             self.workbench.active_tab_idx = Some(idx);
             self.close_confirm_armed = true;
             self.find_focused = false;
+            let state = self.workbench.tabs[idx].session.state;
             let title = self.workbench.tabs[idx].title();
-            self.set_notice(format!(
-                "Unsaved changes in '{title}' — Save (Cmd/Ctrl+S) or close again to discard"
-            ));
+            match state {
+                DocState::Conflict => {
+                    self.conflict_diff_open = true;
+                    self.set_notice(format!(
+                        "External conflict in '{title}' — resolve or close again to archive backup & exit"
+                    ));
+                }
+                DocState::Missing {
+                    has_local_edits: true,
+                } => {
+                    self.set_notice(format!(
+                        "Missing file '{title}' has unsaved changes — Save As or close again to backup & exit"
+                    ));
+                }
+                _ => {
+                    self.set_notice(format!(
+                        "Unsaved changes in '{title}' — Save (Cmd/Ctrl+S) or close again to discard"
+                    ));
+                }
+            }
             return false;
         }
-        self.workbench.discard_all_recoveries();
+        for i in 0..self.workbench.tabs.len() {
+            let state = self.workbench.tabs[i].session.state;
+            let title = self.workbench.tabs[i].title();
+            match state {
+                DocState::Conflict
+                | DocState::Missing {
+                    has_local_edits: true,
+                } => {
+                    if let Err(err) = self.workbench.tabs[i].session.archive_unsaved_on_close() {
+                        self.workbench.active_tab_idx = Some(i);
+                        self.set_notice(format!(
+                            "Backup failed for '{title}' ({err}) — please Save As first"
+                        ));
+                        return false;
+                    }
+                }
+                _ => {
+                    self.workbench.tabs[i].session.discard_recovery_snapshot();
+                }
+            }
+        }
         self.workbench.maintain_recovery_storage();
         true
     }
@@ -1336,12 +2083,17 @@ impl GuiController {
             if let Key::Character(ch) = &event.logical_key {
                 let lower = ch.to_ascii_lowercase();
                 match lower.as_str() {
+                    "s" if shift => {
+                        self.save_as_active_tab();
+                        return true;
+                    }
                     "s" => {
                         self.save_active_tab();
                         return true;
                     }
                     "n" => {
                         self.close_confirm_armed = false;
+                        self.flush_active_tab_before_switch();
                         self.workbench.new_document();
                         self.find_focused = false;
                         self.pending_scroll_ensure_caret = true;
@@ -1617,7 +2369,8 @@ impl GuiController {
                 match target {
                     EditorHitTarget::Text(offset) => {
                         if let Some(tab) = self.workbench.active_tab_mut() {
-                            let _ = tab.edit(|ctx| ctx.set_caret(offset));
+                            let safe_offset = tab.session.buffer.snap_out_of_crlf(offset);
+                            let _ = tab.edit(|ctx| ctx.set_caret(safe_offset));
                             self.dragging_selection = true;
                         }
                         return true;
@@ -1643,8 +2396,9 @@ impl GuiController {
         if self.dragging_selection {
             if let Some(EditorHitTarget::Text(offset)) = self.shaper.hit_test(x, y) {
                 if let Some(tab) = self.workbench.active_tab_mut() {
-                    let anchor = tab.view.selection.anchor;
-                    let _ = tab.edit(|ctx| ctx.set_selection(anchor, offset));
+                    let anchor = tab.session.buffer.snap_out_of_crlf(tab.view.selection.anchor);
+                    let safe_offset = tab.session.buffer.snap_out_of_crlf(offset);
+                    let _ = tab.edit(|ctx| ctx.set_selection(anchor, safe_offset));
                     changed = true;
                 }
             }
@@ -1692,6 +2446,9 @@ impl GuiController {
         match action {
             UiAction::SelectTab(idx) => {
                 if idx < self.workbench.tabs.len() {
+                    if self.workbench.active_tab_idx != Some(idx) {
+                        self.flush_active_tab_before_switch();
+                    }
                     self.workbench.active_tab_idx = Some(idx);
                     self.find_focused = false;
                     self.preferred_caret_x = None;
@@ -1703,6 +2460,7 @@ impl GuiController {
                 true
             }
             UiAction::NewTab => {
+                self.flush_active_tab_before_switch();
                 self.workbench.new_document();
                 self.find_focused = false;
                 true
@@ -1747,6 +2505,7 @@ impl GuiController {
                         self.collapsed_dirs.insert(path);
                     }
                 } else {
+                    self.flush_active_tab_before_switch();
                     match self.workbench.open_document(&path) {
                         Ok(_) => self.find_focused = false,
                         Err(e) => self.set_notice(format!("Open failed: {e}")),
@@ -1782,6 +2541,70 @@ impl GuiController {
                 self.find_focused = true;
                 true
             }
+            UiAction::ToggleConflictDiff => {
+                self.conflict_diff_open = !self.conflict_diff_open;
+                true
+            }
+            UiAction::ResolveConflictKeepMine => {
+                self.resolve_active_conflict_keep_mine();
+                true
+            }
+            UiAction::ResolveConflictUseTheirs => {
+                self.resolve_active_conflict_use_theirs();
+                true
+            }
+            UiAction::ResolveConflictAutoMerge => {
+                self.resolve_active_conflict_auto_merge();
+                true
+            }
+            UiAction::SaveAsActive => {
+                self.save_as_active_tab();
+                true
+            }
+            UiAction::ResaveMissingFile | UiAction::RetrySaveActive | UiAction::SaveActiveNow => {
+                self.save_active_tab();
+                true
+            }
+            UiAction::ForceCloseActiveMissing => {
+                if let Some(id) = self.workbench.active_tab().map(|t| t.id) {
+                    match self.workbench.try_close_tab(id, true) {
+                        Ok(true) => {
+                            if self.ime_target == ImeTarget::Tab(id) {
+                                self.ime_target = ImeTarget::None;
+                            }
+                            self.conflict_diff_open = false;
+                            self.trigger_background_maintenance(true);
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            self.set_notice(format!("Cannot close tab: {e} — please Save As first"));
+                        }
+                    }
+                }
+                true
+            }
+            UiAction::ClearConflictBackups => {
+                let path_opt = self
+                    .workbench
+                    .active_tab()
+                    .and_then(|t| t.session.path.clone());
+                let removed = self
+                    .workbench
+                    .clear_conflict_backups_for_path(path_opt.as_deref());
+                if removed > 0 {
+                    self.trigger_background_maintenance(true);
+                    self.set_notice(format!("Removed {removed} conflict backup copy(s)"));
+                } else {
+                    self.set_notice("No conflict backup copies found to clean");
+                }
+                true
+            }
+            UiAction::DismissConflictBackupNotice => {
+                if let Some(tab) = self.workbench.active_tab_mut() {
+                    tab.conflict_backup_notice_dismissed = true;
+                }
+                true
+            }
         }
     }
 
@@ -1802,52 +2625,304 @@ impl GuiController {
             if self.ime_target == ImeTarget::Tab(id) {
                 self.ime_target = ImeTarget::None;
             }
+            self.conflict_diff_open = false;
             self.trigger_background_maintenance(true);
         } else {
             self.set_notice(unsaved_msg);
         }
     }
 
-    fn save_active_tab(&mut self) {
+    fn handle_conflict_action_outcome(
+        &mut self,
+        tab_id: u64,
+        outcome: ConflictActionOutcome,
+        resolved_msg: &str,
+    ) {
+        match outcome {
+            ConflictActionOutcome::ResolvedClean | ConflictActionOutcome::ResolvedDirty => {
+                self.conflict_diff_open = false;
+                self.workbench.refresh_tab_conflict_backup_count(tab_id);
+                self.set_notice(resolved_msg);
+                self.trigger_background_maintenance(true);
+            }
+            ConflictActionOutcome::TransitionedToMissing => {
+                self.conflict_diff_open = false;
+                self.set_notice("Disk file missing — choose Re-save, Save As..., or Close Tab");
+            }
+            ConflictActionOutcome::AbortedStillConflict(msg) => {
+                self.conflict_diff_open = true;
+                self.set_notice(format!("Conflict not resolved: {msg}"));
+            }
+        }
+    }
+
+    fn resolve_active_conflict_keep_mine(&mut self) {
         self.close_confirm_armed = false;
-        let untitled_dir = self
-            .untitled_save_dir
-            .clone()
-            .unwrap_or_else(std::env::temp_dir);
         let Some(tab) = self.workbench.active_tab_mut() else {
             return;
         };
-        if tab.session.path.is_none() {
-            let reserved = match reserve_unique_untitled_path(&untitled_dir, tab.id) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.set_notice(format!("Save error: {e}"));
-                    return;
+        let tab_id = tab.id;
+        let outcome = tab.resolve_conflict_keep_mine();
+        self.handle_conflict_action_outcome(
+            tab_id,
+            outcome,
+            "Kept local edits and saved (disk backup created)",
+        );
+    }
+
+    fn resolve_active_conflict_use_theirs(&mut self) {
+        self.close_confirm_armed = false;
+        let Some(tab) = self.workbench.active_tab_mut() else {
+            return;
+        };
+        let tab_id = tab.id;
+        let rev = tab.session.buffer.revision();
+        let outcome = tab.resolve_conflict_use_theirs(rev);
+        self.handle_conflict_action_outcome(
+            tab_id,
+            outcome,
+            "Loaded disk version into editor (Undo with Cmd/Ctrl+Z)",
+        );
+    }
+
+    fn resolve_active_conflict_auto_merge(&mut self) {
+        self.close_confirm_armed = false;
+        let Some(tab) = self.workbench.active_tab_mut() else {
+            return;
+        };
+        let tab_id = tab.id;
+        let rev = tab.session.buffer.revision();
+        let outcome = tab.resolve_conflict_auto_merge(rev);
+        match outcome {
+            AutoMergeOutcome::MergedClean | AutoMergeOutcome::MergedDirty { .. } => {
+                self.conflict_diff_open = false;
+                self.workbench.refresh_tab_conflict_backup_count(tab_id);
+                self.set_notice("Auto-merged non-overlapping changes (Undo with Cmd/Ctrl+Z)");
+                self.trigger_background_maintenance(true);
+            }
+            AutoMergeOutcome::HasOverlappingConflicts { conflicting_hunks } => {
+                self.conflict_diff_open = true;
+                self.set_notice(format!(
+                    "Auto Merge found {} overlapping hunk(s) — inspect Diff or choose Keep Mine / Use Disk",
+                    conflicting_hunks.len()
+                ));
+            }
+            AutoMergeOutcome::TransitionedToMissing => {
+                self.conflict_diff_open = false;
+                self.set_notice("Disk file missing — choose Re-save, Save As..., or Close Tab");
+            }
+            AutoMergeOutcome::AbortedStillConflict(msg) => {
+                self.conflict_diff_open = true;
+                self.set_notice(format!("Auto Merge blocked: {msg}"));
+            }
+        }
+    }
+
+    fn finish_save_as(
+        &mut self,
+        tab_id: u64,
+        dest: &Path,
+        outcome: SaveOutcome,
+        remove_reserved_on_failure: bool,
+        notice_with_path: bool,
+    ) {
+        match outcome {
+            SaveOutcome::SavedClean | SaveOutcome::SavedButStillDirty { .. } => {
+                self.conflict_diff_open = false;
+                self.workbench.recent_files.record_open(dest);
+                self.workbench.refresh_tab_conflict_backup_count(tab_id);
+                if notice_with_path {
+                    self.set_notice(format!("Saved {}", dest.display()));
+                } else {
+                    self.set_notice(format!("Saved as {}", dest.display()));
                 }
+                self.trigger_background_maintenance(true);
+            }
+            SaveOutcome::EnteredConflict => {
+                if remove_reserved_on_failure {
+                    let _ = fs::remove_file(dest);
+                }
+                self.conflict_diff_open = true;
+                self.set_notice(
+                    "Conflict at target file — choose Diff, Auto Merge, Keep Mine, or Use Disk",
+                );
+            }
+            SaveOutcome::WriteFailed(e) => {
+                if remove_reserved_on_failure {
+                    let _ = fs::remove_file(dest);
+                }
+                self.set_notice(format!("Save error: {e}"));
+            }
+        }
+    }
+
+    fn save_as_active_tab(&mut self) {
+        self.close_confirm_armed = false;
+        let Some((tab_id, current_path, default_name)) = self.workbench.active_tab().map(|t| {
+            let default_name = t
+                .session
+                .path
+                .as_deref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "Untitled.md".to_string());
+            (t.id, t.session.path.clone(), default_name)
+        }) else {
+            return;
+        };
+        let Some(dest) = self
+            .save_dialog
+            .pick_save_as_path(current_path.as_deref(), &default_name)
+        else {
+            self.set_notice("Save As cancelled");
+            return;
+        };
+        let outcome = match self.workbench.save_tab_as(tab_id, &dest) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.set_notice(err);
+                return;
+            }
+        };
+        self.finish_save_as(tab_id, &dest, outcome, false, false);
+    }
+
+    fn save_active_tab(&mut self) {
+        self.close_confirm_armed = false;
+        let untitled_dir = self.untitled_save_dir.clone();
+        let Some((tab_id, state, is_untitled)) = self
+            .workbench
+            .active_tab()
+            .map(|t| (t.id, t.session.state, t.session.path.is_none()))
+        else {
+            return;
+        };
+
+        // PRD 4.5.1 C: `Conflict` Cmd/Ctrl+S opens conflict options instead of overwriting disk.
+        if state == DocState::Conflict {
+            let first = match self.workbench.tabs.iter_mut().find(|t| t.id == tab_id) {
+                Some(tab) => tab.sync_from_disk(true),
+                None => return,
             };
-            match tab.save_as(&reserved) {
-                SaveOutcome::SavedClean | SaveOutcome::SavedButStillDirty { .. } => {
-                    self.set_notice(format!("Saved {}", reserved.display()));
+            let sync = if let ExternalSyncResult::Renamed { old_path, new_path } = first {
+                if let Some((_, _, other_title)) =
+                    self.workbench.find_other_tab_with_path(tab_id, &new_path)
+                {
+                    self.set_notice(format!(
+                        "Conflict rename target already open in '{other_title}' — keeping current path"
+                    ));
+                    if let Some(cur) = self.workbench.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        cur.session.path = Some(old_path);
+                        cur.session.on_external_deleted();
+                    }
+                    ExternalSyncResult::BecameMissing
+                } else {
+                    self.workbench.recent_files.record_open(&new_path);
+                    self.workbench.refresh_tab_conflict_backup_count(tab_id);
+                    match self.workbench.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        Some(cur) => cur.sync_from_disk(true),
+                        None => return,
+                    }
+                }
+            } else {
+                first
+            };
+            let new_state = self
+                .workbench
+                .tabs
+                .iter()
+                .find(|t| t.id == tab_id)
+                .map(|t| t.session.state);
+            match (sync, new_state) {
+                (ExternalSyncResult::BecameMissing, _) => {
+                    self.conflict_diff_open = false;
+                    self.set_notice(
+                        "File deleted or moved externally — choose Re-save, Save As..., or Close Tab",
+                    );
+                }
+                (ExternalSyncResult::ReloadedClean, _)
+                | (ExternalSyncResult::ReappearedClean { .. }, _) => {
+                    self.conflict_diff_open = false;
+                    self.set_notice("Disk content already matches local buffer (Clean)");
                     self.trigger_background_maintenance(true);
                 }
-                SaveOutcome::EnteredConflict => {
-                    let _ = fs::remove_file(&reserved);
-                    self.set_notice("Conflict detected!");
+                (ExternalSyncResult::ConflictTheirsUpdated, _) => {
+                    self.conflict_diff_open = true;
+                    self.set_notice(
+                        "Disk file changed again — conflict diff updated; choose an action",
+                    );
                 }
-                SaveOutcome::WriteFailed(e) => {
-                    let _ = fs::remove_file(&reserved);
-                    self.set_notice(format!("Save error: {e}"));
+                (ExternalSyncResult::ReadError(e), _) => {
+                    self.conflict_diff_open = true;
+                    self.set_notice(format!("Read error while re-checking conflict: {e}"));
+                }
+                (_, Some(DocState::Conflict)) => {
+                    self.conflict_diff_open = true;
+                    self.set_notice(
+                        "Conflict active — choose Diff, Auto Merge, Keep Mine, Use Disk, or Save As...",
+                    );
+                }
+                (_, Some(DocState::Clean)) => {
+                    self.conflict_diff_open = false;
+                    self.set_notice("Disk content matches local buffer (Clean)");
+                    self.trigger_background_maintenance(true);
+                }
+                _ => {
+                    self.conflict_diff_open = true;
+                    self.set_notice("Conflict active — choose resolution option");
                 }
             }
             return;
         }
-        match tab.save() {
+
+        if is_untitled {
+            if let Some(dir) = untitled_dir {
+                let reserved = match reserve_unique_untitled_path(&dir, tab_id) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.set_notice(format!("Save error: {e}"));
+                        return;
+                    }
+                };
+                let outcome = match self.workbench.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    Some(tab) => tab.save_as(&reserved),
+                    None => return,
+                };
+                self.finish_save_as(tab_id, &reserved, outcome, true, true);
+                return;
+            }
+            if let Some(dest) = self.save_dialog.pick_save_as_path(None, "Untitled.md") {
+                let outcome = match self.workbench.save_tab_as(tab_id, &dest) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        self.set_notice(err);
+                        return;
+                    }
+                };
+                self.finish_save_as(tab_id, &dest, outcome, false, true);
+            } else {
+                self.set_notice("Save cancelled — use Save As to pick a location");
+            }
+            return;
+        }
+
+        let outcome = match self.workbench.tabs.iter_mut().find(|t| t.id == tab_id) {
+            Some(tab) => tab.save(),
+            None => return,
+        };
+        match outcome {
             SaveOutcome::SavedClean | SaveOutcome::SavedButStillDirty { .. } => {
+                self.conflict_diff_open = false;
+                self.workbench.refresh_tab_conflict_backup_count(tab_id);
                 self.set_notice("Saved");
                 self.trigger_background_maintenance(true);
             }
             SaveOutcome::EnteredConflict => {
-                self.set_notice("External modification conflict detected!");
+                self.conflict_diff_open = true;
+                self.set_notice(
+                    "External modification conflict detected — choose Diff, Auto Merge, Keep Mine, Use Disk, or Save As...",
+                );
             }
             SaveOutcome::WriteFailed(e) => {
                 self.set_notice(format!("Save error: {e}"));
@@ -1883,15 +2958,25 @@ impl GuiController {
                 if head >= total {
                     return;
                 }
-                let rope = ctx.buffer.rope();
-                let ch_idx = rope.byte_to_char(head.min(total));
-                let next = if ch_idx < rope.len_chars() {
-                    rope.char_to_byte(ch_idx + 1)
-                } else {
-                    total
+                let (start, next) = {
+                    let rope = ctx.buffer.rope();
+                    let ch_idx = rope.byte_to_char(head.min(total));
+                    let aligned = rope.char_to_byte(ch_idx);
+                    if ctx.buffer.is_crlf_midpoint(aligned) {
+                        (aligned - 1, aligned + 1)
+                    } else if ctx.buffer.is_crlf_midpoint(aligned + 1) {
+                        (aligned, aligned + 2)
+                    } else {
+                        let next_byte = if ch_idx < rope.len_chars() {
+                            rope.char_to_byte(ch_idx + 1)
+                        } else {
+                            total
+                        };
+                        (aligned, next_byte)
+                    }
                 };
-                if next > head {
-                    ctx.set_selection(head, next);
+                if next > start {
+                    ctx.set_selection(start, next);
                     ctx.backspace();
                 }
             });
@@ -1914,15 +2999,27 @@ impl GuiController {
                 let clamped = sel.head.min(total);
                 let ch_idx = rope.byte_to_char(clamped);
                 if dir < 0 {
-                    if ch_idx > 0 && rope.char_to_byte(ch_idx) == clamped {
+                    let prev = if ch_idx > 0 && rope.char_to_byte(ch_idx) == clamped {
                         rope.char_to_byte(ch_idx - 1)
                     } else {
                         rope.char_to_byte(ch_idx)
+                    };
+                    if tab.session.buffer.is_crlf_midpoint(prev) {
+                        prev - 1
+                    } else {
+                        prev
                     }
-                } else if ch_idx < rope.len_chars() {
-                    rope.char_to_byte(ch_idx + 1)
                 } else {
-                    total
+                    let next = if ch_idx < rope.len_chars() {
+                        rope.char_to_byte(ch_idx + 1)
+                    } else {
+                        total
+                    };
+                    if tab.session.buffer.is_crlf_midpoint(next) {
+                        next + 1
+                    } else {
+                        next
+                    }
                 }
             };
             let _ = tab.edit(|ctx| {
@@ -1955,6 +3052,7 @@ impl GuiController {
                 }
             });
             let _ = tab.edit(|ctx| {
+                let target = ctx.buffer.snap_out_of_crlf(target);
                 if extend {
                     ctx.set_selection(sel.anchor, target);
                 } else {
@@ -1989,6 +3087,7 @@ impl GuiController {
             });
             self.preferred_caret_x = next_pref;
             let _ = tab.edit(|ctx| {
+                let next_pos = ctx.buffer.snap_out_of_crlf(next_pos);
                 if extend {
                     ctx.set_selection(sel.anchor, next_pos);
                 } else {
@@ -2323,6 +3422,7 @@ impl ApplicationHandler for VellmarkApp {
                 let res = if path.is_dir() {
                     self.controller.workbench.open_folder(&path).map(|_| ())
                 } else {
+                    self.controller.flush_active_tab_before_switch();
                     self.controller
                         .workbench
                         .open_document(&path)
@@ -2334,12 +3434,16 @@ impl ApplicationHandler for VellmarkApp {
                 }
                 self.request_redraw();
             }
+            WindowEvent::Focused(false) => {
+                if self.controller.handle_focus_lost() {
+                    self.request_redraw();
+                }
+            }
             WindowEvent::Focused(true) => {
                 if let Some(win) = &self.window {
                     win.set_ime_allowed(true);
                 }
-                self.controller.trigger_background_maintenance(false);
-                self.controller.reset_blink();
+                self.controller.handle_focus_gained();
                 self.request_redraw();
             }
             WindowEvent::RedrawRequested => {
@@ -2355,10 +3459,13 @@ impl ApplicationHandler for VellmarkApp {
         }
         self.controller.workbench.maybe_maintain_recovery_storage_async();
         let now = Instant::now();
+        if self.controller.tick_runtime_at(now) {
+            self.request_redraw();
+        }
         if self.controller.tick_blink(now) {
             self.request_redraw();
         }
-        let next_wake = self.controller.last_caret_blink + BLINK_INTERVAL;
+        let next_wake = self.controller.next_wake_deadline();
         event_loop.set_control_flow(ControlFlow::WaitUntil(next_wake));
     }
 }
@@ -2997,6 +4104,462 @@ mod tests {
             .active_status_notice()
             .as_deref()
             .is_some_and(|n| n.contains(PROTECTED_SNAPSHOT_LIMIT_NOTICE)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn click_hit_action(gui: &mut GuiController, predicate: impl Fn(&UiAction) -> bool) -> bool {
+        let _ = gui.build_frame();
+        let Some(zone) = gui
+            .ui_hit_zones
+            .iter()
+            .rev()
+            .find(|z| predicate(&z.action))
+            .cloned()
+        else {
+            return false;
+        };
+        gui.handle_pointer_down(
+            zone.rect.x + zone.rect.w * 0.5,
+            zone.rect.y + zone.rect.h * 0.5,
+        )
+    }
+
+    #[test]
+    fn test_conflict_banner_diff_automerge_keepmine_usedisk_saveas_and_cmd_s_behavior() {
+        let dir = std::env::temp_dir().join(format!(
+            "vellmark-gui-conflict-actions-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rec_root = dir.join("rec");
+        let doc = dir.join("note.md");
+        let save_as_doc = dir.join("note-copy.md");
+        fs::create_dir_all(&rec_root).unwrap();
+        fs::write(&doc, "line1\nline2\nline3\n").unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root));
+        wb.open_document(&doc).unwrap();
+        let mut gui = GuiController::with_clipboard(wb, Box::new(MemoryClipboard::default()));
+        gui.window_size = (1100.0, 720.0);
+
+        // Local edit on line 1; external disk edit on line 3 (disjoint -> Auto Merge succeeds)
+        {
+            let tab = gui.workbench.active_tab_mut().unwrap();
+            tab.edit(|ctx| {
+                ctx.set_selection(0, 5);
+                ctx.insert_text("mine1");
+            })
+            .unwrap();
+        }
+        fs::write(&doc, "line1\nline2\ndisk3\n").unwrap();
+        assert!(gui.handle_focus_gained());
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.state,
+            DocState::Conflict
+        );
+
+        // Cmd/Ctrl+S under Conflict opens diff options without overwriting disk
+        gui.save_active_tab();
+        assert!(gui.conflict_diff_open);
+        assert_eq!(fs::read_to_string(&doc).unwrap(), "line1\nline2\ndisk3\n");
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.state,
+            DocState::Conflict
+        );
+
+        // Toggle Diff off via banner button, then back on
+        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ToggleConflictDiff)));
+        assert!(!gui.conflict_diff_open);
+        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ToggleConflictDiff)));
+        assert!(gui.conflict_diff_open);
+
+        // Click Auto Merge -> resolves disjoint changes, exits Conflict, leaves merged content
+        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ResolveConflictAutoMerge)));
+        assert!(!gui.conflict_diff_open);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.state,
+            DocState::Dirty
+        );
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "mine1\nline2\ndisk3\n"
+        );
+        gui.save_active_tab();
+        assert_eq!(fs::read_to_string(&doc).unwrap(), "mine1\nline2\ndisk3\n");
+
+        // Overlapping conflict -> Auto Merge opens Diff & remains Conflict, Use Disk loads disk cleanly (undoable)
+        {
+            let tab = gui.workbench.active_tab_mut().unwrap();
+            tab.edit(|ctx| {
+                ctx.set_selection(6, 11);
+                ctx.insert_text("local2");
+            })
+            .unwrap();
+        }
+        fs::write(&doc, "mine1\ndisk2\ndisk3\n").unwrap();
+        assert!(gui.handle_focus_gained());
+        gui.conflict_diff_open = false;
+        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ResolveConflictAutoMerge)));
+        assert!(gui.conflict_diff_open);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.state,
+            DocState::Conflict
+        );
+        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ResolveConflictUseTheirs)));
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.state,
+            DocState::Clean
+        );
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "mine1\ndisk2\ndisk3\n"
+        );
+
+        // New conflict -> Keep Mine creates backup & surfaces Clean Backups banner button
+        {
+            let tab = gui.workbench.active_tab_mut().unwrap();
+            tab.edit(|ctx| ctx.insert_text("top\n")).unwrap();
+        }
+        fs::write(&doc, "external-v2\n").unwrap();
+        assert!(gui.handle_focus_gained());
+        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ResolveConflictKeepMine)));
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.state,
+            DocState::Clean
+        );
+        // Auto Merge, Use Disk, and Keep Mine each left a safety backup for `doc`
+        assert!(
+            gui.workbench.active_tab().unwrap().conflict_backup_count >= 1,
+            "expected at least 1 conflict backup after resolutions"
+        );
+        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ClearConflictBackups)));
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().conflict_backup_count,
+            0
+        );
+
+        // Create another conflict so Save As... hit zone is rendered on the banner, then resolve via MemorySaveDialog
+        {
+            let tab = gui.workbench.active_tab_mut().unwrap();
+            tab.edit(|ctx| ctx.insert_text("local-copy-")).unwrap();
+        }
+        fs::write(&doc, "external-v3\n").unwrap();
+        assert!(gui.handle_focus_gained());
+        gui.set_save_dialog(Box::new(MemorySaveDialog::new(Some(save_as_doc.clone()))));
+        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::SaveAsActive)));
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.path.as_deref(),
+            Some(save_as_doc.as_path())
+        );
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.state,
+            DocState::Clean
+        );
+        assert!(fs::read_to_string(&save_as_doc)
+            .unwrap()
+            .contains("local-copy-"));
+
+        // Tab switch immediately flushes named Dirty document
+        gui.workbench.new_document();
+        let dirty_idx = 0usize;
+        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::SelectTab(i) if *i == dirty_idx)));
+        {
+            let tab = gui.workbench.active_tab_mut().unwrap();
+            tab.edit(|ctx| {
+                ctx.set_selection(0, 0);
+                ctx.insert_text("tab-switch-");
+            })
+            .unwrap();
+        }
+        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::SelectTab(1))));
+        assert!(fs::read_to_string(&save_as_doc)
+            .unwrap()
+            .starts_with("tab-switch-"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_missing_banner_resave_and_close_and_write_error_banner_and_focus_lost() {
+        let dir = std::env::temp_dir().join(format!(
+            "vellmark-gui-missing-writeerr-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rec_root = dir.join("rec");
+        let doc = dir.join("target.md");
+        fs::create_dir_all(&rec_root).unwrap();
+        fs::write(&doc, "start\n").unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root));
+        wb.open_document(&doc).unwrap();
+        let mut gui = GuiController::with_clipboard(wb, Box::new(MemoryClipboard::default()));
+        gui.window_size = (1000.0, 700.0);
+
+        // Focus loss immediately flushes named Dirty document
+        {
+            let tab = gui.workbench.active_tab_mut().unwrap();
+            tab.edit(|ctx| ctx.insert_text("focus-")).unwrap();
+        }
+        assert!(gui.handle_focus_lost());
+        assert_eq!(fs::read_to_string(&doc).unwrap(), "focus-start\n");
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.state,
+            DocState::Clean
+        );
+
+        // Simulated write failure shows WriteError banner with Retry button
+        {
+            let tab = gui.workbench.active_tab_mut().unwrap();
+            tab.edit(|ctx| ctx.insert_text("retry-")).unwrap();
+            tab.last_write_error = Some("Simulated EIO".to_string());
+        }
+        assert!(matches!(
+            gui.active_doc_banner_kind(),
+            Some(DocBannerKind::WriteError { .. })
+        ));
+        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::RetrySaveActive)));
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.state,
+            DocState::Clean
+        );
+        assert!(gui.workbench.active_tab().unwrap().last_write_error.is_none());
+        assert_eq!(fs::read_to_string(&doc).unwrap(), "focus-retry-start\n");
+
+        // Deleting file triggers Missing banner; Re-save recreates original file; Close Tab removes it
+        fs::remove_file(&doc).unwrap();
+        assert!(gui.handle_focus_gained());
+        assert!(matches!(
+            gui.active_doc_banner_kind(),
+            Some(DocBannerKind::Missing { .. })
+        ));
+        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ResaveMissingFile)));
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.state,
+            DocState::Clean
+        );
+        assert!(doc.exists());
+
+        fs::remove_file(&doc).unwrap();
+        assert!(gui.handle_focus_gained());
+        let deleted_id = gui.workbench.active_tab().unwrap().id;
+        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ForceCloseActiveMissing)));
+        assert!(!gui.workbench.tabs.iter().any(|t| t.id == deleted_id));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_save_as_refuses_path_already_open_in_another_tab() {
+        let dir = std::env::temp_dir().join(format!(
+            "vellmark-gui-saveas-dup-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rec_root = dir.join("rec");
+        let doc_a = dir.join("a.md");
+        let doc_b = dir.join("b.md");
+        fs::create_dir_all(&rec_root).unwrap();
+        fs::write(&doc_a, "content A\n").unwrap();
+        fs::write(&doc_b, "content B\n").unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root));
+        wb.open_document(&doc_a).unwrap();
+        wb.open_document(&doc_b).unwrap();
+        wb.active_tab_idx = Some(0);
+
+        let mut gui = GuiController::with_clipboard(wb, Box::new(MemoryClipboard::default()));
+        {
+            let tab = gui.workbench.active_tab_mut().unwrap();
+            tab.edit(|ctx| ctx.insert_text("edited-")).unwrap();
+        }
+        gui.set_save_dialog(Box::new(MemorySaveDialog::new(Some(doc_b.clone()))));
+        gui.save_as_active_tab();
+
+        // Tab 0 remains bound to doc_a, doc_b on disk stays intact, no duplicate tab paths exist
+        assert_eq!(gui.workbench.tabs.len(), 2);
+        assert_eq!(
+            gui.workbench.tabs[0].session.path.as_deref(),
+            Some(doc_a.as_path())
+        );
+        assert_eq!(
+            gui.workbench.tabs[1].session.path.as_deref(),
+            Some(doc_b.as_path())
+        );
+        assert_eq!(fs::read_to_string(&doc_b).unwrap(), "content B\n");
+        assert!(gui
+            .status_notice
+            .as_ref()
+            .is_some_and(|(msg, _)| msg.contains("already open")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_dialog_stdout_path_preserves_trailing_spaces_cr_and_existing_ancestor_dir() {
+        assert_eq!(
+            parse_dialog_stdout_path(b"/tmp/note .md\n"),
+            Some(PathBuf::from("/tmp/note .md"))
+        );
+        // Must strip ONLY one trailing LF so filenames ending in `\r` (e.g. macOS `Icon\r`)
+        // or `\n` are not rewritten into another filename.
+        assert_eq!(
+            parse_dialog_stdout_path(b"/tmp/Icon\r\n"),
+            Some(PathBuf::from("/tmp/Icon\r"))
+        );
+        assert_eq!(
+            parse_dialog_stdout_path(b"/tmp/trailing-lf\n\n"),
+            Some(PathBuf::from("/tmp/trailing-lf\n"))
+        );
+        assert_eq!(parse_dialog_stdout_path(b"\n"), None);
+        assert_eq!(parse_dialog_stdout_path(b""), None);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = b"/tmp/nonutf8-\xff-name \n";
+            let parsed = parse_dialog_stdout_path(raw).unwrap();
+            assert_eq!(parsed.as_os_str().as_bytes(), b"/tmp/nonutf8-\xff-name ");
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "vellmark-gui-dialog-dir-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let deleted_child = dir.join("missing_subdir").join("file.md");
+        assert_eq!(existing_default_dialog_dir(Some(&deleted_child)), Some(dir.as_path()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_crlf_enter_navigation_delete_and_autosave_preserves_crlf_without_bare_lf() {
+        let dir = std::env::temp_dir().join(format!(
+            "vellmark-gui-crlf-enter-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rec_dir = dir.join("recovery");
+        fs::create_dir_all(&rec_dir).unwrap();
+        let doc = dir.join("win.md");
+        fs::write(&doc, b"# Title\r\n\r\nBody line\r\n").unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_dir));
+        wb.open_document(&doc).unwrap();
+        let mut gui = GuiController::with_clipboard(wb, Box::new(MemoryClipboard::default()));
+
+        let body_start = "# Title\r\n\r\n".len();
+        gui.workbench
+            .active_tab_mut()
+            .unwrap()
+            .edit(|ctx| ctx.set_caret(body_start))
+            .unwrap();
+
+        // Press Enter via GUI editor dispatch
+        gui.dispatch_editor(EditorAction::Enter);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "# Title\r\n\r\n\r\nBody line\r\n"
+        );
+
+        // Wait past the 2s auto-save idle window and drain SaveWorker through GuiController runtime
+        let future = Instant::now() + Duration::from_secs(3);
+        let _ = gui.tick_runtime_at(future);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if gui
+                .workbench
+                .active_tab()
+                .is_some_and(|t| t.session.state == DocState::Clean)
+            {
+                break;
+            }
+            let _ = gui.tick_runtime_at(future);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.state,
+            DocState::Clean
+        );
+        assert!(gui.active_doc_banner_kind().is_none());
+        let saved_bytes = fs::read(&doc).unwrap();
+        assert_eq!(saved_bytes, b"# Title\r\n\r\n\r\nBody line\r\n");
+        let bare_lf = saved_bytes
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(idx, b)| b == b'\n' && (idx == 0 || saved_bytes[idx - 1] != b'\r'))
+            .count();
+        assert_eq!(bare_lf, 0);
+
+        // ArrowRight / ArrowLeft across `\r\n` must skip the 2-byte CRLF pair atomically,
+        // and Delete forward before `\r\n` must delete both `\r` and `\n`.
+        gui.workbench
+            .active_tab_mut()
+            .unwrap()
+            .edit(|ctx| ctx.set_caret("# Title".len()))
+            .unwrap();
+        gui.move_caret_horizontal(1, false);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().view.selection.head,
+            "# Title\r\n".len()
+        );
+        gui.move_caret_horizontal(-1, false);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().view.selection.head,
+            "# Title".len()
+        );
+        gui.delete_forward();
+        let after_del = gui.workbench.active_tab().unwrap().session.buffer.to_string();
+        assert_eq!(after_del, "# Title\r\n\r\nBody line\r\n");
+
+        // Deleting the last `\r\n` in a CRLF file (`A\r\nB`) still preserves `CrLf` on next Enter + auto-save
+        let single_eol = dir.join("single_eol.md");
+        fs::write(&single_eol, b"A\r\nB").unwrap();
+        gui.workbench.open_document(&single_eol).unwrap();
+        gui.workbench
+            .active_tab_mut()
+            .unwrap()
+            .edit(|ctx| ctx.set_caret("A\r\n".len()))
+            .unwrap();
+        gui.dispatch_editor(EditorAction::Backspace);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "AB"
+        );
+        gui.dispatch_editor(EditorAction::Enter);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "A\r\nB"
+        );
+        let future2 = Instant::now() + Duration::from_secs(3);
+        let _ = gui.tick_runtime_at(future2);
+        let dl2 = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < dl2 {
+            if gui
+                .workbench
+                .active_tab()
+                .is_some_and(|t| t.session.state == DocState::Clean)
+            {
+                break;
+            }
+            let _ = gui.tick_runtime_at(future2);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(fs::read(&single_eol).unwrap(), b"A\r\nB");
 
         let _ = fs::remove_dir_all(&dir);
     }

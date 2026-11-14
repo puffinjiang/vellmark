@@ -69,6 +69,15 @@ impl EditorViewState {
         buffer: &'a mut TextBuffer,
         undo: &'a mut UndoHistory,
     ) -> EditorContext<'a> {
+        self.context_with_line_ending(buffer, undo, LineEnding::Lf)
+    }
+
+    pub fn context_with_line_ending<'a>(
+        &'a mut self,
+        buffer: &'a mut TextBuffer,
+        undo: &'a mut UndoHistory,
+        preferred_line_ending: LineEnding,
+    ) -> EditorContext<'a> {
         EditorContext {
             buffer,
             undo,
@@ -77,6 +86,7 @@ impl EditorViewState {
             ime_preedit: &mut self.ime_preedit,
             ime_composition_selection: &mut self.ime_composition_selection,
             expansion_frozen: &mut self.expansion_frozen,
+            preferred_line_ending,
         }
     }
 }
@@ -91,6 +101,7 @@ pub struct EditorContext<'a> {
     pub ime_preedit: &'a mut Option<String>,
     pub ime_composition_selection: &'a mut Option<Selection>,
     pub expansion_frozen: &'a mut bool,
+    pub preferred_line_ending: LineEnding,
 }
 
 /// Stateful standalone editor controller wrapping `TextBuffer`, `Selection`, `UndoHistory`,
@@ -109,6 +120,8 @@ pub struct EditorController {
     pub ime_composition_selection: Option<Selection>,
     /// Tracks whether block expansion is frozen due to active IME composition.
     pub expansion_frozen: bool,
+    /// Remembered document line-ending preference used as fallback when all line breaks are deleted.
+    pub preferred_line_ending: LineEnding,
 }
 
 impl Default for EditorController {
@@ -119,18 +132,14 @@ impl Default for EditorController {
 
 impl EditorController {
     pub fn new() -> Self {
-        Self {
-            buffer: TextBuffer::new(),
-            selection: Selection::caret(0),
-            undo: UndoHistory::new(),
-            mode: ViewMode::Wysiwyg,
-            ime_preedit: None,
-            ime_composition_selection: None,
-            expansion_frozen: false,
-        }
+        Self::with_line_ending("", LineEnding::Lf)
     }
 
     pub fn from_str(text: &str) -> Self {
+        Self::with_line_ending(text, LineEnding::detect_dominant(text))
+    }
+
+    pub fn with_line_ending(text: &str, preferred_line_ending: LineEnding) -> Self {
         Self {
             buffer: TextBuffer::from_str(text),
             selection: Selection::caret(0),
@@ -139,6 +148,7 @@ impl EditorController {
             ime_preedit: None,
             ime_composition_selection: None,
             expansion_frozen: false,
+            preferred_line_ending,
         }
     }
 
@@ -151,6 +161,7 @@ impl EditorController {
             ime_preedit: &mut self.ime_preedit,
             ime_composition_selection: &mut self.ime_composition_selection,
             expansion_frozen: &mut self.expansion_frozen,
+            preferred_line_ending: self.preferred_line_ending,
         }
     }
 
@@ -380,9 +391,24 @@ impl EditorContext<'_> {
         *self.selection = sel_after;
     }
 
+    fn dominant_line_ending(&self) -> &'static str {
+        let full = self.buffer.to_string();
+        LineEnding::detect_dominant_or(&full, self.preferred_line_ending).as_str()
+    }
+
+    /// Snap caret/selection endpoints out of the middle of `\r\n` so user edits never split CRLF.
+    fn normalize_selection_out_of_crlf(&mut self) {
+        let norm_anchor = self.buffer.snap_out_of_crlf(self.selection.anchor);
+        let norm_head = self.buffer.snap_out_of_crlf(self.selection.head);
+        if norm_anchor != self.selection.anchor || norm_head != self.selection.head {
+            *self.selection = Selection::new(norm_anchor, norm_head);
+        }
+    }
+
     /// Insert an arbitrary text snippet (e.g. paste / rich-text conversion / image link) as a single transaction.
     pub fn insert_text(&mut self, text: &str) {
         self.abort_ime_preedit();
+        self.normalize_selection_out_of_crlf();
         if text.is_empty() && self.selection.is_caret() {
             return;
         }
@@ -616,6 +642,24 @@ impl EditorContext<'_> {
     /// Type a character in WYSIWYG/Source mode with automatic syntax trigger recording (PRD 4.1.1 B & G #1, #6).
     pub fn insert_char(&mut self, ch: char) {
         self.abort_ime_preedit();
+        self.normalize_selection_out_of_crlf();
+
+        if ch == '\n' {
+            let nl = self.dominant_line_ending();
+            let range = self.selection.range();
+            let sel_before = *self.selection;
+            let sel_after = Selection::caret(range.start + nl.len());
+            self.undo.apply_edit(
+                self.buffer,
+                range,
+                nl,
+                sel_before,
+                sel_after,
+                EditKind::Typing,
+            );
+            *self.selection = sel_after;
+            return;
+        }
 
         let (line_start_before, _) = self.current_line_bounds();
         let in_code_fence = self.is_offset_inside_fenced_code_block(line_start_before);
@@ -659,7 +703,7 @@ impl EditorContext<'_> {
 
         // P2 fix: Only record WYSIWYG syntax conversion triggers when in `ViewMode::Wysiwyg` AND outside fenced code blocks!
         if *self.mode == ViewMode::Wysiwyg && !in_code_fence {
-            let (line_start, line_end) = self.current_line_bounds();
+            let (line_start, line_end, _) = self.current_line_content_bounds();
             let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
             if ch == ' ' && self.selection.head == line_end {
                 if let Some(rel) = block_line_syntax_escape_offset(&line) {
@@ -692,6 +736,7 @@ impl EditorContext<'_> {
         self.abort_ime_preedit();
 
         if !self.selection.is_caret() {
+            self.normalize_selection_out_of_crlf();
             let r = self.selection.range();
             let sel_before = *self.selection;
             let sel_after = Selection::caret(r.start);
@@ -708,7 +753,7 @@ impl EditorContext<'_> {
         }
 
         let caret = self.selection.head;
-        let (line_start, line_end) = self.current_line_bounds();
+        let (line_start, line_end, _) = self.current_line_content_bounds();
         let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
 
         if *self.mode == ViewMode::Wysiwyg {
@@ -813,13 +858,21 @@ impl EditorContext<'_> {
 
         // Standard character or newline deletion (merges with previous block when at `line_start > 0`)
         if caret > 0 {
-            let full = self.buffer.to_string();
-            let prev_char_len = full[..caret]
-                .chars()
-                .next_back()
-                .map(|c| c.len_utf8())
-                .unwrap_or(1);
-            let del_range = ByteRange::new(caret - prev_char_len, caret);
+            let del_range = if self.buffer.is_crlf_midpoint(caret) {
+                // Caret somehow landed mid-CRLF: delete the entire `\r\n` atomically.
+                ByteRange::new(caret - 1, caret + 1)
+            } else if caret >= 2 && self.buffer.is_crlf_midpoint(caret - 1) {
+                // Treat `\r\n` as a single atomic newline unit so Backspace never leaves orphan `\r`.
+                ByteRange::new(caret - 2, caret)
+            } else {
+                let full = self.buffer.to_string();
+                let prev_char_len = full[..caret]
+                    .chars()
+                    .next_back()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(1);
+                ByteRange::new(caret - prev_char_len, caret)
+            };
             let sel_before = *self.selection;
             let sel_after = Selection::caret(del_range.start);
             self.undo.apply_edit(
@@ -962,15 +1015,17 @@ impl EditorContext<'_> {
     pub fn enter(&mut self) {
         self.abort_ime_preedit();
 
-        // P2 fix: When a non-empty selection exists, Enter replaces the selected range with `\n`.
+        // Replaces non-empty selection with the document's dominant line ending (P2 fix).
+        self.normalize_selection_out_of_crlf();
         if !self.selection.is_caret() {
+            let nl = self.dominant_line_ending();
             let range = self.selection.range();
             let sel_before = *self.selection;
-            let sel_after = Selection::caret(range.start + 1);
+            let sel_after = Selection::caret(range.start + nl.len());
             self.undo.apply_edit(
                 self.buffer,
                 range,
-                "\n",
+                nl,
                 sel_before,
                 sel_after,
                 EditKind::Typing,
@@ -980,8 +1035,10 @@ impl EditorContext<'_> {
         }
 
         let caret = self.selection.head;
-        let (line_start, line_end) = self.current_line_bounds();
-        let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
+        let (line_start, content_end, line_end) = self.current_line_content_bounds();
+        let line = self
+            .buffer
+            .slice_to_string(ByteRange::new(line_start, content_end));
 
         if *self.mode == ViewMode::Wysiwyg {
             let in_code_fence = self.is_offset_inside_fenced_code_block(line_start);
@@ -1009,7 +1066,7 @@ impl EditorContext<'_> {
                             let sel_after = Selection::caret(line_start);
                             self.undo.apply_edit(
                                 self.buffer,
-                                ByteRange::new(line_start, line_end),
+                                ByteRange::new(line_start, content_end),
                                 "",
                                 sel_before,
                                 sel_after,
@@ -1018,10 +1075,11 @@ impl EditorContext<'_> {
                             *self.selection = sel_after;
                         }
                         return;
-                    } else if caret == line_end {
+                    } else if caret == content_end {
                         // Continue list on next line
+                        let nl = self.dominant_line_ending();
                         let prefix = &line[..indent_bytes + marker_bytes];
-                        let insertion = format!("\n{prefix}");
+                        let insertion = format!("{nl}{prefix}");
                         let sel_before = *self.selection;
                         let sel_after = Selection::caret(caret + insertion.len());
                         self.undo.apply_edit(
@@ -1047,7 +1105,7 @@ impl EditorContext<'_> {
                             && !is_table_delimiter_row(&line);
 
                         let full = self.buffer.to_string();
-                        let nl = detect_line_ending_str(&full);
+                        let nl = detect_line_ending_str(&full, self.preferred_line_ending);
                         let insert_pos = table_row_insert_pos(&full, line_start, line_end);
 
                         let (insertion, caret_offset_in_insertion) = if is_standalone_header {
@@ -1084,7 +1142,7 @@ impl EditorContext<'_> {
                         let sel_before = *self.selection;
                         if line[content_start..].trim().is_empty() {
                             let del_range = if strip_rel_range.start == 0 {
-                                ByteRange::new(line_start, line_end)
+                                ByteRange::new(line_start, content_end)
                             } else {
                                 ByteRange::new(
                                     line_start + strip_rel_range.start,
@@ -1102,8 +1160,7 @@ impl EditorContext<'_> {
                             );
                             *self.selection = sel_after;
                         } else {
-                            let full_text = self.buffer.to_string();
-                            let le = LineEnding::detect_dominant(&full_text).as_str();
+                            let le = self.dominant_line_ending();
                             let prefix = &line[..content_start];
                             let continuation = if prefix.ends_with(' ') {
                                 format!("{le}{prefix}")
@@ -1126,17 +1183,19 @@ impl EditorContext<'_> {
                 }
 
                 // PRD 4.1.1 B.1: ``` / ~~~ + Enter inserts companion closing fence in single SyntaxConversion tx
-                if caret == line_end {
+                if caret == content_end {
                     if let Some((fence_ch, fence_len)) = parse_opening_code_fence(&line) {
                         let full_text = self.buffer.to_string();
                         if !has_unpaired_closing_fence_below(
                             &full_text,
-                            line_end,
+                            content_end,
                             fence_ch,
                             fence_len,
                         ) {
                             let indent = line.len() - line.trim_start_matches(' ').len();
-                            let le = LineEnding::detect_dominant(&full_text).as_str();
+                            let le =
+                                LineEnding::detect_dominant_or(&full_text, self.preferred_line_ending)
+                                    .as_str();
                             let closer: String =
                                 std::iter::repeat(fence_ch as char).take(fence_len).collect();
                             let insertion = format!("{le}{le}{closer}");
@@ -1159,8 +1218,7 @@ impl EditorContext<'_> {
 
                     // PRD 4.1.1 B.1: --- / *** / ___ + Enter completes ThematicBreak with escape-undo
                     if let Some(escape_rel) = thematic_break_escape_offset(&line) {
-                        let full_text = self.buffer.to_string();
-                        let le = LineEnding::detect_dominant(&full_text).as_str();
+                        let le = self.dominant_line_ending();
                         let sel_before = *self.selection;
                         let sel_after = Selection::caret(caret + le.len());
                         self.undo.apply_edit(
@@ -1195,14 +1253,15 @@ impl EditorContext<'_> {
 
                 let after_fence = closing_fence_end - removed_len;
                 let sel_after = if after_fence == self.buffer.len_bytes() {
+                    let nl = self.dominant_line_ending();
                     self.buffer
-                        .replace_bytes(ByteRange::empty(after_fence), "\n");
+                        .replace_bytes(ByteRange::empty(after_fence), nl);
                     ops.push(EditOp {
                         range: ByteRange::empty(after_fence),
                         deleted: String::new(),
-                        inserted: "\n".to_string(),
+                        inserted: nl.to_string(),
                     });
-                    Selection::caret(after_fence + 1)
+                    Selection::caret(after_fence + nl.len())
                 } else {
                     Selection::caret(after_fence)
                 };
@@ -1219,12 +1278,13 @@ impl EditorContext<'_> {
         }
 
         // Default newline insertion
+        let nl = self.dominant_line_ending();
         let sel_before = *self.selection;
-        let sel_after = Selection::caret(caret + 1);
+        let sel_after = Selection::caret(caret + nl.len());
         self.undo.apply_edit(
             self.buffer,
             ByteRange::empty(caret),
-            "\n",
+            nl,
             sel_before,
             sel_after,
             EditKind::Typing,
@@ -1253,14 +1313,16 @@ impl EditorContext<'_> {
     pub fn select_all(&mut self) {
         self.abort_ime_preedit();
         let doc_len = self.buffer.len_bytes();
-        let (line_start, line_end) = self.current_line_bounds();
+        let (line_start, content_end, _) = self.current_line_content_bounds();
 
         let block_target = if let Some(body_range) =
             self.enclosing_fenced_code_block_body_range(line_start)
         {
             body_range
         } else if self.is_caret_in_table_row() {
-            let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
+            let line = self
+                .buffer
+                .slice_to_string(ByteRange::new(line_start, content_end));
             let pipes = unescaped_pipe_offsets(&line);
             let rel_caret = self.selection.head.saturating_sub(line_start);
             if let Some(cell_idx) = current_table_cell_index(&pipes, rel_caret) {
@@ -1273,10 +1335,10 @@ impl EditorContext<'_> {
                 let inner_end = c_end.saturating_sub(trim_r).max(inner_start);
                 ByteRange::new(inner_start, inner_end)
             } else {
-                ByteRange::new(line_start, line_end)
+                ByteRange::new(line_start, content_end)
             }
         } else {
-            ByteRange::new(line_start, line_end)
+            ByteRange::new(line_start, content_end)
         };
 
         if !block_target.is_empty() && self.selection.range() != block_target {
@@ -1377,7 +1439,7 @@ impl EditorContext<'_> {
         }
 
         // Bottom-right cell of table: append a new empty row (PRD 4.1.1 G #6)
-        let nl = detect_line_ending_str(&full);
+        let nl = detect_line_ending_str(&full, self.preferred_line_ending);
         let insert_pos = table_row_insert_pos(&full, line_start, line_end);
         let empty_row = build_empty_table_row(cols);
         let insertion = format!("{nl}{empty_row}");
@@ -1460,7 +1522,8 @@ impl EditorContext<'_> {
         None
     }
 
-    fn current_line_bounds(&self) -> (ByteOffset, ByteOffset) {
+    /// Return `(line_start, content_end_without_cr, lf_or_eof_end)` for the current line.
+    fn current_line_content_bounds(&self) -> (ByteOffset, ByteOffset, ByteOffset) {
         let full = self.buffer.to_string();
         let bytes = full.as_bytes();
         let caret = self.selection.head.min(bytes.len());
@@ -1468,11 +1531,20 @@ impl EditorContext<'_> {
         while start > 0 && bytes[start - 1] != b'\n' {
             start -= 1;
         }
-        let mut end = caret;
-        while end < bytes.len() && bytes[end] != b'\n' {
-            end += 1;
+        let mut lf_end = caret;
+        while lf_end < bytes.len() && bytes[lf_end] != b'\n' {
+            lf_end += 1;
         }
-        (start, end)
+        let mut content_end = lf_end;
+        while content_end > start && bytes[content_end - 1] == b'\r' {
+            content_end -= 1;
+        }
+        (start, content_end, lf_end)
+    }
+
+    fn current_line_bounds(&self) -> (ByteOffset, ByteOffset) {
+        let (start, _, lf_end) = self.current_line_content_bounds();
+        (start, lf_end)
     }
 
     /// Returns `Some((fence_char, fence_len))` if the line starting at `target_line_start` is inside
@@ -1533,12 +1605,19 @@ impl EditorContext<'_> {
         let (f_char, f_len) = parse_opening_code_fence(prev_line)?;
 
         let after = &full[empty_line_start..];
-        let next_line_rel_end = after.strip_prefix('\n')?.find('\n').unwrap_or(after.len() - 1);
-        let next_line = after[1..1 + next_line_rel_end].trim_end_matches('\r');
+        let (after_eol_len, after_rest) = if let Some(rest) = after.strip_prefix("\r\n") {
+            (2, rest)
+        } else if let Some(rest) = after.strip_prefix('\n') {
+            (1, rest)
+        } else {
+            return None;
+        };
+        let next_line_rel_end = after_rest.find('\n').unwrap_or(after_rest.len());
+        let next_line = after_rest[..next_line_rel_end].trim_end_matches('\r');
         if !is_closing_code_fence(next_line, f_char, f_len) {
             return None;
         }
-        let close_end = empty_line_start + 1 + next_line_rel_end;
+        let close_end = empty_line_start + after_eol_len + next_line.len();
         Some(ByteRange::new(prev_line_start, close_end))
     }
 
@@ -1548,18 +1627,29 @@ impl EditorContext<'_> {
     ) -> Option<(ByteRange, ByteOffset)> {
         let full = self.buffer.to_string();
         // Caret must be on the 2nd consecutive empty line right before a valid closing code fence line
-        if caret < 2 || !full[..caret].ends_with("\n\n") {
+        let trailing_empty_bytes = if full[..caret].ends_with("\r\n\r\n") {
+            4
+        } else if full[..caret].ends_with("\n\n") {
+            2
+        } else {
             return None;
-        }
+        };
         let (f_char, f_len) = self.enclosing_fenced_code_block(caret)?;
-        let after = full.get(caret..)?.strip_prefix('\n')?;
+        let after_full = full.get(caret..)?;
+        let (after_eol_len, after) = if let Some(rest) = after_full.strip_prefix("\r\n") {
+            (2, rest)
+        } else if let Some(rest) = after_full.strip_prefix('\n') {
+            (1, rest)
+        } else {
+            return None;
+        };
         let close_line_len = after.find('\n').unwrap_or(after.len());
         let close_line = after[..close_line_len].trim_end_matches('\r');
         if !is_closing_code_fence(close_line, f_char, f_len) {
             return None;
         }
-        let closing_fence_end = caret + 1 + close_line_len;
-        Some((ByteRange::new(caret - 2, caret), closing_fence_end))
+        let closing_fence_end = caret + after_eol_len + close_line.len();
+        Some((ByteRange::new(caret - trailing_empty_bytes, caret), closing_fence_end))
     }
 }
 
@@ -1686,8 +1776,8 @@ fn table_cell_caret_offset(cell_slice: &str) -> usize {
     }
 }
 
-fn detect_line_ending_str(full: &str) -> &'static str {
-    match LineEnding::detect_dominant(full) {
+fn detect_line_ending_str(full: &str, fallback: LineEnding) -> &'static str {
+    match LineEnding::detect_dominant_or(full, fallback) {
         LineEnding::CrLf => "\r\n",
         LineEnding::Lf | LineEnding::Cr => "\n",
     }
@@ -2820,5 +2910,152 @@ mod tests {
         ed.dispatch(EditorAction::Undo);
         assert_eq!(ed.buffer.to_string(), "```");
         assert_eq!(ed.selection, Selection::caret(3));
+    }
+
+    fn assert_strict_crlf(text: &str) {
+        let bytes = text.as_bytes();
+        for (idx, &b) in bytes.iter().enumerate() {
+            if b == b'\n' {
+                assert!(
+                    idx > 0 && bytes[idx - 1] == b'\r',
+                    "found bare LF at byte {idx} in {text:?}"
+                );
+            }
+            if b == b'\r' {
+                assert!(
+                    bytes.get(idx + 1) == Some(&b'\n'),
+                    "found orphan CR at byte {idx} in {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_crlf_enter_backspace_and_structural_edits_preserve_crlf_without_bare_lf() {
+        // Exact N1 repro: CRLF document + Enter before Body line must insert `\r\n`, not bare `\n`.
+        let mut ed = EditorController::from_str("# Title\r\n\r\nBody line\r\n");
+        ed.set_caret("# Title\r\n\r\n".len());
+        ed.enter();
+        assert_eq!(ed.buffer.to_string(), "# Title\r\n\r\n\r\nBody line\r\n");
+        assert_strict_crlf(&ed.buffer.to_string());
+
+        // Selection-replace Enter preserves CRLF
+        let mut sel_ed = EditorController::from_str("# Title\r\nReplaceMe line\r\n");
+        let sel_start = "# Title\r\n".len();
+        sel_ed.set_selection(sel_start, sel_start + "ReplaceMe".len());
+        sel_ed.enter();
+        assert_eq!(sel_ed.buffer.to_string(), "# Title\r\n\r\n line\r\n");
+        assert_strict_crlf(&sel_ed.buffer.to_string());
+
+        // List continuation at EOF and before `\r\n`, plus empty list exit
+        let mut list_eof = EditorController::from_str("- item 1\r\n- item 2");
+        list_eof.set_caret(list_eof.buffer.len_bytes());
+        list_eof.enter();
+        assert_eq!(list_eof.buffer.to_string(), "- item 1\r\n- item 2\r\n- ");
+        assert_strict_crlf(&list_eof.buffer.to_string());
+        list_eof.enter();
+        assert_eq!(list_eof.buffer.to_string(), "- item 1\r\n- item 2\r\n");
+        assert_strict_crlf(&list_eof.buffer.to_string());
+
+        let mut list_mid = EditorController::from_str("- item 1\r\nAfter\r\n");
+        list_mid.set_caret("- item 1".len());
+        list_mid.enter();
+        assert_eq!(list_mid.buffer.to_string(), "- item 1\r\n- \r\nAfter\r\n");
+        assert_strict_crlf(&list_mid.buffer.to_string());
+        list_mid.enter();
+        assert_eq!(list_mid.buffer.to_string(), "- item 1\r\n\r\nAfter\r\n");
+        assert_strict_crlf(&list_mid.buffer.to_string());
+
+        // Blockquote continuation & exit before `\r\n`
+        let mut quote_ed = EditorController::from_str("> quote\r\nAfter\r\n");
+        quote_ed.set_caret("> quote".len());
+        quote_ed.enter();
+        assert_eq!(quote_ed.buffer.to_string(), "> quote\r\n> \r\nAfter\r\n");
+        assert_strict_crlf(&quote_ed.buffer.to_string());
+        quote_ed.enter();
+        assert_eq!(quote_ed.buffer.to_string(), "> quote\r\n\r\nAfter\r\n");
+        assert_strict_crlf(&quote_ed.buffer.to_string());
+
+        // Code fence opening companion + 3rd Enter exit + single Undo + empty fence Backspace
+        let mut fence_open = EditorController::from_str("Intro\r\n```rust");
+        fence_open.set_caret(fence_open.buffer.len_bytes());
+        fence_open.enter();
+        assert_eq!(fence_open.buffer.to_string(), "Intro\r\n```rust\r\n\r\n```");
+        assert_strict_crlf(&fence_open.buffer.to_string());
+
+        let mut fence_exit = EditorController::from_str("```rust\r\nlet x = 1;\r\n```");
+        fence_exit.set_caret("```rust\r\nlet x = 1;".len());
+        fence_exit.enter();
+        fence_exit.enter();
+        let before_third = fence_exit.buffer.to_string();
+        assert_eq!(before_third, "```rust\r\nlet x = 1;\r\n\r\n\r\n```");
+        fence_exit.enter();
+        assert_eq!(fence_exit.buffer.to_string(), "```rust\r\nlet x = 1;\r\n```\r\n");
+        assert_strict_crlf(&fence_exit.buffer.to_string());
+        fence_exit.undo();
+        assert_eq!(fence_exit.buffer.to_string(), before_third);
+
+        let mut empty_fence = EditorController::from_str("```\r\n\r\n```");
+        empty_fence.set_caret("```\r\n".len());
+        empty_fence.backspace();
+        assert_eq!(empty_fence.buffer.to_string(), "");
+
+        // Standard Backspace right after `\r\n` removes full `\r\n` without orphan `\r`
+        let mut bs_ed = EditorController::from_str("A\r\nB");
+        bs_ed.set_caret("A\r\n".len());
+        bs_ed.backspace();
+        assert_eq!(bs_ed.buffer.to_string(), "AB");
+        assert_strict_crlf(&bs_ed.buffer.to_string());
+
+        // insert_char('\n') and mid-CRLF defensive snapping keep CRLF intact
+        let mut ch_ed = EditorController::from_str("A\r\nB\r\n");
+        ch_ed.set_caret("A\r".len()); // mid-CRLF
+        ch_ed.enter();
+        assert_eq!(ch_ed.buffer.to_string(), "A\r\n\r\nB\r\n");
+        assert_strict_crlf(&ch_ed.buffer.to_string());
+        ch_ed.set_caret("A\r\n\r\nB".len());
+        ch_ed.insert_char('\n');
+        assert_eq!(ch_ed.buffer.to_string(), "A\r\n\r\nB\r\n\r\n");
+        assert_strict_crlf(&ch_ed.buffer.to_string());
+
+        // Progressive Select-All does not select `\r` of `\r\n`
+        let mut sa_ed = EditorController::from_str("# Title\r\nBody\r\n");
+        sa_ed.set_caret(2);
+        sa_ed.select_all();
+        assert_eq!(sa_ed.selection, Selection::new(0, "# Title".len()));
+        sa_ed.insert_char('X');
+        assert_eq!(sa_ed.buffer.to_string(), "X\r\nBody\r\n");
+        assert_strict_crlf(&sa_ed.buffer.to_string());
+
+        // Thematic break and code fence before `\r\n` preserve CRLF
+        let mut hr_ed = EditorController::from_str("---\r\nAfter\r\n");
+        hr_ed.set_caret("---".len());
+        hr_ed.enter();
+        assert_eq!(hr_ed.buffer.to_string(), "---\r\n\r\nAfter\r\n");
+        assert_strict_crlf(&hr_ed.buffer.to_string());
+        hr_ed.undo();
+        assert_eq!(hr_ed.buffer.to_string(), "\\---\r\nAfter\r\n");
+
+        let mut fence_mid = EditorController::from_str("```rust\r\nAfter\r\n");
+        fence_mid.set_caret("```rust".len());
+        fence_mid.enter();
+        assert_eq!(fence_mid.buffer.to_string(), "```rust\r\n\r\n```\r\nAfter\r\n");
+        assert_strict_crlf(&fence_mid.buffer.to_string());
+
+        // Dominant CR document inserts `\r`
+        let mut cr_ed = EditorController::from_str("Line 1\rLine 2\r");
+        cr_ed.set_caret("Line 1".len());
+        cr_ed.enter();
+        assert_eq!(cr_ed.buffer.to_string(), "Line 1\r\rLine 2\r");
+        assert!(!cr_ed.buffer.to_string().contains('\n'));
+
+        // Deleting the last CRLF in a document remembers `preferred_line_ending == CrLf`
+        let mut del_last = EditorController::from_str("A\r\nB");
+        del_last.set_caret("A\r\n".len());
+        del_last.backspace();
+        assert_eq!(del_last.buffer.to_string(), "AB");
+        del_last.enter();
+        assert_eq!(del_last.buffer.to_string(), "A\r\nB");
+        assert_strict_crlf(&del_last.buffer.to_string());
     }
 }

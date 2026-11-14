@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_WORKBENCH_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
@@ -20,14 +20,38 @@ fn next_recovery_session_tag() -> String {
     format!("pid{}-{nanos}-wb{seq}", std::process::id())
 }
 
+fn normalize_line_endings(text: &str, target: LineEnding) -> String {
+    if !text.contains('\n') && !text.contains('\r') {
+        return text.to_string();
+    }
+    let target_str = target.as_str();
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push_str(target_str);
+            }
+            '\n' => out.push_str(target_str),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 use vellmark_core::{
-    ByteOffset, ConflictActionOutcome, DEFAULT_ORPHAN_GRACE_SECS, DocState, DocumentSession,
-    DocumentStats, EditorAction, EditorContext, EditorViewState, FileTreeNode,
-    HISTORICAL_BACKUPS_DIR_NAME, HistoricalBackupEntry, HistoricalBackupPolicy,
-    HistoricalBackupReason, PendingRecoveryEntry, RecentFilesList, RecoveryMaintenanceReport,
-    SaveOutcome, Selection, SessionError, archive_pending_recovery_to_history,
-    clear_conflict_backups_for_path, clear_historical_backups_for_path, delete_historical_backup,
-    discard_pending_recovery_entry, list_historical_backups, maintain_recovery_root,
+    AutoMergeOutcome, ByteOffset, ConflictActionOutcome, DEFAULT_ORPHAN_GRACE_SECS, DocState,
+    DocumentSession, DocumentStats, EditorAction, EditorContext, EditorViewState,
+    ExternalSyncResult, FileTreeNode, HISTORICAL_BACKUPS_DIR_NAME, HistoricalBackupEntry,
+    HistoricalBackupPolicy, HistoricalBackupReason, LineEnding, MergeConflictHunk,
+    PendingRecoveryEntry, RecentFilesList, RecoveryMaintenanceReport, SaveOutcome, Selection,
+    SessionError, archive_pending_recovery_to_history, clear_conflict_backups_for_path,
+    clear_historical_backups_for_path, delete_historical_backup, discard_pending_recovery_entry,
+    list_historical_backups, list_historical_backups_for_path, maintain_recovery_root,
+    paths_refer_to_same_file,
 };
 use vellmark_export::{
     HtmlExportMode, export_markdown_to_html_document, html_to_markdown,
@@ -46,6 +70,8 @@ use crate::assets::import_image_to_assets;
 use crate::config::AppConfig;
 use crate::search::{QuickOpenMatch, WorkspaceSearchMatch, global_workspace_search, quick_open_fuzzy_search};
 
+pub const AUTO_SAVE_RETRY_BACKOFF_SECS: [u64; 3] = [5, 15, 60];
+
 /// An open editor tab binding one `DocumentSession` (source of truth + conflict state)
 /// with its `EditorViewState` (caret/selection, WYSIWYG/Source mode, IME state) and scroll position.
 pub struct DocumentTab {
@@ -60,9 +86,42 @@ pub struct DocumentTab {
         String,
         vellmark_core::FindOptions,
     )>,
+    auto_save_tracked_rev: u64,
+    last_edit_at: Option<Instant>,
+    auto_save_next_retry_at: Option<Instant>,
+    auto_save_retry_attempt: usize,
+    pub last_write_error: Option<String>,
+    pub conflict_theirs_updated: bool,
+    pub conflict_backup_count: usize,
+    pub conflict_backup_notice_dismissed: bool,
+    pub last_merge_conflicts: Vec<MergeConflictHunk>,
+    last_external_read_error: Option<String>,
 }
 
 impl DocumentTab {
+    fn new(id: u64, session: DocumentSession, view: EditorViewState) -> Self {
+        let rev = session.buffer.revision();
+        let last_edit_at = (session.state == DocState::Dirty).then(Instant::now);
+        Self {
+            id,
+            session,
+            view,
+            scroll_y: 0.0,
+            ast_cache: std::cell::RefCell::new(None),
+            last_zero_width_find: None,
+            auto_save_tracked_rev: rev,
+            last_edit_at,
+            auto_save_next_retry_at: None,
+            auto_save_retry_attempt: 0,
+            last_write_error: None,
+            conflict_theirs_updated: false,
+            conflict_backup_count: 0,
+            conflict_backup_notice_dismissed: false,
+            last_merge_conflicts: Vec::new(),
+            last_external_read_error: None,
+        }
+    }
+
     pub fn title(&self) -> String {
         self.session
             .path
@@ -77,7 +136,11 @@ impl DocumentTab {
     }
 
     pub fn edit(&mut self, f: impl FnOnce(&mut EditorContext<'_>)) -> Result<bool, SessionError> {
-        self.session.with_editor_view(&mut self.view, f)
+        let changed = self.session.with_editor_view(&mut self.view, f)?;
+        if changed {
+            self.sync_edit_activity_at(Instant::now());
+        }
+        Ok(changed)
     }
 
     pub fn dispatch(&mut self, action: EditorAction) -> Result<bool, SessionError> {
@@ -92,9 +155,15 @@ impl DocumentTab {
                 };
                 Ok(false)
             }
-            mutating_action => self
-                .session
-                .with_editor_view(&mut self.view, move |ctx| ctx.dispatch(mutating_action)),
+            mutating_action => {
+                let changed = self
+                    .session
+                    .with_editor_view(&mut self.view, move |ctx| ctx.dispatch(mutating_action))?;
+                if changed {
+                    self.sync_edit_activity_at(Instant::now());
+                }
+                Ok(changed)
+            }
         }
     }
 
@@ -127,6 +196,13 @@ impl DocumentTab {
         copy_selection(&self.session.buffer.to_string(), self.view.selection)
     }
 
+    fn target_line_ending(&self) -> LineEnding {
+        LineEnding::detect_dominant_or(
+            &self.session.buffer.to_string(),
+            self.session.format.dominant_line_ending,
+        )
+    }
+
     /// Paste rich clipboard content (`text/html`, Excel/CSV spreadsheet text, or plain text, PRD 4.6 X-06 & 4.3 T-04).
     pub fn paste_rich_clipboard(
         &mut self,
@@ -140,7 +216,8 @@ impl DocumentTab {
         } else {
             plain_text.to_string()
         };
-        self.edit(|ctx| ctx.insert_text(&converted))
+        let normalized = normalize_line_endings(&converted, self.target_line_ending());
+        self.edit(|ctx| ctx.insert_text(&normalized))
     }
 
     /// Sync and borrow cached incremental AST blocks without allocating on unchanged frames (10 MB fast path).
@@ -369,11 +446,15 @@ impl DocumentTab {
     }
 
     pub fn save(&mut self) -> SaveOutcome {
-        self.session.save()
+        let outcome = self.session.save();
+        self.apply_save_outcome_at(&outcome, Instant::now());
+        outcome
     }
 
     pub fn save_as(&mut self, new_path: impl AsRef<Path>) -> SaveOutcome {
-        self.session.save_as(new_path)
+        let outcome = self.session.save_as(new_path);
+        self.apply_save_outcome_at(&outcome, Instant::now());
+        outcome
     }
 
     pub fn on_external_modified(&mut self, new_disk_text: &str) {
@@ -381,10 +462,245 @@ impl DocumentTab {
             .on_external_modified_with_view(new_disk_text, &mut self.view);
     }
 
-    pub fn resolve_conflict_use_theirs(&mut self, captured_rev: u64) -> ConflictActionOutcome {
-        self.session
-            .resolve_conflict_use_theirs_with_view(captured_rev, &mut self.view)
+    pub fn resolve_conflict_keep_mine(&mut self) -> ConflictActionOutcome {
+        let rev = self.session.buffer.revision();
+        let rope = self.session.buffer.snapshot_rope();
+        let outcome = self.session.resolve_conflict_keep_mine(rev, rope);
+        match outcome {
+            ConflictActionOutcome::ResolvedClean | ConflictActionOutcome::ResolvedDirty => {
+                self.last_write_error = None;
+                self.auto_save_next_retry_at = None;
+                self.auto_save_retry_attempt = 0;
+                self.conflict_theirs_updated = false;
+                self.last_merge_conflicts.clear();
+                self.conflict_backup_notice_dismissed = false;
+                self.sync_edit_activity_at(Instant::now());
+            }
+            ConflictActionOutcome::TransitionedToMissing => {
+                self.last_write_error = None;
+                self.conflict_theirs_updated = false;
+                self.last_merge_conflicts.clear();
+            }
+            ConflictActionOutcome::AbortedStillConflict(_) => {}
+        }
+        outcome
     }
+
+    pub fn resolve_conflict_use_theirs(&mut self, captured_rev: u64) -> ConflictActionOutcome {
+        let outcome = self
+            .session
+            .resolve_conflict_use_theirs_with_view(captured_rev, &mut self.view);
+        match outcome {
+            ConflictActionOutcome::ResolvedClean | ConflictActionOutcome::ResolvedDirty => {
+                self.last_write_error = None;
+                self.auto_save_next_retry_at = None;
+                self.auto_save_retry_attempt = 0;
+                self.conflict_theirs_updated = false;
+                self.last_merge_conflicts.clear();
+                self.conflict_backup_notice_dismissed = false;
+                self.sync_edit_activity_at(Instant::now());
+            }
+            ConflictActionOutcome::TransitionedToMissing => {
+                self.last_write_error = None;
+                self.conflict_theirs_updated = false;
+                self.last_merge_conflicts.clear();
+            }
+            ConflictActionOutcome::AbortedStillConflict(_) => {}
+        }
+        outcome
+    }
+
+    pub fn resolve_conflict_auto_merge(&mut self, captured_rev: u64) -> AutoMergeOutcome {
+        let outcome = self
+            .session
+            .resolve_conflict_auto_merge_with_view(captured_rev, &mut self.view);
+        match &outcome {
+            AutoMergeOutcome::MergedClean | AutoMergeOutcome::MergedDirty { .. } => {
+                self.last_write_error = None;
+                self.auto_save_next_retry_at = None;
+                self.auto_save_retry_attempt = 0;
+                self.conflict_theirs_updated = false;
+                self.last_merge_conflicts.clear();
+                self.conflict_backup_notice_dismissed = false;
+                self.sync_edit_activity_at(Instant::now());
+            }
+            AutoMergeOutcome::HasOverlappingConflicts { conflicting_hunks } => {
+                self.last_merge_conflicts = conflicting_hunks.clone();
+            }
+            AutoMergeOutcome::TransitionedToMissing => {
+                self.last_write_error = None;
+                self.conflict_theirs_updated = false;
+                self.last_merge_conflicts.clear();
+            }
+            AutoMergeOutcome::AbortedStillConflict(_) => {}
+        }
+        outcome
+    }
+
+    pub fn is_auto_save_eligible(&self) -> bool {
+        self.session.path.is_some()
+            && !self.session.is_read_only()
+            && self.session.state == DocState::Dirty
+    }
+
+    pub fn sync_edit_activity_at(&mut self, now: Instant) {
+        let rev = self.session.buffer.revision();
+        if rev != self.auto_save_tracked_rev {
+            self.auto_save_tracked_rev = rev;
+            if self.session.state == DocState::Dirty {
+                self.last_edit_at = Some(now);
+                self.auto_save_next_retry_at = None;
+                self.auto_save_retry_attempt = 0;
+            }
+        }
+        if self.session.state != DocState::Dirty {
+            self.last_edit_at = None;
+            self.auto_save_next_retry_at = None;
+            self.auto_save_retry_attempt = 0;
+            if self.session.state == DocState::Clean {
+                self.last_write_error = None;
+            }
+        }
+        if self.session.state != DocState::Conflict {
+            self.conflict_theirs_updated = false;
+            self.last_merge_conflicts.clear();
+        }
+    }
+
+    pub fn next_auto_save_deadline(
+        &self,
+        auto_save_enabled: bool,
+        idle_delay: Duration,
+    ) -> Option<Instant> {
+        if !auto_save_enabled
+            || !self.is_auto_save_eligible()
+            || self.session.is_async_save_in_flight()
+        {
+            return None;
+        }
+        if let Some(retry_at) = self.auto_save_next_retry_at {
+            return Some(retry_at);
+        }
+        self.last_edit_at.map(|t| t + idle_delay)
+    }
+
+    pub(crate) fn apply_save_outcome_at(&mut self, outcome: &SaveOutcome, now: Instant) {
+        match outcome {
+            SaveOutcome::SavedClean => {
+                self.last_write_error = None;
+                self.auto_save_next_retry_at = None;
+                self.auto_save_retry_attempt = 0;
+                self.last_edit_at = None;
+                self.conflict_theirs_updated = false;
+                self.last_merge_conflicts.clear();
+                self.auto_save_tracked_rev = self.session.buffer.revision();
+            }
+            SaveOutcome::SavedButStillDirty { .. } => {
+                self.last_write_error = None;
+                self.auto_save_next_retry_at = None;
+                self.auto_save_retry_attempt = 0;
+                self.last_edit_at = Some(now);
+                self.auto_save_tracked_rev = self.session.buffer.revision();
+            }
+            SaveOutcome::EnteredConflict => {
+                self.last_write_error = None;
+                self.auto_save_next_retry_at = None;
+                self.auto_save_retry_attempt = 0;
+            }
+            SaveOutcome::WriteFailed(err) => {
+                if matches!(self.session.state, DocState::Missing { .. })
+                    && err == "target file disappeared before write"
+                {
+                    self.last_write_error = None;
+                    self.auto_save_next_retry_at = None;
+                    self.auto_save_retry_attempt = 0;
+                } else {
+                    self.last_write_error = Some(err.clone());
+                    if self.session.state == DocState::Dirty {
+                        let idx = self
+                            .auto_save_retry_attempt
+                            .min(AUTO_SAVE_RETRY_BACKOFF_SECS.len() - 1);
+                        let secs = AUTO_SAVE_RETRY_BACKOFF_SECS[idx];
+                        self.auto_save_next_retry_at = Some(now + Duration::from_secs(secs));
+                        self.auto_save_retry_attempt =
+                            (self.auto_save_retry_attempt + 1).min(AUTO_SAVE_RETRY_BACKOFF_SECS.len());
+                    } else {
+                        self.auto_save_next_retry_at = None;
+                        self.auto_save_retry_attempt = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn sync_from_disk(&mut self, bypass_stat_cache: bool) -> ExternalSyncResult {
+        let res = self
+            .session
+            .sync_from_disk_with_view(&mut self.view, bypass_stat_cache);
+        match &res {
+            ExternalSyncResult::NoChange => {}
+            ExternalSyncResult::ReloadedClean
+            | ExternalSyncResult::ReappearedClean { .. } => {
+                self.last_write_error = None;
+                self.auto_save_next_retry_at = None;
+                self.auto_save_retry_attempt = 0;
+                self.last_edit_at = None;
+                self.conflict_theirs_updated = false;
+                self.last_merge_conflicts.clear();
+                self.last_external_read_error = None;
+                self.auto_save_tracked_rev = self.session.buffer.revision();
+            }
+            ExternalSyncResult::EnteredConflict => {
+                self.last_write_error = None;
+                self.auto_save_next_retry_at = None;
+                self.auto_save_retry_attempt = 0;
+                self.conflict_theirs_updated = false;
+                self.last_merge_conflicts.clear();
+                self.last_external_read_error = None;
+            }
+            ExternalSyncResult::ConflictTheirsUpdated => {
+                self.conflict_theirs_updated = true;
+                self.last_merge_conflicts.clear();
+                self.last_external_read_error = None;
+            }
+            ExternalSyncResult::BecameMissing => {
+                self.last_write_error = None;
+                self.auto_save_next_retry_at = None;
+                self.auto_save_retry_attempt = 0;
+                self.conflict_theirs_updated = false;
+                self.last_merge_conflicts.clear();
+                self.last_external_read_error = None;
+            }
+            ExternalSyncResult::ReappearedDirty => {
+                self.last_write_error = None;
+                self.last_edit_at = Some(Instant::now());
+                self.auto_save_next_retry_at = None;
+                self.auto_save_retry_attempt = 0;
+                self.conflict_theirs_updated = false;
+                self.last_merge_conflicts.clear();
+                self.last_external_read_error = None;
+            }
+            ExternalSyncResult::Renamed { .. } => {
+                self.last_external_read_error = None;
+            }
+            ExternalSyncResult::ReadError(_) => {}
+        }
+        res
+    }
+}
+
+/// High-level runtime event produced by auto-save timers or external file polling (PRD 4.5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkbenchRuntimeEvent {
+    AutoSavedClean { tab_id: u64, title: String },
+    EnteredConflict { tab_id: u64, title: String },
+    ConflictTheirsUpdated { tab_id: u64, title: String },
+    ReloadedClean { tab_id: u64, title: String },
+    BecameMissing { tab_id: u64, title: String, has_local_edits: bool },
+    Reappeared { tab_id: u64, title: String, reloaded: bool },
+    Renamed { tab_id: u64, old_path: PathBuf, new_path: PathBuf },
+    WriteFailed { tab_id: u64, title: String, error: String },
+    ReadError { tab_id: u64, title: String, error: String },
 }
 
 const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 60;
@@ -468,14 +784,8 @@ impl AppWorkbench {
             self.history_policy,
             std::time::Duration::from_millis(200),
         );
-        self.tabs.push(DocumentTab {
-            id,
-            session,
-            view: EditorViewState::default(),
-            scroll_y: 0.0,
-            ast_cache: std::cell::RefCell::new(None),
-            last_zero_width_find: None,
-        });
+        self.tabs
+            .push(DocumentTab::new(id, session, EditorViewState::default()));
         self.active_tab_idx = Some(self.tabs.len() - 1);
         id
     }
@@ -487,9 +797,8 @@ impl AppWorkbench {
         if let Some((idx, tab)) = self.tabs.iter().enumerate().find(|(_, t)| {
             t.session
                 .path
-                .as_ref()
-                .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()) == canonical)
-                .unwrap_or(false)
+                .as_deref()
+                .is_some_and(|p| paths_refer_to_same_file(p, target))
         }) {
             let id = tab.id;
             self.active_tab_idx = Some(idx);
@@ -509,16 +818,52 @@ impl AppWorkbench {
             std::time::Duration::from_millis(200),
         )?;
         self.recent_files.record_open(canonical);
-        self.tabs.push(DocumentTab {
-            id,
-            session,
-            view: EditorViewState::default(),
-            scroll_y: 0.0,
-            ast_cache: std::cell::RefCell::new(None),
-            last_zero_width_find: None,
-        });
+        self.tabs
+            .push(DocumentTab::new(id, session, EditorViewState::default()));
+        self.refresh_tab_conflict_backup_count(id);
         self.active_tab_idx = Some(self.tabs.len() - 1);
         Ok(id)
+    }
+
+    /// Return `(tab_idx, tab_id, title)` if any open tab other than `exclude_tab_id` is already
+    /// bound to the same canonical/equivalent file path (PRD 4.5.1 E single-document invariant).
+    pub fn find_other_tab_with_path(
+        &self,
+        exclude_tab_id: u64,
+        target: &Path,
+    ) -> Option<(usize, u64, String)> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .find(|(_, tab)| {
+                tab.id != exclude_tab_id
+                    && tab
+                        .session
+                        .path
+                        .as_deref()
+                        .is_some_and(|p| paths_refer_to_same_file(p, target))
+            })
+            .map(|(idx, tab)| (idx, tab.id, tab.title()))
+    }
+
+    /// Save tab `tab_id` to `new_path`, refusing to bind a second independent tab to a file path
+    /// already open in another tab (PRD 4.5.1 E single-document invariant).
+    pub fn save_tab_as(
+        &mut self,
+        tab_id: u64,
+        new_path: impl AsRef<Path>,
+    ) -> Result<SaveOutcome, String> {
+        let dest = new_path.as_ref();
+        if let Some((other_idx, _, other_title)) = self.find_other_tab_with_path(tab_id, dest) {
+            return Err(format!(
+                "'{other_title}' is already open in tab {} — close that tab first or pick another file",
+                other_idx + 1
+            ));
+        }
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else {
+            return Err("tab no longer exists".to_string());
+        };
+        Ok(tab.save_as(dest))
     }
 
     /// Close a tab, enforcing unsaved-change guards when `force == false` and archiving unsaved edits
@@ -707,6 +1052,9 @@ impl AppWorkbench {
                         let caret = tab.session.buffer.len_bytes();
                         tab.view.selection = Selection::caret(caret);
                         *tab.ast_cache.borrow_mut() = None;
+                        tab.sync_edit_activity_at(Instant::now());
+                        let tab_id = tab.id;
+                        self.refresh_tab_conflict_backup_count(tab_id);
                         self.active_tab_idx = Some(existing_idx);
                         restored += 1;
                     }
@@ -724,17 +1072,15 @@ impl AppWorkbench {
                 policy,
             );
             let caret = session.buffer.len_bytes();
-            self.tabs.push(DocumentTab {
+            self.tabs.push(DocumentTab::new(
                 id,
                 session,
-                view: EditorViewState {
+                EditorViewState {
                     selection: Selection::caret(caret),
                     ..Default::default()
                 },
-                scroll_y: 0.0,
-                ast_cache: std::cell::RefCell::new(None),
-                last_zero_width_find: None,
-            });
+            ));
+            self.refresh_tab_conflict_backup_count(id);
             self.active_tab_idx = Some(self.tabs.len() - 1);
             restored += 1;
         }
@@ -878,6 +1224,7 @@ impl AppWorkbench {
                 }
                 self.last_maintenance_unix_secs = Some(ts);
                 self.last_recovery_maintenance = Some(report.clone());
+                self.refresh_all_conflict_backup_counts();
                 Some(report)
             }
             Err(mpsc::TryRecvError::Empty) => None,
@@ -930,7 +1277,169 @@ impl AppWorkbench {
         );
         self.last_maintenance_unix_secs = Some(now);
         self.last_recovery_maintenance = Some(report.clone());
+        self.refresh_all_conflict_backup_counts();
         Some(report)
+    }
+
+    /// Refresh cached count of conflict safety backups under `history/` for one open tab.
+    pub fn refresh_tab_conflict_backup_count(&mut self, tab_id: u64) {
+        let Some(hist) = self.history_root() else {
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                tab.conflict_backup_count = 0;
+            }
+            return;
+        };
+        let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) else {
+            return;
+        };
+        let Some(src_path) = self.tabs[pos].session.path.clone() else {
+            self.tabs[pos].conflict_backup_count = 0;
+            return;
+        };
+        let count = list_historical_backups_for_path(hist, Some(&src_path))
+            .into_iter()
+            .filter(|e| e.reason.is_conflict_backup())
+            .count();
+        self.tabs[pos].conflict_backup_count = count;
+    }
+
+    /// Refresh cached conflict safety backup counts across all open tabs.
+    pub fn refresh_all_conflict_backup_counts(&mut self) {
+        let ids: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
+        for id in ids {
+            self.refresh_tab_conflict_backup_count(id);
+        }
+    }
+
+    /// Return the earliest scheduled auto-save deadline across all open tabs.
+    pub fn next_auto_save_deadline(&self) -> Option<Instant> {
+        let idle = Duration::from_millis(self.config.auto_save_delay_ms);
+        self.tabs
+            .iter()
+            .filter_map(|t| t.next_auto_save_deadline(self.config.auto_save_enabled, idle))
+            .min()
+    }
+
+    /// Harvest completed background auto-saves across all tabs without dispatching new ones.
+    pub fn poll_async_saves_at(&mut self, now: Instant) -> Vec<WorkbenchRuntimeEvent> {
+        let mut events = Vec::new();
+        for tab in &mut self.tabs {
+            if let Some(outcome) = tab.session.poll_async_save() {
+                tab.apply_save_outcome_at(&outcome, now);
+                push_runtime_save_event(tab, &outcome, &mut events);
+            }
+        }
+        events
+    }
+
+    /// Advance auto-save timers at `now` (2s idle delay + 5s/15s/60s backoff retries, PRD 4.5.1 A & C).
+    pub fn tick_auto_save_at(&mut self, now: Instant) -> Vec<WorkbenchRuntimeEvent> {
+        let mut events = self.poll_async_saves_at(now);
+        let idle_delay = Duration::from_millis(self.config.auto_save_delay_ms);
+        for tab in &mut self.tabs {
+            tab.sync_edit_activity_at(now);
+            if let Some(deadline) =
+                tab.next_auto_save_deadline(self.config.auto_save_enabled, idle_delay)
+            {
+                if now >= deadline {
+                    tab.session.schedule_async_save();
+                }
+            }
+        }
+        events.extend(self.poll_async_saves_at(now));
+        events
+    }
+
+    /// Immediately flush auto-save for a specific tab (e.g. on tab switch per PRD 4.5.1 A).
+    pub fn flush_auto_save_for_tab(&mut self, tab_id: u64, now: Instant) -> Vec<WorkbenchRuntimeEvent> {
+        if !self.config.auto_save_enabled {
+            return Vec::new();
+        }
+        let mut events = self.poll_async_saves_at(now);
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else {
+            return events;
+        };
+        if !tab.is_auto_save_eligible() {
+            return events;
+        }
+        let outcome = tab.session.save();
+        tab.apply_save_outcome_at(&outcome, now);
+        push_runtime_save_event(tab, &outcome, &mut events);
+        events
+    }
+
+    /// Immediately flush auto-save for every eligible Dirty named tab (on focus loss or window close).
+    pub fn flush_all_dirty_auto_saves(&mut self, now: Instant) -> Vec<WorkbenchRuntimeEvent> {
+        if !self.config.auto_save_enabled {
+            return Vec::new();
+        }
+        let mut events = self.poll_async_saves_at(now);
+        for tab in &mut self.tabs {
+            if !tab.is_auto_save_eligible() {
+                continue;
+            }
+            let outcome = tab.session.save();
+            tab.apply_save_outcome_at(&outcome, now);
+            push_runtime_save_event(tab, &outcome, &mut events);
+        }
+        events
+    }
+
+    /// Synchronize open tabs against external disk modifications, deletions, and renames (PRD 4.5.1 C & G).
+    pub fn poll_external_changes(&mut self, bypass_stat_cache: bool) -> Vec<WorkbenchRuntimeEvent> {
+        let now = Instant::now();
+        let mut events = self.poll_async_saves_at(now);
+        for idx in 0..self.tabs.len() {
+            if self.tabs[idx].session.path.is_none()
+                || self.tabs[idx].session.is_async_save_in_flight()
+            {
+                continue;
+            }
+            let tab_id = self.tabs[idx].id;
+            let res = self.tabs[idx].sync_from_disk(bypass_stat_cache);
+            if let ExternalSyncResult::Renamed { old_path, new_path } = res {
+                let duplicate_open = self.tabs.iter().enumerate().any(|(j, other)| {
+                    j != idx
+                        && other
+                            .session
+                            .path
+                            .as_deref()
+                            .is_some_and(|p| paths_refer_to_same_file(p, &new_path))
+                });
+                if duplicate_open {
+                    // Preserve single-document-instance invariant (PRD 4.5.1 E).
+                    self.tabs[idx].session.path = Some(old_path);
+                    self.tabs[idx].session.on_external_deleted();
+                    let has_local_edits = matches!(
+                        self.tabs[idx].session.state,
+                        DocState::Missing {
+                            has_local_edits: true
+                        }
+                    );
+                    let t = self.tabs[idx].title();
+                    events.push(WorkbenchRuntimeEvent::BecameMissing {
+                        tab_id,
+                        title: t,
+                        has_local_edits,
+                    });
+                } else {
+                    self.recent_files.record_open(&new_path);
+                    self.refresh_tab_conflict_backup_count(tab_id);
+                    events.push(WorkbenchRuntimeEvent::Renamed {
+                        tab_id,
+                        old_path,
+                        new_path,
+                    });
+                    // Reconcile renamed target's file content right away so simultaneous rename +
+                    // external edit updates buffer/Conflict immediately without waiting another poll.
+                    let follow_up = self.tabs[idx].sync_from_disk(true);
+                    push_non_rename_sync_event(&mut self.tabs[idx], follow_up, &mut events);
+                }
+            } else {
+                push_non_rename_sync_event(&mut self.tabs[idx], res, &mut events);
+            }
+        }
+        events
     }
 
     /// Explicitly delete a single historical / conflict safety backup file under `history/`.
@@ -938,23 +1447,35 @@ impl AppWorkbench {
         let Some(hist) = self.history_root() else {
             return Ok(false);
         };
-        delete_historical_backup(hist, backup_path)
+        let removed = delete_historical_backup(hist, backup_path)?;
+        if removed {
+            self.refresh_all_conflict_backup_counts();
+        }
+        Ok(removed)
     }
 
     /// Explicitly remove all conflict-resolution safety backups for `source_path`.
     pub fn clear_conflict_backups_for_path(&mut self, source_path: Option<&Path>) -> usize {
-        match self.history_root() {
+        let removed = match self.history_root() {
             Some(hist) => clear_conflict_backups_for_path(hist, source_path),
             None => 0,
+        };
+        if removed > 0 {
+            self.refresh_all_conflict_backup_counts();
         }
+        removed
     }
 
     /// Explicitly remove all historical backups (conflict + close + crash archive) for `source_path`.
     pub fn clear_history_backups_for_path(&mut self, source_path: Option<&Path>) -> usize {
-        match self.history_root() {
+        let removed = match self.history_root() {
             Some(hist) => clear_historical_backups_for_path(hist, source_path),
             None => 0,
+        };
+        if removed > 0 {
+            self.refresh_all_conflict_backup_counts();
         }
+        removed
     }
 
     pub fn protected_snapshots_exceed_limit(&self) -> bool {
@@ -984,6 +1505,114 @@ impl AppWorkbench {
         self.recovery_root
             .as_ref()
             .map(|r| r.join(format!("{}-tab-{tab_id}", self.recovery_session_tag)))
+    }
+}
+
+fn push_runtime_save_event(
+    tab: &DocumentTab,
+    outcome: &SaveOutcome,
+    events: &mut Vec<WorkbenchRuntimeEvent>,
+) {
+    let tab_id = tab.id;
+    let title = tab.title();
+    match outcome {
+        SaveOutcome::SavedClean => {
+            events.push(WorkbenchRuntimeEvent::AutoSavedClean { tab_id, title });
+        }
+        SaveOutcome::SavedButStillDirty { .. } => {}
+        SaveOutcome::EnteredConflict => {
+            events.push(WorkbenchRuntimeEvent::EnteredConflict { tab_id, title });
+        }
+        SaveOutcome::WriteFailed(err) => {
+            if matches!(tab.session.state, DocState::Missing { .. })
+                && err == "target file disappeared before write"
+            {
+                let has_local_edits = matches!(
+                    tab.session.state,
+                    DocState::Missing {
+                        has_local_edits: true
+                    }
+                );
+                events.push(WorkbenchRuntimeEvent::BecameMissing {
+                    tab_id,
+                    title,
+                    has_local_edits,
+                });
+            } else {
+                events.push(WorkbenchRuntimeEvent::WriteFailed {
+                    tab_id,
+                    title,
+                    error: err.clone(),
+                });
+            }
+        }
+    }
+}
+
+fn push_non_rename_sync_event(
+    tab: &mut DocumentTab,
+    res: ExternalSyncResult,
+    events: &mut Vec<WorkbenchRuntimeEvent>,
+) {
+    let tab_id = tab.id;
+    let title = tab.title();
+    match res {
+        ExternalSyncResult::NoChange => {
+            tab.last_external_read_error = None;
+        }
+        ExternalSyncResult::ReloadedClean => {
+            tab.last_external_read_error = None;
+            events.push(WorkbenchRuntimeEvent::ReloadedClean { tab_id, title });
+        }
+        ExternalSyncResult::EnteredConflict => {
+            tab.last_external_read_error = None;
+            events.push(WorkbenchRuntimeEvent::EnteredConflict { tab_id, title });
+        }
+        ExternalSyncResult::ConflictTheirsUpdated => {
+            tab.last_external_read_error = None;
+            events.push(WorkbenchRuntimeEvent::ConflictTheirsUpdated { tab_id, title });
+        }
+        ExternalSyncResult::BecameMissing => {
+            tab.last_external_read_error = None;
+            let has_local_edits = matches!(
+                tab.session.state,
+                DocState::Missing {
+                    has_local_edits: true
+                }
+            );
+            events.push(WorkbenchRuntimeEvent::BecameMissing {
+                tab_id,
+                title,
+                has_local_edits,
+            });
+        }
+        ExternalSyncResult::ReappearedClean { reloaded } => {
+            tab.last_external_read_error = None;
+            events.push(WorkbenchRuntimeEvent::Reappeared {
+                tab_id,
+                title,
+                reloaded,
+            });
+        }
+        ExternalSyncResult::ReappearedDirty => {
+            tab.last_external_read_error = None;
+            events.push(WorkbenchRuntimeEvent::Reappeared {
+                tab_id,
+                title,
+                reloaded: false,
+            });
+        }
+        ExternalSyncResult::Renamed { .. } => {}
+        ExternalSyncResult::ReadError(err) => {
+            if tab.last_external_read_error.as_deref() != Some(err.as_str()) {
+                tab.last_external_read_error = Some(err.clone());
+                events.push(WorkbenchRuntimeEvent::ReadError {
+                    tab_id,
+                    title,
+                    error: err,
+                });
+            }
+        }
     }
 }
 
@@ -1475,6 +2104,162 @@ mod tests {
         };
         assert!(report.protected_snapshot_bytes > 0);
         assert!(wb.last_recovery_maintenance.is_some());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_runtime_auto_save_2s_idle_retry_backoff_and_flush_on_switch() {
+        let root = std::env::temp_dir().join(format!(
+            "vellmark-wb-autosave-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rec_root = root.join("recovery");
+        let doc_a = root.join("a.md");
+        let doc_b = root.join("b.md");
+        fs::create_dir_all(&rec_root).unwrap();
+        fs::write(&doc_a, "alpha\n").unwrap();
+        fs::write(&doc_b, "beta\n").unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root));
+        let id_a = wb.open_document(&doc_a).unwrap();
+        let _id_b = wb.open_document(&doc_b).unwrap();
+        wb.active_tab_idx = Some(0);
+
+        let t0 = Instant::now();
+        {
+            let tab = wb.tabs.iter_mut().find(|t| t.id == id_a).unwrap();
+            tab.edit(|ctx| ctx.insert_text("edited-")).unwrap();
+            tab.last_edit_at = Some(t0);
+        }
+
+        // Before 2000ms idle threshold -> does NOT write yet
+        let early = wb.tick_auto_save_at(t0 + Duration::from_millis(1500));
+        assert!(early.is_empty());
+        assert_eq!(fs::read_to_string(&doc_a).unwrap(), "alpha\n");
+
+        // After 2000ms idle threshold -> queues async save and finishes cleanly
+        let _ = wb.tick_auto_save_at(t0 + Duration::from_millis(2050));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while wb.tabs.iter().find(|t| t.id == id_a).unwrap().session.state != DocState::Clean {
+            let _ = wb.tick_auto_save_at(Instant::now());
+            assert!(Instant::now() < deadline, "timed out waiting for 2s auto-save");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(fs::read_to_string(&doc_a).unwrap(), "edited-alpha\n");
+
+        // Verify 5s -> 15s -> 60s write-failure retry backoff schedule
+        {
+            let tab = wb.tabs.iter_mut().find(|t| t.id == id_a).unwrap();
+            tab.edit(|ctx| ctx.insert_text("x")).unwrap();
+            let err = SaveOutcome::WriteFailed("simulated I/O error".to_string());
+            let base = t0 + Duration::from_secs(10);
+            tab.apply_save_outcome_at(&err, base);
+            assert_eq!(tab.auto_save_retry_attempt, 1);
+            assert_eq!(
+                tab.next_auto_save_deadline(true, Duration::from_secs(2)),
+                Some(base + Duration::from_secs(5))
+            );
+            tab.apply_save_outcome_at(&err, base + Duration::from_secs(5));
+            assert_eq!(tab.auto_save_retry_attempt, 2);
+            assert_eq!(
+                tab.next_auto_save_deadline(true, Duration::from_secs(2)),
+                Some(base + Duration::from_secs(20))
+            );
+            tab.apply_save_outcome_at(&err, base + Duration::from_secs(20));
+            assert_eq!(tab.auto_save_retry_attempt, 3);
+            assert_eq!(
+                tab.next_auto_save_deadline(true, Duration::from_secs(2)),
+                Some(base + Duration::from_secs(80))
+            );
+        }
+
+        // Flush on switch writes Dirty named tab immediately regardless of 2s delay
+        let evs = wb.flush_auto_save_for_tab(id_a, Instant::now());
+        assert!(evs.iter().any(|e| matches!(e, WorkbenchRuntimeEvent::AutoSavedClean { tab_id, .. } if *tab_id == id_a)));
+        assert_eq!(fs::read_to_string(&doc_a).unwrap(), "edited-xalpha\n");
+
+        #[cfg(unix)]
+        {
+            // Simultaneous external edit + rename is reconciled immediately on a single poll
+            let doc_c = root.join("c.md");
+            fs::write(&doc_b, "beta-modified-and-renamed\n").unwrap();
+            fs::rename(&doc_b, &doc_c).unwrap();
+            let poll_evs = wb.poll_external_changes(false);
+            assert!(poll_evs
+                .iter()
+                .any(|e| matches!(e, WorkbenchRuntimeEvent::Renamed { new_path, .. } if new_path == &doc_c)));
+            assert!(poll_evs
+                .iter()
+                .any(|e| matches!(e, WorkbenchRuntimeEvent::ReloadedClean { .. })));
+            let tab_b = wb
+                .tabs
+                .iter()
+                .find(|t| t.session.path.as_deref() == Some(doc_c.as_path()))
+                .unwrap();
+            assert_eq!(tab_b.session.buffer.to_string(), "beta-modified-and-renamed\n");
+            assert_eq!(tab_b.session.state, DocState::Clean);
+        }
+
+        // save_tab_as must refuse binding two tabs to the same file path
+        let other_path = wb.tabs[1].session.path.clone().unwrap();
+        let err = wb.save_tab_as(id_a, &other_path).unwrap_err();
+        assert!(err.contains("already open"));
+        assert_eq!(
+            wb.tabs.iter().find(|t| t.id == id_a).unwrap().session.path.as_deref(),
+            Some(doc_a.as_path())
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_paste_rich_clipboard_normalizes_newlines_to_dominant_document_eol() {
+        let root = std::env::temp_dir().join(format!(
+            "vellmark-paste-eol-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let crlf_path = root.join("crlf.md");
+        fs::write(&crlf_path, b"# Title\r\n\r\nBody\r\n").unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), None);
+        let id_crlf = wb.open_document(&crlf_path).unwrap();
+        let tab = wb.tabs.iter_mut().find(|t| t.id == id_crlf).unwrap();
+        let insert_at = "# Title\r\n\r\n".len();
+        tab.edit(|ctx| ctx.set_caret(insert_at)).unwrap();
+
+        tab.paste_rich_clipboard(Some("<p>Para 1</p><p>Para 2</p>"), "Para 1\nPara 2")
+            .unwrap();
+        tab.paste_rich_clipboard(None, "Plain 1\nPlain 2").unwrap();
+        tab.paste_rich_clipboard(None, "h1\th2\nv1\tv2").unwrap();
+
+        let buf = tab.session.buffer.to_string();
+        for (idx, &b) in buf.as_bytes().iter().enumerate() {
+            if b == b'\n' {
+                assert!(idx > 0 && buf.as_bytes()[idx - 1] == b'\r', "bare LF at {idx} in {buf:?}");
+            }
+        }
+        assert_eq!(tab.save(), SaveOutcome::SavedClean);
+
+        // LF document must normalize CRLF clipboard text to `\n`
+        let lf_path = root.join("lf.md");
+        fs::write(&lf_path, b"# Title\n\nBody\n").unwrap();
+        let id_lf = wb.open_document(&lf_path).unwrap();
+        let lf_tab = wb.tabs.iter_mut().find(|t| t.id == id_lf).unwrap();
+        lf_tab.edit(|ctx| ctx.set_caret("# Title\n\n".len())).unwrap();
+        lf_tab
+            .paste_rich_clipboard(None, "Clip 1\r\nClip 2\r\n")
+            .unwrap();
+        let lf_buf = lf_tab.session.buffer.to_string();
+        assert!(!lf_buf.contains('\r'), "unexpected CR in LF doc: {lf_buf:?}");
+        assert!(lf_buf.contains("Clip 1\nClip 2\n"));
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -98,6 +98,24 @@ impl TextBuffer {
         &self.rope
     }
 
+    /// True when `offset` sits directly between `\r` and `\n` in a CRLF pair.
+    pub fn is_crlf_midpoint(&self, offset: ByteOffset) -> bool {
+        let clamped = offset.min(self.rope.len_bytes());
+        clamped > 0
+            && self.rope.get_byte(clamped - 1) == Some(b'\r')
+            && self.rope.get_byte(clamped) == Some(b'\n')
+    }
+
+    /// Clamp `offset` to buffer bounds and step back 1 byte if it sits between `\r` and `\n`.
+    pub fn snap_out_of_crlf(&self, offset: ByteOffset) -> ByteOffset {
+        let clamped = offset.min(self.rope.len_bytes());
+        if self.is_crlf_midpoint(clamped) {
+            clamped - 1
+        } else {
+            clamped
+        }
+    }
+
     /// Snapshot the current rope (O(1) structural sharing, PRD 4.5.1 A).
     pub fn snapshot_rope(&self) -> Rope {
         self.rope.clone()
