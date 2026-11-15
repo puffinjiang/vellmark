@@ -45,12 +45,12 @@ pub enum BlockKind {
 }
 
 pub use vellmark_core::table::{
-    TableAlign, TableCellSpan, TableRowParsed, is_pipe_table_line, parse_table_block,
-    parse_table_cell_rel_ranges, parse_table_delimiter_alignments, unescaped_pipe_offsets,
+    TableAlign, TableCellSpan, TableRowParsed, is_closing_fence_line, is_pipe_table_line,
+    parse_opening_fence_line, parse_table_block, parse_table_cell_rel_ranges,
+    parse_table_delimiter_alignments, unescaped_pipe_offsets,
 };
 use vellmark_core::table::{
-    is_closing_fence_line, parse_atx_heading_prefix, parse_list_item_kind,
-    parse_opening_fence_line, try_scan_gfm_table_from_line,
+    parse_atx_heading_prefix, parse_list_item_kind, try_scan_gfm_table_from_line,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

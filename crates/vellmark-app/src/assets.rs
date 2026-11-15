@@ -6,6 +6,17 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+/// Returns whether `path` has a supported raster image extension decoded by `vellmark`.
+pub fn is_supported_image_extension(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff"
+    )
+}
+
 /// Imports `source_image` into `<base_dir>/<assets_rel_dir>/<unique_file_name>` and returns
 /// `(copied_destination_path, markdown_snippet)` (e.g. `![diagram](./assets/diagram.png)`).
 pub fn import_image_to_assets(
@@ -15,6 +26,48 @@ pub fn import_image_to_assets(
     assets_rel_dir: &str,
     alt_text: Option<&str>,
 ) -> io::Result<(PathBuf, String)> {
+    let bytes = fs::read(source_image)?;
+    let raw_name = source_image
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid source image name"))?;
+    let stem = Path::new(raw_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("image");
+    let ext = Path::new(raw_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    import_image_bytes_to_assets(
+        doc_path,
+        fallback_dir,
+        &bytes,
+        stem,
+        ext,
+        assets_rel_dir,
+        alt_text,
+    )
+}
+
+/// Writes raw image `bytes` into `<base_dir>/<assets_rel_dir>/<unique_file_name>` and returns
+/// `(written_destination_path, markdown_snippet)` (PRD 4.4 I-02).
+pub fn import_image_bytes_to_assets(
+    doc_path: Option<&Path>,
+    fallback_dir: Option<&Path>,
+    bytes: &[u8],
+    stem: &str,
+    ext: &str,
+    assets_rel_dir: &str,
+    alt_text: Option<&str>,
+) -> io::Result<(PathBuf, String)> {
+    if bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot import empty image bytes",
+        ));
+    }
     let base_dir = doc_path
         .and_then(|p| p.parent())
         .filter(|p| !p.as_os_str().is_empty())
@@ -30,25 +83,36 @@ pub fn import_image_to_assets(
     let dest_dir = base_dir.join(&rel_clean);
     fs::create_dir_all(&dest_dir)?;
 
-    let raw_name = source_image
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid source image name"))?;
-    let stem = Path::new(raw_name)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("image");
-    let ext = Path::new(raw_name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let clean_stem = sanitize_filename_component(stem, "image");
+    let clean_ext: String = ext
+        .trim_start_matches('.')
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
 
-    let (dest_path, final_name) = create_unique_destination(&dest_dir, stem, ext, source_image)?;
+    let (dest_path, final_name) =
+        write_unique_destination(&dest_dir, &clean_stem, &clean_ext, bytes)?;
     let rel_posix = format_relative_markdown_path(assets_rel_dir, &rel_clean, &final_name);
-    let alt = alt_text.unwrap_or(stem);
+    let alt = alt_text.unwrap_or(&clean_stem);
     let markdown = format!("![{alt}]({rel_posix})");
     Ok((dest_path, markdown))
+}
+
+fn sanitize_filename_component(raw: &str, fallback: &str) -> String {
+    let clean: String = raw
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '\0' => '-',
+            _ if c.is_control() => '-',
+            _ => c,
+        })
+        .collect();
+    let trimmed = clean.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn sanitize_relative_assets_dir(rel: &str) -> io::Result<PathBuf> {
@@ -71,13 +135,12 @@ fn sanitize_relative_assets_dir(rel: &str) -> io::Result<PathBuf> {
     Ok(clean)
 }
 
-fn create_unique_destination(
+fn write_unique_destination(
     dest_dir: &Path,
     stem: &str,
     ext: &str,
-    source_image: &Path,
+    bytes: &[u8],
 ) -> io::Result<(PathBuf, String)> {
-    let bytes = fs::read(source_image)?;
     let mut suffix = 0usize;
     loop {
         let candidate_name = match (suffix, ext.is_empty()) {
@@ -94,7 +157,7 @@ fn create_unique_destination(
         {
             Ok(mut f) => {
                 use std::io::Write;
-                f.write_all(&bytes)?;
+                f.write_all(bytes)?;
                 f.sync_all()?;
                 return Ok((dest_path, candidate_name));
             }
@@ -158,6 +221,24 @@ mod tests {
 
         // Reject traversal in assets_rel_dir
         assert!(import_image_to_assets(Some(&doc_path), None, &src_img, "../outside", None).is_err());
+
+        // Raw byte import (e.g. clipboard PNG) + supported extensions
+        assert!(is_supported_image_extension(Path::new("snap.PNG")));
+        assert!(is_supported_image_extension(Path::new("photo.jpeg")));
+        assert!(!is_supported_image_extension(Path::new("notes.md")));
+
+        let (p3, md3) = import_image_bytes_to_assets(
+            Some(&doc_path),
+            None,
+            b"\x89PNG\r\n\x1a\nclip",
+            "clipboard/../clip",
+            "png",
+            "./assets",
+            Some("Pasted"),
+        )
+        .unwrap();
+        assert_eq!(md3, "![Pasted](./assets/clipboard-..-clip.png)");
+        assert!(p3.exists());
 
         let _ = fs::remove_dir_all(&dir);
     }

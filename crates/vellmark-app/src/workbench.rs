@@ -44,7 +44,7 @@ use vellmark_render::{
 };
 use vellmark_theme::ThemeSheet;
 
-use crate::assets::import_image_to_assets;
+use crate::assets::{import_image_bytes_to_assets, import_image_to_assets};
 use crate::config::AppConfig;
 use crate::search::{QuickOpenMatch, WorkspaceSearchMatch, global_workspace_search, quick_open_fuzzy_search};
 
@@ -903,13 +903,7 @@ impl AppWorkbench {
         source_image: &Path,
         alt_text: Option<&str>,
     ) -> Result<PathBuf, String> {
-        let doc_path = self
-            .active_tab()
-            .and_then(|t| t.session.path.as_deref())
-            .map(|p| p.to_path_buf());
-        let fallback = self.workspace_root.clone();
-        let rel_dir = self.config.image_assets_dir.clone();
-
+        let (doc_path, fallback, rel_dir) = self.active_image_target_dirs();
         let (dest_path, md_snippet) = import_image_to_assets(
             doc_path.as_deref(),
             fallback.as_deref(),
@@ -918,11 +912,50 @@ impl AppWorkbench {
             alt_text,
         )
         .map_err(|e| e.to_string())?;
+        self.insert_image_snippet_into_active(dest_path, &md_snippet)
+    }
 
+    /// Write raw image bytes (e.g., pasted clipboard bitmap) into `./assets` and insert Markdown syntax (PRD 4.4 I-02).
+    pub fn paste_image_bytes_into_active(
+        &mut self,
+        bytes: &[u8],
+        stem: &str,
+        ext: &str,
+        alt_text: Option<&str>,
+    ) -> Result<PathBuf, String> {
+        let (doc_path, fallback, rel_dir) = self.active_image_target_dirs();
+        let (dest_path, md_snippet) = import_image_bytes_to_assets(
+            doc_path.as_deref(),
+            fallback.as_deref(),
+            bytes,
+            stem,
+            ext,
+            &rel_dir,
+            alt_text,
+        )
+        .map_err(|e| e.to_string())?;
+        self.insert_image_snippet_into_active(dest_path, &md_snippet)
+    }
+
+    fn active_image_target_dirs(&self) -> (Option<PathBuf>, Option<PathBuf>, String) {
+        let doc_path = self
+            .active_tab()
+            .and_then(|t| t.session.path.as_deref())
+            .map(|p| p.to_path_buf());
+        let fallback = self.workspace_root.clone();
+        let rel_dir = self.config.image_assets_dir.clone();
+        (doc_path, fallback, rel_dir)
+    }
+
+    fn insert_image_snippet_into_active(
+        &mut self,
+        dest_path: PathBuf,
+        md_snippet: &str,
+    ) -> Result<PathBuf, String> {
         let tab = self
             .active_tab_mut()
             .ok_or_else(|| "no active tab".to_string())?;
-        tab.edit(|ctx| ctx.insert_text(&md_snippet))
+        tab.edit(|ctx| ctx.insert_text(md_snippet))
             .map_err(|e| e.to_string())?;
         Ok(dest_path)
     }

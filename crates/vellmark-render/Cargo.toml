@@ -12,3 +12,4 @@ vellmark-core.workspace = true
 vellmark-parser.workspace = true
 vellmark-theme.workspace = true
 cosmic-text.workspace = true
+syntect.workspace = true

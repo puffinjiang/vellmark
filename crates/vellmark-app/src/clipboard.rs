@@ -7,6 +7,7 @@ use std::sync::Mutex;
 pub struct ClipboardContent {
     pub text: Option<String>,
     pub html: Option<String>,
+    pub image_png: Option<Vec<u8>>,
 }
 
 /// Abstract clipboard transport so GUI controllers interact with the OS clipboard at runtime
@@ -53,9 +54,23 @@ impl ClipboardBackend for MemoryClipboard {
         *guard = ClipboardContent {
             text: Some(text.to_string()),
             html: html.map(str::to_string),
+            image_png: None,
         };
         Ok(())
     }
+}
+
+const MAX_CLIPBOARD_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+fn decode_to_png_bytes(raw: &[u8], fmt: image::ImageFormat) -> Option<Vec<u8>> {
+    if raw.is_empty() || raw.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return None;
+    }
+    let img = image::load_from_memory_with_format(raw, fmt).ok()?;
+    let mut png_out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut png_out, image::ImageFormat::Png).ok()?;
+    Some(png_out.into_inner())
 }
 
 /// Native OS clipboard integration.
@@ -79,22 +94,44 @@ impl NativeClipboard {
 #[cfg(target_os = "macos")]
 impl ClipboardBackend for NativeClipboard {
     fn read(&self) -> ClipboardContent {
-        use objc2_app_kit::{NSPasteboard, NSPasteboardTypeHTML, NSPasteboardTypeString};
+        use objc2_app_kit::{
+            NSPasteboard, NSPasteboardTypeHTML, NSPasteboardTypePNG, NSPasteboardTypeString,
+            NSPasteboardTypeTIFF,
+        };
 
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             let change_count = pb.changeCount();
             if let Ok(guard) = self.last_self_write.lock()
                 && let Some((saved_cc, ref md)) = *guard
-                    && saved_cc == change_count {
-                        return ClipboardContent {
-                            text: Some(md.clone()),
-                            html: None,
-                        };
-                    }
+                && saved_cc == change_count
+            {
+                return ClipboardContent {
+                    text: Some(md.clone()),
+                    html: None,
+                    image_png: None,
+                };
+            }
             let text = pb.stringForType(NSPasteboardTypeString).map(|s| s.to_string());
             let html = pb.stringForType(NSPasteboardTypeHTML).map(|s| s.to_string());
-            ClipboardContent { text, html }
+            // Prefer text/HTML whenever present; read bitmap only when no text payload exists.
+            let image_png = if text.is_none() {
+                pb.dataForType(NSPasteboardTypePNG)
+                    .map(|d| d.bytes().to_vec())
+                    .filter(|b| !b.is_empty() && b.len() <= MAX_CLIPBOARD_IMAGE_BYTES)
+                    .or_else(|| {
+                        pb.dataForType(NSPasteboardTypeTIFF).and_then(|d| {
+                            decode_to_png_bytes(d.bytes(), image::ImageFormat::Tiff)
+                        })
+                    })
+            } else {
+                None
+            };
+            ClipboardContent {
+                text,
+                html,
+                image_png,
+            }
         }
     }
 
@@ -143,15 +180,38 @@ impl ClipboardBackend for NativeClipboard {
             }
         };
 
+        let read_cmd_bytes = |program: &str, args: &[&str]| -> Option<Vec<u8>> {
+            let out = Command::new(program).args(args).output().ok()?;
+            if out.status.success()
+                && !out.stdout.is_empty()
+                && out.stdout.len() <= MAX_CLIPBOARD_IMAGE_BYTES
+            {
+                Some(out.stdout)
+            } else {
+                None
+            }
+        };
+
         let text = read_cmd("wl-paste", &["--no-newline"])
             .or_else(|| read_cmd("xclip", &["-o", "-selection", "clipboard"]))
             .or_else(|| read_cmd("xsel", &["--clipboard", "--output"]));
         let html = read_cmd("wl-paste", &["--no-newline", "--type", "text/html"]).or_else(|| {
             read_cmd("xclip", &["-o", "-selection", "clipboard", "-t", "text/html"])
         });
+        let image_png = if text.is_none() {
+            read_cmd_bytes("wl-paste", &["--no-newline", "--type", "image/png"]).or_else(|| {
+                read_cmd_bytes("xclip", &["-o", "-selection", "clipboard", "-t", "image/png"])
+            })
+        } else {
+            None
+        };
 
-        if text.is_some() || html.is_some() {
-            ClipboardContent { text, html }
+        if text.is_some() || html.is_some() || image_png.is_some() {
+            ClipboardContent {
+                text,
+                html,
+                image_png,
+            }
         } else {
             self.fallback.lock().map(|g| g.clone()).unwrap_or_default()
         }
@@ -181,6 +241,7 @@ impl ClipboardBackend for NativeClipboard {
             *guard = ClipboardContent {
                 text: Some(text.to_string()),
                 html: html.map(str::to_string),
+                image_png: None,
             };
         }
 
@@ -203,15 +264,35 @@ impl ClipboardBackend for NativeClipboard {
         if let Ok(out) = Command::new("powershell")
             .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
             .output()
+            && out.status.success()
         {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout).into_owned();
-                if !text.is_empty() {
-                    return ClipboardContent {
-                        text: Some(text),
-                        html: None,
-                    };
-                }
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            if !text.is_empty() {
+                return ClipboardContent {
+                    text: Some(text),
+                    html: None,
+                    image_png: None,
+                };
+            }
+        }
+        if let Ok(out) = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-STA",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; if ([System.Windows.Forms.Clipboard]::ContainsImage()) { $img = [System.Windows.Forms.Clipboard]::GetImage(); $ms = New-Object System.IO.MemoryStream; $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); [Convert]::ToBase64String($ms.ToArray()) }",
+            ])
+            .output()
+            && out.status.success()
+        {
+            let b64 = String::from_utf8_lossy(&out.stdout);
+            if let Some(png) = crate::images::decode_base64_str(b64.trim(), MAX_CLIPBOARD_IMAGE_BYTES)
+            {
+                return ClipboardContent {
+                    text: None,
+                    html: None,
+                    image_png: Some(png),
+                };
             }
         }
         self.fallback.lock().map(|g| g.clone()).unwrap_or_default()
@@ -225,6 +306,7 @@ impl ClipboardBackend for NativeClipboard {
             *guard = ClipboardContent {
                 text: Some(text.to_string()),
                 html: html.map(str::to_string),
+                image_png: None,
             };
         }
 
@@ -247,5 +329,24 @@ impl ClipboardBackend for NativeClipboard {
         } else {
             Err("Set-Clipboard command failed".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_memory_clipboard_image_and_text_roundtrip() {
+        let clip = MemoryClipboard::with_initial(ClipboardContent {
+            text: None,
+            html: None,
+            image_png: Some(vec![0x89, b'P', b'N', b'G']),
+        });
+        assert_eq!(clip.read().image_png.as_deref(), Some(&[0x89, b'P', b'N', b'G'][..]));
+        clip.write("hello", Some("<b>hello</b>")).unwrap();
+        let after = clip.read();
+        assert_eq!(after.text.as_deref(), Some("hello"));
+        assert!(after.image_png.is_none());
     }
 }

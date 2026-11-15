@@ -19,19 +19,23 @@ use vellmark_parser::{
     parse_table_block,
 };
 use vellmark_render::{
-    DrawList, EditorHitTarget, EditorSceneResult, EditorViewport, Rect, ResolvedThemeStyle,
-    SceneRect, ShapedDocumentCache, shape_ui_text_into,
+    CodeBlockButtonKind, CodeLanguageEntry, DrawList, EditorHitTarget, EditorSceneResult,
+    EditorViewport, ImageLoadStatus, Rect, ResolvedThemeStyle, SceneRect, ShapedDocumentCache,
+    code_language_catalog, code_language_display_label, normalize_fence_language_token,
+    shape_ui_text_into,
 };
 use vellmark_theme::BuiltinTheme;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Theme as WindowTheme, Window, WindowAttributes, WindowId};
 
+use crate::assets::is_supported_image_extension;
 use crate::clipboard::{ClipboardBackend, NativeClipboard};
 use crate::gpu::WgpuRenderer;
+use crate::images::ImageCache;
 use crate::search::QuickOpenMatch;
 use crate::workbench::{AppWorkbench, DocumentTab, WorkbenchRuntimeEvent};
 
@@ -709,6 +713,14 @@ enum UiAction {
     CloseQuickOpen,
     SelectQuickOpenMatch(usize),
     FocusQuickOpenInput,
+    OpenCodeLangPicker {
+        block_range: ByteRange,
+        current_language: String,
+    },
+    ToggleCodeLineNumbers,
+    CloseCodeLangPicker,
+    SelectCodeLangMatch(usize),
+    FocusCodeLangInput,
 }
 
 #[derive(Debug, Clone)]
@@ -772,6 +784,7 @@ enum ImeTarget {
     FindBox,
     LinkPromptBox,
     QuickOpenBox,
+    CodeLangBox,
 }
 
 /// Warning shown in the status bar whenever protected crash snapshots exceed the 500 MB budget.
@@ -814,6 +827,12 @@ pub struct GuiController {
     clipboard: Box<dyn ClipboardBackend>,
     save_dialog: Box<dyn SaveDialogBackend>,
     link_opener: Box<dyn LinkOpenerBackend>,
+    image_cache: ImageCache,
+    code_lang_open: bool,
+    code_lang_block_range: Option<ByteRange>,
+    code_lang_query: String,
+    code_lang_matches: Vec<&'static CodeLanguageEntry>,
+    code_lang_selected: usize,
     ime_target: ImeTarget,
     cached_meta: Option<CachedTabMeta>,
     ui_hit_zones: Vec<UiHitZone>,
@@ -886,6 +905,12 @@ impl GuiController {
             clipboard,
             save_dialog,
             link_opener: Box::new(NoopLinkOpener),
+            image_cache: ImageCache::new(None),
+            code_lang_open: false,
+            code_lang_block_range: None,
+            code_lang_query: String::new(),
+            code_lang_matches: Vec::new(),
+            code_lang_selected: 0,
             ime_target: ImeTarget::None,
             cached_meta: None,
             ui_hit_zones: Vec::new(),
@@ -895,6 +920,23 @@ impl GuiController {
             pending_scroll_ensure_caret: false,
             protected_limit_warned,
         }
+    }
+
+    pub(crate) fn set_image_redraw_notifier(
+        &mut self,
+        notifier: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.image_cache = ImageCache::new(notifier);
+    }
+
+    pub(crate) fn active_image_base_dir(&self) -> Option<PathBuf> {
+        self.workbench
+            .active_tab()
+            .and_then(|t| t.session.path.as_deref())
+            .and_then(|p| p.parent())
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .or_else(|| self.workbench.workspace_root.clone())
     }
 
     pub fn set_save_dialog(&mut self, save_dialog: Box<dyn SaveDialogBackend>) {
@@ -1245,6 +1287,9 @@ impl GuiController {
         if self.quick_open_open {
             self.build_quick_open_modal(&mut chrome_layer, layout.editor);
         }
+        if self.code_lang_open {
+            self.build_code_lang_modal(&mut chrome_layer, layout.editor);
+        }
         self.build_status_bar(&mut chrome_layer, layout.status_bar);
 
         (editor_layer, chrome_layer)
@@ -1329,6 +1374,15 @@ impl GuiController {
             .map(|m| m.find_matches.iter().map(|fm| fm.range).collect())
             .unwrap_or_default();
 
+        let _ = self.image_cache.drain_completed();
+        let image_base_dir = self.active_image_base_dir();
+        let allow_network_images = self.workbench.config.allow_network_images;
+        let show_code_line_numbers = self.workbench.config.show_code_line_numbers;
+        let status_resolver = |src: &str| -> ImageLoadStatus {
+            self.image_cache
+                .status_for(image_base_dir.as_deref(), src, allow_network_images)
+        };
+
         let scene_opt: Option<EditorSceneResult> = if let Some(tab) = self.workbench.active_tab() {
             let rev = tab.session.buffer.revision();
             let src_len = tab.session.buffer.len_bytes();
@@ -1344,8 +1398,10 @@ impl GuiController {
                 view: &tab.view,
                 focus_mode,
                 show_caret,
+                show_code_line_numbers,
                 find_matches: &find_ranges,
                 active_find,
+                image_status: Some(&status_resolver),
             };
             Some(tab.with_incremental_blocks(|blocks| {
                 self.shaper.build_editor_scene(blocks, &self.style, &vp, |r| {
@@ -1426,8 +1482,10 @@ impl GuiController {
                         view: &tab.view,
                         focus_mode,
                         show_caret,
+                        show_code_line_numbers,
                         find_matches: &find_ranges,
                         active_find,
+                        image_status: Some(&status_resolver),
                     };
                     scene = tab.with_incremental_blocks(|blocks| {
                         self.shaper.build_editor_scene(blocks, &self.style, &vp2, |r| {
@@ -1454,6 +1512,30 @@ impl GuiController {
                 SceneRect::rounded(sb_rect, self.style.chrome.muted_text.with_alpha(95), 2.5)
                     .with_clip(Some(editor_rect)),
             );
+        }
+
+        if !scene.requested_images.is_empty() {
+            self.image_cache.request_images(
+                image_base_dir.as_deref(),
+                &scene.requested_images,
+                allow_network_images,
+            );
+        }
+        for btn in &scene.code_block_buttons {
+            if let Some(rect) = intersect_rect(btn.rect, editor_rect) {
+                let action = match btn.kind {
+                    CodeBlockButtonKind::LanguagePicker => UiAction::OpenCodeLangPicker {
+                        block_range: btn.block_range,
+                        current_language: btn.current_language.clone(),
+                    },
+                    CodeBlockButtonKind::ToggleLineNumbers => UiAction::ToggleCodeLineNumbers,
+                };
+                self.ui_hit_zones.push(UiHitZone {
+                    rect,
+                    action,
+                    pointer_cursor: true,
+                });
+            }
         }
 
         scene.draw
@@ -2029,6 +2111,87 @@ impl GuiController {
     }
 
     fn build_quick_open_modal(&mut self, dl: &mut DrawList, editor_rect: Rect) {
+        let query = self.quick_open_query.clone();
+        let selected = self.quick_open_selected;
+        let empty_msg = if self.workbench.workspace_root.is_none() {
+            "No workspace folder open — press Cmd/Ctrl+Shift+O to open a folder"
+        } else {
+            "No matching Markdown/text files"
+        };
+        let rows: Vec<ListPickerRow> = self
+            .quick_open_matches
+            .iter()
+            .enumerate()
+            .map(|(idx, m)| ListPickerRow {
+                label: m.relative_path.clone(),
+                badge: None,
+                action: UiAction::SelectQuickOpenMatch(idx),
+            })
+            .collect();
+        self.draw_list_picker_modal(
+            dl,
+            editor_rect,
+            &query,
+            "Quick Open — type file name or path...",
+            empty_msg,
+            selected,
+            UiAction::FocusQuickOpenInput,
+            UiAction::CloseQuickOpen,
+            rows,
+        );
+    }
+
+    fn build_code_lang_modal(&mut self, dl: &mut DrawList, editor_rect: Rect) {
+        let query = self.code_lang_query.clone();
+        let selected = self.code_lang_selected;
+        let trimmed = query.trim();
+        let custom_empty;
+        let empty_msg = if !trimmed.is_empty() {
+            custom_empty = format!("Press Enter to use custom language \"{trimmed}\"");
+            custom_empty.as_str()
+        } else {
+            "No matching language"
+        };
+        let rows: Vec<ListPickerRow> = self
+            .code_lang_matches
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| ListPickerRow {
+                label: entry.label.to_string(),
+                badge: Some(if entry.token.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    entry.token.to_string()
+                }),
+                action: UiAction::SelectCodeLangMatch(idx),
+            })
+            .collect();
+        self.draw_list_picker_modal(
+            dl,
+            editor_rect,
+            &query,
+            "Code Language — type language name or token...",
+            empty_msg,
+            selected,
+            UiAction::FocusCodeLangInput,
+            UiAction::CloseCodeLangPicker,
+            rows,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_list_picker_modal(
+        &mut self,
+        dl: &mut DrawList,
+        editor_rect: Rect,
+        query: &str,
+        placeholder: &str,
+        empty_msg: &str,
+        selected: usize,
+        focus_action: UiAction,
+        close_action: UiAction,
+        rows: Vec<ListPickerRow>,
+    ) {
         let chrome = self.style.chrome;
         let modal_w = 540.0_f32.min((editor_rect.w - 24.0).max(260.0));
         let modal_x = editor_rect.x + ((editor_rect.w - modal_w) * 0.5).max(8.0);
@@ -2036,7 +2199,7 @@ impl GuiController {
 
         let max_visible = 8usize;
         let row_h = 28.0_f32;
-        let visible_rows = self.quick_open_matches.len().clamp(1, max_visible);
+        let visible_rows = rows.len().clamp(1, max_visible);
         let list_top = modal_y + 42.0;
         let modal_h = (48.0 + visible_rows as f32 * row_h).min((editor_rect.h - 24.0).max(80.0));
         let modal = Rect::new(modal_x, modal_y, modal_w, modal_h);
@@ -2047,7 +2210,7 @@ impl GuiController {
         );
         self.ui_hit_zones.push(UiHitZone {
             rect: modal,
-            action: UiAction::FocusQuickOpenInput,
+            action: focus_action.clone(),
             pointer_cursor: false,
         });
 
@@ -2060,7 +2223,7 @@ impl GuiController {
         self.push_ui_text(dl, "×", close_rect.x + 7.0, close_rect.y + 4.0, 12.0, 600, chrome.text, None, Some(modal));
         self.ui_hit_zones.push(UiHitZone {
             rect: close_rect,
-            action: UiAction::CloseQuickOpen,
+            action: close_action,
             pointer_cursor: true,
         });
 
@@ -2070,22 +2233,16 @@ impl GuiController {
             (modal.w - close_w - 22.0).max(120.0),
             26.0,
         );
-        let query = self.quick_open_query.clone();
         self.draw_overlay_text_input(
             dl,
             input_rect,
-            &query,
-            "Quick Open — type file name or path...",
+            query,
+            placeholder,
             true,
-            UiAction::FocusQuickOpenInput,
+            focus_action,
         );
 
-        if self.quick_open_matches.is_empty() {
-            let empty_msg = if self.workbench.workspace_root.is_none() {
-                "No workspace folder open — press Cmd/Ctrl+Shift+O to open a folder"
-            } else {
-                "No matching Markdown/text files"
-            };
+        if rows.is_empty() {
             self.push_ui_text(
                 dl,
                 empty_msg,
@@ -2100,15 +2257,18 @@ impl GuiController {
             return;
         }
 
-        let total = self.quick_open_matches.len();
-        let selected = self.quick_open_selected.min(total - 1);
+        let total = rows.len();
+        let selected = selected.min(total - 1);
         let start_idx = selected.saturating_sub(max_visible - 1);
         let end_idx = (start_idx + max_visible).min(total);
-        let rows: Vec<(usize, String)> = (start_idx..end_idx)
-            .map(|i| (i, self.quick_open_matches[i].relative_path.clone()))
-            .collect();
 
-        for (slot, (idx, rel_path)) in rows.into_iter().enumerate() {
+        for (slot, (idx, row)) in rows
+            .into_iter()
+            .enumerate()
+            .skip(start_idx)
+            .take(end_idx - start_idx)
+            .enumerate()
+        {
             let y = list_top + slot as f32 * row_h;
             if y + row_h > modal.y + modal.h - 2.0 {
                 break;
@@ -2121,20 +2281,39 @@ impl GuiController {
                         .with_border(1.0, chrome.accent.with_alpha(140)),
                 );
             }
+            let badge_reserve = row
+                .badge
+                .as_deref()
+                .map(|b| (b.chars().count() as f32 * 6.5 + 18.0).min(120.0))
+                .unwrap_or(0.0);
             self.push_ui_text(
                 dl,
-                &rel_path,
+                &row.label,
                 row_rect.x + 10.0,
                 row_rect.y + 5.0,
                 12.0,
                 if is_sel { 600 } else { 400 },
                 if is_sel { chrome.text } else { chrome.muted_text },
-                Some(row_rect.w - 20.0),
+                Some((row_rect.w - 20.0 - badge_reserve).max(40.0)),
                 Some(modal),
             );
+            if let Some(badge) = &row.badge {
+                let bx = row_rect.x + row_rect.w - badge_reserve + 4.0;
+                self.push_ui_text(
+                    dl,
+                    badge,
+                    bx,
+                    row_rect.y + 5.5,
+                    11.0,
+                    500,
+                    chrome.muted_text,
+                    Some((badge_reserve - 10.0).max(20.0)),
+                    Some(modal),
+                );
+            }
             self.ui_hit_zones.push(UiHitZone {
                 rect: row_rect,
-                action: UiAction::SelectQuickOpenMatch(idx),
+                action: row.action,
                 pointer_cursor: true,
             });
         }
@@ -2556,7 +2735,9 @@ impl GuiController {
     }
 
     fn focused_overlay_ime_target(&self) -> Option<ImeTarget> {
-        if self.quick_open_open {
+        if self.code_lang_open {
+            Some(ImeTarget::CodeLangBox)
+        } else if self.quick_open_open {
             Some(ImeTarget::QuickOpenBox)
         } else if self.link_prompt_open {
             Some(ImeTarget::LinkPromptBox)
@@ -2573,6 +2754,7 @@ impl GuiController {
 
     fn overlay_target_still_open(&self, target: ImeTarget) -> bool {
         match target {
+            ImeTarget::CodeLangBox => self.code_lang_open,
             ImeTarget::QuickOpenBox => self.quick_open_open,
             ImeTarget::LinkPromptBox => self.link_prompt_open,
             ImeTarget::FindBox => self.find_open,
@@ -2594,6 +2776,11 @@ impl GuiController {
             ImeTarget::QuickOpenBox => {
                 self.quick_open_query.push_str(text);
                 self.refresh_quick_open_matches();
+                true
+            }
+            ImeTarget::CodeLangBox => {
+                self.code_lang_query.push_str(text);
+                self.refresh_code_lang_matches();
                 true
             }
             ImeTarget::None | ImeTarget::Tab(_) => false,
@@ -2625,7 +2812,10 @@ impl GuiController {
                     // winit emits it immediately before `Ime::Commit` (especially on Cocoa insertText).
                     // Clearing only the visible preedit preserves `ime_composition_selection` and `ime_target`.
                     match self.ime_target {
-                        ImeTarget::FindBox | ImeTarget::LinkPromptBox | ImeTarget::QuickOpenBox => {}
+                        ImeTarget::FindBox
+                        | ImeTarget::LinkPromptBox
+                        | ImeTarget::QuickOpenBox
+                        | ImeTarget::CodeLangBox => {}
                         ImeTarget::Tab(target_id) => {
                             if let Some(tab) =
                                 self.workbench.tabs.iter_mut().find(|t| t.id == target_id)
@@ -2674,7 +2864,10 @@ impl GuiController {
                 self.ime_target = ImeTarget::None;
 
                 match target {
-                    ImeTarget::FindBox | ImeTarget::LinkPromptBox | ImeTarget::QuickOpenBox => {
+                    ImeTarget::FindBox
+                    | ImeTarget::LinkPromptBox
+                    | ImeTarget::QuickOpenBox
+                    | ImeTarget::CodeLangBox => {
                         self.commit_overlay_text(target, committed);
                     }
                     ImeTarget::Tab(target_id) => {
@@ -2793,12 +2986,28 @@ impl GuiController {
         if event.state != ElementState::Pressed {
             return false;
         }
-        self.handle_key_input(&event.logical_key, event.text.as_deref(), mods)
+        self.handle_key_input_with_physical(
+            &event.logical_key,
+            Some(event.physical_key),
+            event.text.as_deref(),
+            mods,
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_key_input(
         &mut self,
         logical_key: &Key,
+        text: Option<&str>,
+        mods: ModifiersState,
+    ) -> bool {
+        self.handle_key_input_with_physical(logical_key, None, text, mods)
+    }
+
+    fn handle_key_input_with_physical(
+        &mut self,
+        logical_key: &Key,
+        physical_key: Option<PhysicalKey>,
         text: Option<&str>,
         mods: ModifiersState,
     ) -> bool {
@@ -2807,6 +3016,7 @@ impl GuiController {
         let primary = is_primary_mod(mods);
         let shift = mods.shift_key();
         let alt = mods.alt_key();
+        let ctrl = mods.control_key();
 
         // When OS IME composition is active, let IME handle printable input; only allow Escape to cancel safely.
         let ime_composing = self
@@ -2825,6 +3035,21 @@ impl GuiController {
         }
         let active_id = self.workbench.active_tab().map(|t| t.id);
         self.cancel_abandoned_tab_ime(active_id);
+
+        // Code block insert/language-picker shortcut (`Cmd+Option+C` on macOS; Option+C may report `ç` in logical_key)
+        if primary
+            && alt
+            && !shift
+            && !ctrl
+            && (physical_key == Some(PhysicalKey::Code(KeyCode::KeyC))
+                || matches!(
+                    logical_key,
+                    Key::Character(ch) if matches!(ch.as_str(), "c" | "C" | "ç" | "Ç")
+                ))
+        {
+            self.insert_or_pick_code_block();
+            return true;
+        }
 
         // Primary shortcuts
         if primary && !alt
@@ -2851,8 +3076,16 @@ impl GuiController {
                         self.open_quick_open();
                         return true;
                     }
+                    "k" if shift && !cfg!(target_os = "macos") => {
+                        self.insert_or_pick_code_block();
+                        return true;
+                    }
                     "k" => {
                         self.open_link_prompt();
+                        return true;
+                    }
+                    "l" if shift => {
+                        self.execute_ui_action(UiAction::ToggleCodeLineNumbers);
                         return true;
                     }
                     "n" => {
@@ -3083,44 +3316,54 @@ impl GuiController {
         shift: bool,
         ctrl: bool,
     ) -> bool {
+        if self.code_lang_open {
+            match decode_list_modal_key(logical_key, text, primary, ctrl) {
+                ListModalAction::Close => self.close_code_lang_picker(),
+                ListModalAction::MoveSelection(delta) => {
+                    move_list_selection(
+                        &mut self.code_lang_selected,
+                        self.code_lang_matches.len(),
+                        delta,
+                    );
+                }
+                ListModalAction::Confirm => {
+                    self.confirm_code_lang_match(self.code_lang_selected);
+                }
+                ListModalAction::QueryBackspace => {
+                    self.code_lang_query.pop();
+                    self.refresh_code_lang_matches();
+                }
+                ListModalAction::QueryAppend(txt) => {
+                    self.code_lang_query.push_str(&txt);
+                    self.refresh_code_lang_matches();
+                }
+                ListModalAction::None => {}
+            }
+            return true;
+        }
+
         if self.quick_open_open {
-            match logical_key {
-                Key::Named(NamedKey::Escape) => {
-                    self.close_quick_open();
-                    return true;
+            match decode_list_modal_key(logical_key, text, primary, ctrl) {
+                ListModalAction::Close => self.close_quick_open(),
+                ListModalAction::MoveSelection(delta) => {
+                    move_list_selection(
+                        &mut self.quick_open_selected,
+                        self.quick_open_matches.len(),
+                        delta,
+                    );
                 }
-                Key::Named(NamedKey::ArrowUp) => {
-                    if self.quick_open_selected > 0 {
-                        self.quick_open_selected -= 1;
-                    }
-                    return true;
-                }
-                Key::Named(NamedKey::ArrowDown) => {
-                    if !self.quick_open_matches.is_empty() {
-                        self.quick_open_selected =
-                            (self.quick_open_selected + 1).min(self.quick_open_matches.len() - 1);
-                    }
-                    return true;
-                }
-                Key::Named(NamedKey::Enter) => {
+                ListModalAction::Confirm => {
                     self.confirm_quick_open_match(self.quick_open_selected);
-                    return true;
                 }
-                Key::Named(NamedKey::Backspace) => {
+                ListModalAction::QueryBackspace => {
                     self.quick_open_query.pop();
                     self.refresh_quick_open_matches();
-                    return true;
                 }
-                _ => {
-                    if let Some(txt) = (!primary && !ctrl)
-                        .then(|| overlay_printable_key_text(logical_key, text))
-                        .flatten()
-                    {
-                        self.quick_open_query.push_str(&txt);
-                        self.refresh_quick_open_matches();
-                        return true;
-                    }
+                ListModalAction::QueryAppend(txt) => {
+                    self.quick_open_query.push_str(&txt);
+                    self.refresh_quick_open_matches();
                 }
+                ListModalAction::None => {}
             }
             return true;
         }
@@ -3501,13 +3744,41 @@ impl GuiController {
                 self.confirm_link_prompt();
                 true
             }
-            UiAction::FocusLinkInput | UiAction::FocusQuickOpenInput => true,
+            UiAction::FocusLinkInput
+            | UiAction::FocusQuickOpenInput
+            | UiAction::FocusCodeLangInput => true,
             UiAction::CloseQuickOpen => {
                 self.close_quick_open();
                 true
             }
             UiAction::SelectQuickOpenMatch(idx) => {
                 self.confirm_quick_open_match(idx);
+                true
+            }
+            UiAction::OpenCodeLangPicker {
+                block_range,
+                current_language,
+            } => {
+                self.open_code_lang_picker(block_range, current_language);
+                true
+            }
+            UiAction::ToggleCodeLineNumbers => {
+                self.workbench.config.show_code_line_numbers =
+                    !self.workbench.config.show_code_line_numbers;
+                let on = self.workbench.config.show_code_line_numbers;
+                self.set_notice(if on {
+                    "Code Line Numbers: ON"
+                } else {
+                    "Code Line Numbers: OFF"
+                });
+                true
+            }
+            UiAction::CloseCodeLangPicker => {
+                self.close_code_lang_picker();
+                true
+            }
+            UiAction::SelectCodeLangMatch(idx) => {
+                self.confirm_code_lang_match(idx);
                 true
             }
         }
@@ -4068,6 +4339,7 @@ impl GuiController {
         match target {
             ImeTarget::FindBox => self.run_find_next(false),
             ImeTarget::QuickOpenBox => self.refresh_quick_open_matches(),
+            ImeTarget::CodeLangBox => self.refresh_code_lang_matches(),
             ImeTarget::LinkPromptBox | ImeTarget::None | ImeTarget::Tab(_) => {}
         }
     }
@@ -4077,6 +4349,7 @@ impl GuiController {
             ImeTarget::FindBox => &self.find_query,
             ImeTarget::LinkPromptBox => &self.link_prompt_url,
             ImeTarget::QuickOpenBox => &self.quick_open_query,
+            ImeTarget::CodeLangBox => &self.code_lang_query,
             ImeTarget::None | ImeTarget::Tab(_) => "",
         }
     }
@@ -4086,6 +4359,7 @@ impl GuiController {
             ImeTarget::FindBox => self.find_query.clear(),
             ImeTarget::LinkPromptBox => self.link_prompt_url.clear(),
             ImeTarget::QuickOpenBox => self.quick_open_query.clear(),
+            ImeTarget::CodeLangBox => self.code_lang_query.clear(),
             ImeTarget::None | ImeTarget::Tab(_) => {}
         }
     }
@@ -4155,7 +4429,30 @@ impl GuiController {
             .html
             .as_deref()
             .is_some_and(|h| !h.trim().is_empty());
-        if plain.is_empty() && !has_html {
+        let has_image = !self.has_focused_text_input()
+            && plain.is_empty()
+            && content.image_png.is_some();
+        if plain.is_empty() && !has_html && !has_image {
+            return;
+        }
+        if has_image && let Some(png) = content.image_png.as_deref() {
+            self.close_confirm_armed = false;
+            let active_id = self.workbench.active_tab().map(|t| t.id);
+            self.cancel_abandoned_tab_ime(active_id);
+            match self
+                .workbench
+                .paste_image_bytes_into_active(png, "pasted-image", "png", Some("image"))
+            {
+                Ok(dest) => {
+                    self.pending_scroll_ensure_caret = true;
+                    let name = dest
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("image.png");
+                    self.set_notice(format!("Pasted image -> {name}"));
+                }
+                Err(e) => self.set_notice(format!("Image paste failed: {e}")),
+            }
             return;
         }
         if !plain.is_empty() {
@@ -4164,7 +4461,7 @@ impl GuiController {
         if let Some(target) = self.focused_overlay_ime_target() {
             let clean = match target {
                 ImeTarget::FindBox => plain.as_str(),
-                ImeTarget::LinkPromptBox | ImeTarget::QuickOpenBox => {
+                ImeTarget::LinkPromptBox | ImeTarget::QuickOpenBox | ImeTarget::CodeLangBox => {
                     plain.trim_matches(&['\r', '\n'][..])
                 }
                 ImeTarget::None | ImeTarget::Tab(_) => "",
@@ -4186,9 +4483,11 @@ impl GuiController {
     fn close_transient_prompts(&mut self) {
         self.link_prompt_open = false;
         self.quick_open_open = false;
+        self.code_lang_open = false;
+        self.code_lang_block_range = None;
         if matches!(
             self.ime_target,
-            ImeTarget::LinkPromptBox | ImeTarget::QuickOpenBox
+            ImeTarget::LinkPromptBox | ImeTarget::QuickOpenBox | ImeTarget::CodeLangBox
         ) {
             self.ime_target = ImeTarget::None;
         }
@@ -4294,6 +4593,159 @@ impl GuiController {
                 self.set_notice(format!("Opened {}", picked.relative_path));
             }
             Err(e) => self.set_notice(format!("Open failed: {e}")),
+        }
+    }
+
+    /// Insert a fenced code block, or open the Code Language Picker if the caret is already inside one.
+    pub fn insert_or_pick_code_block(&mut self) {
+        if self.code_lang_open {
+            self.close_code_lang_picker();
+            return;
+        }
+        if let Some((block_range, current_language)) = self.active_caret_code_fence() {
+            self.open_code_lang_picker(block_range, current_language);
+        } else {
+            self.dispatch_editor(EditorAction::InsertCodeBlock(String::new()));
+        }
+    }
+
+    fn active_caret_code_fence(&self) -> Option<(ByteRange, String)> {
+        let tab = self.workbench.active_tab()?;
+        let caret = tab.view.selection.head;
+        let (found_range, info_string) = tab.with_incremental_blocks(|blocks| {
+            blocks.iter().find_map(|b| match &b.kind {
+                BlockKind::CodeFence { info_string }
+                    if caret >= b.range.start && caret <= b.range.end =>
+                {
+                    Some((b.range, info_string.clone()))
+                }
+                _ => None,
+            })
+        })?;
+        let block_text = tab.session.buffer.slice_to_string(found_range);
+        if caret == found_range.end && block_text.ends_with('\n') {
+            return None;
+        }
+        Some((found_range, info_string))
+    }
+
+    /// Show the Code Language Picker modal bound to a specific fenced code block.
+    pub fn open_code_lang_picker(&mut self, block_range: ByteRange, current_language: String) {
+        self.close_confirm_armed = false;
+        self.close_transient_prompts();
+        self.find_focused = false;
+        let active_id = self.workbench.active_tab().map(|t| t.id);
+        self.cancel_abandoned_tab_ime(active_id);
+        self.code_lang_block_range = Some(block_range);
+        self.code_lang_query.clear();
+        self.refresh_code_lang_matches();
+        let normalized = normalize_fence_language_token(&current_language);
+        if !normalized.is_empty()
+            && let Some(pos) = self
+                .code_lang_matches
+                .iter()
+                .position(|e| e.token == normalized)
+        {
+            self.code_lang_selected = pos;
+        }
+        self.code_lang_open = true;
+    }
+
+    fn close_code_lang_picker(&mut self) {
+        self.code_lang_open = false;
+        self.code_lang_block_range = None;
+        if self.ime_target == ImeTarget::CodeLangBox {
+            self.ime_target = ImeTarget::None;
+        }
+    }
+
+    fn refresh_code_lang_matches(&mut self) {
+        let q = self.code_lang_query.trim().to_ascii_lowercase();
+        self.code_lang_matches = code_language_catalog()
+            .iter()
+            .filter(|entry| {
+                q.is_empty()
+                    || entry.label.to_ascii_lowercase().contains(&q)
+                    || entry.token.to_ascii_lowercase().contains(&q)
+            })
+            .collect();
+        self.code_lang_selected = 0;
+    }
+
+    fn confirm_code_lang_match(&mut self, idx: usize) {
+        let Some(block_range) = self.code_lang_block_range else {
+            self.close_code_lang_picker();
+            return;
+        };
+        let selected_lang = if let Some(entry) = self.code_lang_matches.get(idx) {
+            entry.token.clone()
+        } else {
+            let custom = self.code_lang_query.trim();
+            if custom.is_empty() {
+                self.close_code_lang_picker();
+                return;
+            }
+            custom.to_string()
+        };
+        self.close_code_lang_picker();
+        self.find_focused = false;
+        self.close_confirm_armed = false;
+        let active_id = self.workbench.active_tab().map(|t| t.id);
+        self.cancel_abandoned_tab_ime(active_id);
+        if let Some(tab) = self.workbench.active_tab_mut() {
+            match tab.dispatch(EditorAction::SetCodeFenceLanguage {
+                block_range,
+                language: selected_lang.clone(),
+            }) {
+                Ok(_) => {
+                    self.pending_scroll_ensure_caret = true;
+                    let label = code_language_display_label(&selected_lang);
+                    self.set_notice(format!("Code block language: {label}"));
+                }
+                Err(e) => self.set_notice(format!("Action error: {e}")),
+            }
+        }
+    }
+
+    /// Handle an OS dropped directory, image asset (`PRD I-02`), or Markdown/text document.
+    pub fn handle_dropped_path(&mut self, path: &Path) {
+        self.close_confirm_armed = false;
+        if path.is_dir() {
+            self.close_transient_prompts();
+            if let Err(e) = self.workbench.open_folder(path) {
+                self.set_notice(format!("Drop open error: {e}"));
+            }
+            return;
+        }
+        if is_supported_image_extension(path) {
+            self.close_transient_prompts();
+            self.find_focused = false;
+            let active_id = self.workbench.active_tab().map(|t| t.id);
+            self.cancel_abandoned_tab_ime(active_id);
+            let alt = path.file_stem().and_then(|s| s.to_str());
+            match self.workbench.paste_image_into_active(path, alt) {
+                Ok(dest) => {
+                    self.pending_scroll_ensure_caret = true;
+                    let name = dest
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("image");
+                    self.set_notice(format!("Inserted image -> {name}"));
+                }
+                Err(e) => self.set_notice(format!("Image drop error: {e}")),
+            }
+            return;
+        }
+        self.close_transient_prompts();
+        self.flush_active_tab_before_switch();
+        match self.workbench.open_document(path) {
+            Ok(_) => {
+                self.find_focused = false;
+                self.ime_target = ImeTarget::None;
+                self.preferred_caret_x = None;
+                self.pending_scroll_ensure_caret = true;
+            }
+            Err(e) => self.set_notice(format!("Drop open error: {e}")),
         }
     }
 
@@ -4557,8 +5009,14 @@ impl VellmarkApp {
         }
     }
 
-    pub fn run(controller: GuiController) -> Result<(), String> {
-        let event_loop = EventLoop::new().map_err(|e| format!("failed to create event loop: {e}"))?;
+    pub fn run(mut controller: GuiController) -> Result<(), String> {
+        let event_loop = EventLoop::<()>::with_user_event()
+            .build()
+            .map_err(|e| format!("failed to create event loop: {e}"))?;
+        let proxy: EventLoopProxy<()> = event_loop.create_proxy();
+        controller.set_image_redraw_notifier(Some(Arc::new(move || {
+            let _ = proxy.send_event(());
+        })));
         let mut app = Self::new(controller);
         event_loop
             .run_app(&mut app)
@@ -4593,12 +5051,16 @@ impl VellmarkApp {
                 LogicalSize::new(area.w.max(2.0), area.h.max(16.0)),
             );
         }
+        let base_dir = self.controller.active_image_base_dir();
         let clear = self.controller.style.bg_color;
+        let shaper = &mut self.controller.shaper;
+        let image_cache = &mut self.controller.image_cache;
         let _ = gpu.render_layers(
             clear,
             scale,
-            self.controller.shaper.font_system_mut(),
+            shaper.font_system_mut(),
             &[&editor_dl, &chrome_dl],
+            |src| image_cache.get_decoded(base_dir.as_deref(), src),
         );
     }
 
@@ -4745,20 +5207,7 @@ impl ApplicationHandler for VellmarkApp {
                 }
             }
             WindowEvent::DroppedFile(path) => {
-                self.controller.close_confirm_armed = false;
-                let res = if path.is_dir() {
-                    self.controller.workbench.open_folder(&path).map(|_| ())
-                } else {
-                    self.controller.flush_active_tab_before_switch();
-                    self.controller
-                        .workbench
-                        .open_document(&path)
-                        .map(|_| ())
-                        .map_err(|e| std::io::Error::other(e.to_string()))
-                };
-                if let Err(e) = res {
-                    self.controller.set_notice(format!("Drop open error: {e}"));
-                }
+                self.controller.handle_dropped_path(&path);
                 self.request_redraw();
             }
             WindowEvent::Focused(false) => {
@@ -4780,7 +5229,15 @@ impl ApplicationHandler for VellmarkApp {
         }
     }
 
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        let _ = self.controller.image_cache.drain_completed();
+        self.request_redraw();
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.controller.image_cache.drain_completed() {
+            self.request_redraw();
+        }
         if self.controller.poll_background_maintenance() {
             self.request_redraw();
         }
@@ -4795,6 +5252,57 @@ impl ApplicationHandler for VellmarkApp {
         let next_wake = self.controller.next_wake_deadline();
         event_loop.set_control_flow(ControlFlow::WaitUntil(next_wake));
     }
+}
+
+struct ListPickerRow {
+    label: String,
+    badge: Option<String>,
+    action: UiAction,
+}
+
+enum ListModalAction {
+    None,
+    Close,
+    MoveSelection(isize),
+    Confirm,
+    QueryBackspace,
+    QueryAppend(String),
+}
+
+fn decode_list_modal_key(
+    logical_key: &Key,
+    text: Option<&str>,
+    primary: bool,
+    ctrl: bool,
+) -> ListModalAction {
+    match logical_key {
+        Key::Named(NamedKey::Escape) => ListModalAction::Close,
+        Key::Named(NamedKey::ArrowUp) => ListModalAction::MoveSelection(-1),
+        Key::Named(NamedKey::ArrowDown) => ListModalAction::MoveSelection(1),
+        Key::Named(NamedKey::Enter) => ListModalAction::Confirm,
+        Key::Named(NamedKey::Backspace) => ListModalAction::QueryBackspace,
+        _ => (!primary && !ctrl)
+            .then(|| overlay_printable_key_text(logical_key, text))
+            .flatten()
+            .map_or(ListModalAction::None, ListModalAction::QueryAppend),
+    }
+}
+
+fn move_list_selection(selected: &mut usize, len: usize, delta: isize) {
+    if len == 0 {
+        *selected = 0;
+        return;
+    }
+    let next = (*selected as isize + delta).clamp(0, len as isize - 1);
+    *selected = next as usize;
+}
+
+fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.w).min(b.x + b.w);
+    let y1 = (a.y + a.h).min(b.y + b.h);
+    (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
 }
 
 fn reserve_unique_untitled_path(dir: &Path, tab_id: u64) -> std::io::Result<PathBuf> {
@@ -5194,6 +5702,7 @@ mod tests {
         let initial_clip = ClipboardContent {
             text: Some("preserved".to_string()),
             html: None,
+            image_png: None,
         };
         let shared_clip = std::sync::Arc::new(MemoryClipboard::with_initial(initial_clip));
         struct SharedClip(std::sync::Arc<MemoryClipboard>);
@@ -5262,6 +5771,7 @@ mod tests {
         shared_clip.set_content(ClipboardContent {
             text: Some("heading".to_string()),
             html: Some("<h2>External Heading</h2>".to_string()),
+            image_png: None,
         });
         let end = gui.workbench.active_tab().unwrap().session.buffer.len_bytes();
         gui.workbench
@@ -5410,6 +5920,7 @@ mod tests {
         let shared_clip = std::sync::Arc::new(MemoryClipboard::with_initial(ClipboardContent {
             text: Some("prior".to_string()),
             html: None,
+            image_png: None,
         }));
         struct FailingClip(std::sync::Arc<MemoryClipboard>);
         impl ClipboardBackend for FailingClip {
@@ -6695,6 +7206,225 @@ Second duplicate body\n";
                 "`{bad_md}` should not produce an interactive link target"
             );
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn test_primary_modifier() -> ModifiersState {
+        if cfg!(target_os = "macos") {
+            ModifiersState::SUPER
+        } else {
+            ModifiersState::CONTROL
+        }
+    }
+
+    fn test_encode_png_2x2() -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([24, 144, 255, 255]));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn test_code_block_language_picker_and_line_numbers_toggle() {
+        let mut wb = AppWorkbench::new(AppConfig::default(), None);
+        wb.new_document();
+        wb.active_tab_mut()
+            .unwrap()
+            .session
+            .buffer
+            .reset_content("hello\n\n```rust\nfn main() {}\n```\n");
+        let mut gui = GuiController::new(wb);
+        assert!(gui.workbench.config.show_code_line_numbers);
+
+        let _ = gui.build_frame();
+        let ln_rect = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::ToggleCodeLineNumbers))
+            .map(|z| z.rect)
+            .expect("expected code block line-number toggle pill");
+        let lang_rect = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::OpenCodeLangPicker { .. }))
+            .map(|z| z.rect)
+            .expect("expected code block language picker pill");
+
+        // Click LN toggle pill -> disables line numbers; Cmd/Ctrl+Shift+L re-enables.
+        assert!(gui.handle_pointer_down(ln_rect.x + ln_rect.w * 0.5, ln_rect.y + ln_rect.h * 0.5));
+        assert!(!gui.workbench.config.show_code_line_numbers);
+        assert!(gui.handle_key_input(
+            &Key::Character("l".into()),
+            None,
+            test_primary_modifier() | ModifiersState::SHIFT
+        ));
+        assert!(gui.workbench.config.show_code_line_numbers);
+
+        // Click Language Picker pill -> search "py" -> Enter -> fence language becomes python.
+        assert!(gui.handle_pointer_down(lang_rect.x + lang_rect.w * 0.5, lang_rect.y + lang_rect.h * 0.5));
+        assert!(gui.code_lang_open);
+        assert!(gui.handle_key_input(&Key::Character("p".into()), Some("p"), ModifiersState::empty()));
+        assert!(gui.handle_key_input(&Key::Character("y".into()), Some("y"), ModifiersState::empty()));
+        assert!(!gui.code_lang_matches.is_empty());
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert!(!gui.code_lang_open);
+        assert!(gui
+            .workbench
+            .active_tab()
+            .unwrap()
+            .session
+            .buffer
+            .to_string()
+            .contains("```python\nfn main() {}"));
+    }
+
+    #[test]
+    fn test_code_block_shortcut_inserts_or_opens_language_picker() {
+        let mut wb = AppWorkbench::new(AppConfig::default(), None);
+        wb.new_document();
+        wb.active_tab_mut()
+            .unwrap()
+            .session
+            .buffer
+            .reset_content("paragraph");
+        wb.active_tab_mut()
+            .unwrap()
+            .edit(|ctx| ctx.set_caret("paragraph".len()))
+            .unwrap();
+        let mut gui = GuiController::new(wb);
+
+        // Outside a code block: Cmd+Option+C inserts a fenced code block and places caret inside it.
+        let code_mod = test_primary_modifier() | ModifiersState::ALT;
+        assert!(gui.handle_key_input(&Key::Character("ç".into()), None, code_mod));
+        let md = gui.workbench.active_tab().unwrap().session.buffer.to_string();
+        assert!(md.contains("```"), "expected code fence inserted, got: {md}");
+        assert!(!gui.code_lang_open);
+
+        // Inside the newly created code block: Cmd+Option+C opens the Code Language Picker modal.
+        assert!(gui.handle_key_input(&Key::Character("c".into()), None, code_mod));
+        assert!(gui.code_lang_open);
+        assert!(gui.handle_key_input(&Key::Character("r".into()), Some("r"), ModifiersState::empty()));
+        assert!(gui.handle_key_input(&Key::Character("u".into()), Some("u"), ModifiersState::empty()));
+        assert!(gui.handle_key_input(&Key::Character("s".into()), Some("s"), ModifiersState::empty()));
+        assert!(gui.handle_key_input(&Key::Character("t".into()), Some("t"), ModifiersState::empty()));
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert!(!gui.code_lang_open);
+        assert!(gui
+            .workbench
+            .active_tab()
+            .unwrap()
+            .session
+            .buffer
+            .to_string()
+            .contains("```rust\n"));
+    }
+
+    #[test]
+    fn test_clipboard_png_paste_imports_asset_and_skips_overlay_input() {
+        let dir = std::env::temp_dir().join(format!(
+            "vellmark-gui-clip-img-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("note.md");
+        fs::write(&note, "intro\n").unwrap();
+
+        let png = test_encode_png_2x2();
+        let clip = MemoryClipboard::with_initial(ClipboardContent {
+            text: None,
+            html: None,
+            image_png: Some(png.clone()),
+        });
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(dir.clone()));
+        wb.open_document(&note).unwrap();
+        let end = wb.active_tab().unwrap().session.buffer.len_bytes();
+        wb.active_tab_mut()
+            .unwrap()
+            .edit(|ctx| ctx.set_caret(end))
+            .unwrap();
+        let mut gui = GuiController::with_clipboard(wb, Box::new(clip));
+
+        gui.paste_clipboard();
+        let expected_asset = dir.join("assets").join("pasted-image.png");
+        assert_eq!(fs::read(&expected_asset).unwrap(), png);
+        assert!(gui
+            .workbench
+            .active_tab()
+            .unwrap()
+            .session
+            .buffer
+            .to_string()
+            .contains("![image](./assets/pasted-image.png)"));
+        assert!(gui
+            .active_status_notice()
+            .as_deref()
+            .is_some_and(|n| n.contains("pasted-image.png")));
+
+        // Pasting while a text overlay is focused must never import an image into assets.
+        gui.find_open = true;
+        gui.find_focused = true;
+        gui.paste_clipboard();
+        assert!(gui.find_query.is_empty());
+        assert!(!dir.join("assets").join("pasted-image-2.png").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_handle_dropped_image_imports_to_assets_while_md_drop_opens_tab() {
+        let dir = std::env::temp_dir().join(format!(
+            "vellmark-gui-drop-img-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("note.md");
+        let other = dir.join("other.md");
+        let shot = dir.join("shot.png");
+        let png = test_encode_png_2x2();
+        fs::write(&note, "# Start\n").unwrap();
+        fs::write(&other, "# Other\n").unwrap();
+        fs::write(&shot, &png).unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(dir.clone()));
+        wb.open_document(&note).unwrap();
+        let end = wb.active_tab().unwrap().session.buffer.len_bytes();
+        wb.active_tab_mut()
+            .unwrap()
+            .edit(|ctx| ctx.set_caret(end))
+            .unwrap();
+        let mut gui = GuiController::new(wb);
+
+        gui.handle_dropped_path(&shot);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.path.as_deref(),
+            Some(note.as_path())
+        );
+        let copied_asset = dir.join("assets").join("shot.png");
+        assert_eq!(fs::read(&copied_asset).unwrap(), png);
+        assert!(gui
+            .workbench
+            .active_tab()
+            .unwrap()
+            .session
+            .buffer
+            .to_string()
+            .contains("![shot](./assets/shot.png)"));
+
+        // Non-image Markdown drop still opens as a document tab.
+        gui.handle_dropped_path(&other);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.path.as_deref(),
+            Some(other.as_path())
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

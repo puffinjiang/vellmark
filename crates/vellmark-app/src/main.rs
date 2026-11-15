@@ -3,6 +3,7 @@ pub mod clipboard;
 pub mod config;
 pub mod gpu;
 pub mod gui;
+pub mod images;
 pub mod search;
 pub mod workbench;
 

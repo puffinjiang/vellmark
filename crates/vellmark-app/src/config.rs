@@ -30,6 +30,7 @@ pub struct AppConfig {
     pub auto_save_enabled: bool,
     pub auto_save_delay_ms: u64,
     pub table_auto_align: bool,
+    pub show_code_line_numbers: bool,
     pub image_assets_dir: String,
     pub allow_network_images: bool,
     pub language: UiLanguage,
@@ -54,6 +55,7 @@ impl Default for AppConfig {
             auto_save_enabled: true,
             auto_save_delay_ms: 2000, // PRD 4.5.1 A: 2s pause auto-save
             table_auto_align: true,   // PRD 4.3 T-03: enabled by default
+            show_code_line_numbers: true,
             image_assets_dir: "./assets".to_string(), // PRD 4.4 I-02
             allow_network_images: true,
             language: UiLanguage::ZhCn,
@@ -121,6 +123,7 @@ sidebar_visible = {}\n\
 auto_save_enabled = {}\n\
 auto_save_delay_ms = {}\n\
 table_auto_align = {}\n\
+show_code_line_numbers = {}\n\
 image_assets_dir = \"{}\"\n\
 allow_network_images = {}\n\
 language = \"{lang_name}\"\n",
@@ -138,6 +141,7 @@ language = \"{lang_name}\"\n",
             self.auto_save_enabled,
             self.auto_save_delay_ms,
             self.table_auto_align,
+            self.show_code_line_numbers,
             escape_toml_str(&self.image_assets_dir),
             self.allow_network_images,
         )
@@ -234,6 +238,11 @@ language = \"{lang_name}\"\n",
                         cfg.table_auto_align = b;
                     }
                 }
+                "show_code_line_numbers" => {
+                    if let Ok(b) = v.parse() {
+                        cfg.show_code_line_numbers = b;
+                    }
+                }
                 "image_assets_dir" => {
                     let s = unquote_toml_str(v);
                     if !s.is_empty() {
@@ -310,6 +319,7 @@ mod tests {
         cfg.zoom_in();
         assert_eq!(cfg.zoom_percent, 120);
         cfg.font_family = "\"Noto Serif CJK SC\", serif".to_string();
+        cfg.show_code_line_numbers = false;
 
         let serialized = cfg.to_toml_string();
         let parsed = AppConfig::from_toml_str(&serialized);

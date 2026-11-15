@@ -10,9 +10,13 @@ use cosmic_text::{
     Metrics, Shaping, Style as FontStyle, Weight, Wrap,
 };
 use vellmark_core::{ByteOffset, ByteRange, EditorViewState, Selection, ViewMode};
-use vellmark_parser::{parse_table_block, BlockKind, BlockNode, InlineKind, InlineSpan, TableAlign};
+use vellmark_parser::{
+    BlockKind, BlockNode, InlineKind, InlineSpan, TableAlign, extract_link_destination,
+    is_closing_fence_line, parse_opening_fence_line, parse_table_block,
+};
 
 use crate::style::{ResolvedThemeStyle, RgbaColor};
+use crate::syntax::{CodeSyntaxSpan, code_language_display_label, highlight_code_slice};
 
 /// Axis-aligned rectangle in logical pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -93,10 +97,33 @@ pub struct SceneGlyph {
     pub clip: Option<Rect>,
 }
 
+/// Decoded or pending status reported by the app image cache for viewport image layout (`PRD I-01`, `I-05`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImageLoadStatus {
+    Pending,
+    Loaded { width: u32, height: u32 },
+    Failed,
+    NetworkBlocked,
+}
+
+/// Callback resolving image loading status & natural pixel dimensions during block shaping.
+pub type ImageStatusResolver<'a> = &'a dyn Fn(&str) -> ImageLoadStatus;
+
+/// Textured image quad emitted in the scene draw list (`PRD I-01`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneImage {
+    pub rect: Rect,
+    pub source: String,
+    pub corner_radius: f32,
+    pub opacity: f32,
+    pub clip: Option<Rect>,
+}
+
 /// Draw list consumed cleanly by `vellmark-app::gpu::WgpuRenderer`.
 #[derive(Debug, Clone, Default)]
 pub struct DrawList {
     pub rects: Vec<SceneRect>,
+    pub images: Vec<SceneImage>,
     pub glyphs: Vec<SceneGlyph>,
 }
 
@@ -109,6 +136,8 @@ pub struct VisualTextMap {
     pub line_starts: Vec<usize>,
     /// `(vis_start, vis_end, src_start, src_end)` sorted by `vis_start`.
     segments: Vec<VisualSegment>,
+    /// Source offset returned when `segments` is empty (e.g., collapsed empty code fence or image alt).
+    empty_src_fallback: Option<ByteOffset>,
     /// Optional active IME composition splice inserted purely in visual coordinates.
     ime_splice: Option<ImeSplice>,
 }
@@ -224,7 +253,7 @@ impl VisualTextMap {
 
     fn base_visual_to_source(&self, vis: usize) -> ByteOffset {
         if self.segments.is_empty() {
-            return self.block_range.start;
+            return self.empty_src_fallback.unwrap_or(self.block_range.start);
         }
         for seg in &self.segments {
             if vis < seg.vis_start {
@@ -278,6 +307,16 @@ struct DisplaySpanStyle {
 }
 
 #[derive(Debug, Clone)]
+struct BlockImageItem {
+    src: String,
+    alt: String,
+    open_end: ByteOffset,
+    status: ImageLoadStatus,
+    display_w: f32,
+    display_h: f32,
+}
+
+#[derive(Debug, Clone)]
 struct BlockDisplay {
     map: VisualTextMap,
     spans: Vec<DisplaySpanStyle>,
@@ -289,6 +328,28 @@ struct BlockDisplay {
     hr_rule: bool,
     heading_level: Option<u8>,
     task_checkbox: Option<bool>,
+    code_fence_info: Option<String>,
+    code_header_h: f32,
+    code_gutter_w: f32,
+    code_first_body_line_i: usize,
+    code_body_line_count: usize,
+    images: Vec<BlockImageItem>,
+}
+
+/// Interactive button inside a WYSIWYG code block header bar (`PRD M-04`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeBlockButtonKind {
+    LanguagePicker,
+    ToggleLineNumbers,
+}
+
+/// Positioned code block header pill hit target returned per rendered frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeBlockButtonHit {
+    pub kind: CodeBlockButtonKind,
+    pub block_range: ByteRange,
+    pub current_language: String,
+    pub rect: Rect,
 }
 
 /// Inputs describing the active editor viewport for one virtualized frame render.
@@ -304,8 +365,10 @@ pub struct EditorViewport<'a> {
     pub view: &'a EditorViewState,
     pub focus_mode: bool,
     pub show_caret: bool,
+    pub show_code_line_numbers: bool,
     pub find_matches: &'a [ByteRange],
     pub active_find: Option<ByteRange>,
+    pub image_status: Option<ImageStatusResolver<'a>>,
 }
 
 /// Result of clicking/pointing inside the rendered editor scene.
@@ -329,6 +392,8 @@ pub struct EditorSceneResult {
     pub caret_line_height: f32,
     pub ime_cursor_area: Option<Rect>,
     pub visible_block_count: usize,
+    pub code_block_buttons: Vec<CodeBlockButtonHit>,
+    pub requested_images: Vec<String>,
 }
 
 struct CachedBlockShape {
@@ -338,6 +403,7 @@ struct CachedBlockShape {
     display: BlockDisplay,
     total_height: f32,
     inline_code_rects: Vec<Rect>,
+    image_hit_rects_rel: Vec<(Rect, ByteOffset)>,
 }
 
 struct TableCellDisplay {
@@ -549,6 +615,8 @@ impl ShapedDocumentCache {
                 caret_line_height: style.base_line_height_px,
                 ime_cursor_area: Some(cursor_area),
                 visible_block_count: 0,
+                code_block_buttons: Vec::new(),
+                requested_images: Vec::new(),
             };
         }
 
@@ -583,6 +651,8 @@ impl ShapedDocumentCache {
         let mut ime_cursor_area = None;
         let mut any_height_changed = false;
         let mut first_changed_idx = usize::MAX;
+        let mut code_block_buttons: Vec<CodeBlockButtonHit> = Vec::new();
+        let mut requested_images: Vec<String> = Vec::new();
 
         // Determine if caret sits at a trailing empty line past the final block (e.g., after `\n`).
         let caret_after_last_block = blocks
@@ -695,6 +765,9 @@ impl ShapedDocumentCache {
                 style,
                 block_focused,
                 vp.focus_mode,
+                vp.content_width_px,
+                vp.show_code_line_numbers,
+                vp.image_status,
             );
             let avail_w = (vp.content_width_px - display.left_indent_px - 24.0).max(80.0);
             let key = shape_cache_key(
@@ -732,18 +805,19 @@ impl ShapedDocumentCache {
             let text_origin_x = vp.content_left_x + shaped.display.left_indent_px;
             let text_origin_y = screen_top_y + shaped.display.top_pad_px;
 
-            // Block background decorations (code block container, blockquote bar, HR, headings border)
+            // Block background decorations (code block container, header bar, line numbers, blockquote bar, HR, headings border)
             if shaped.display.code_box {
-                let box_rect = Rect::new(
-                    vp.content_left_x + 4.0,
-                    screen_top_y + 2.0,
-                    (vp.content_width_px - 8.0).max(40.0),
-                    (measured_h - 4.0).max(20.0),
-                );
-                draw.rects.push(
-                    SceneRect::rounded(box_rect, style.code_block_bg, 6.0 * style.zoom_scale)
-                        .with_border(1.0, style.code_block_border)
-                        .with_clip(Some(vp.doc_rect)),
+                emit_code_block_chrome(
+                    &mut self.font_system,
+                    shaped,
+                    node.range,
+                    screen_top_y,
+                    text_origin_y,
+                    measured_h,
+                    vp,
+                    style,
+                    &mut draw,
+                    &mut code_block_buttons,
                 );
             }
             if shaped.display.blockquote_bar {
@@ -842,6 +916,20 @@ impl ShapedDocumentCache {
                 style,
                 &mut draw,
             );
+
+            if !shaped.display.images.is_empty() {
+                emit_block_images(
+                    &mut self.font_system,
+                    shaped,
+                    text_origin_x,
+                    text_origin_y,
+                    block_focused,
+                    vp,
+                    style,
+                    &mut draw,
+                    &mut requested_images,
+                );
+            }
 
             // Caret / IME candidate anchor if inside this block (and not past final block)
             let owns_ime = shaped.map.active_ime_caret_visual().is_some();
@@ -968,6 +1056,8 @@ impl ShapedDocumentCache {
             caret_line_height,
             ime_cursor_area,
             visible_block_count: vis_end_idx.saturating_sub(vis_start_idx),
+            code_block_buttons,
+            requested_images,
         }
     }
 
@@ -1001,8 +1091,15 @@ impl ShapedDocumentCache {
                         )));
                     }
                 } else if let Some(shaped) = self.shaped_lru.get(&rec.shape_hash) {
-                    let lx = (win_x - rec.text_origin_x).max(0.0);
-                    let ly = (win_y - rec.text_origin_y).max(0.0);
+                    let lx_raw = win_x - rec.text_origin_x;
+                    let ly_raw = win_y - rec.text_origin_y;
+                    for (rel_rect, open_end) in &shaped.image_hit_rects_rel {
+                        if rel_rect.contains(lx_raw, ly_raw) {
+                            return Some(EditorHitTarget::Text(*open_end));
+                        }
+                    }
+                    let lx = lx_raw.max(0.0);
+                    let ly = ly_raw.max(0.0);
                     if let Some(cur) = shaped.buffer.hit(lx, ly) {
                         let vis = shaped.map.line_col_to_visual(cur.line, cur.index);
                         return Some(EditorHitTarget::Text(
@@ -1229,7 +1326,18 @@ impl ShapedDocumentCache {
     {
         let node = ctx.blocks.get(block_idx)?;
         let raw = read_slice(node.range);
-        let display = build_block_display(node, &raw, ctx.view, ctx.exp_sel, ctx.style, true, false);
+        let display = build_block_display(
+            node,
+            &raw,
+            ctx.view,
+            ctx.exp_sel,
+            ctx.style,
+            true,
+            false,
+            ctx.content_width_px,
+            false,
+            None,
+        );
         let caret_vis = display
             .map
             .source_to_visual(ctx.view.selection.head.clamp(node.range.start, node.range.end));
@@ -1276,6 +1384,39 @@ pub fn shape_ui_text_into(
     scale_factor: f32,
     out_glyphs: &mut Vec<SceneGlyph>,
 ) -> f32 {
+    shape_ui_text_family_into(
+        font_system,
+        text,
+        x,
+        y,
+        font_size,
+        line_height,
+        weight,
+        false,
+        color,
+        max_width,
+        clip,
+        scale_factor,
+        out_glyphs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shape_ui_text_family_into(
+    font_system: &mut FontSystem,
+    text: &str,
+    x: f32,
+    y: f32,
+    font_size: f32,
+    line_height: f32,
+    weight: u16,
+    monospace: bool,
+    color: RgbaColor,
+    max_width: Option<f32>,
+    clip: Option<Rect>,
+    scale_factor: f32,
+    out_glyphs: &mut Vec<SceneGlyph>,
+) -> f32 {
     if text.is_empty() {
         return 0.0;
     }
@@ -1285,7 +1426,11 @@ pub fn shape_ui_text_into(
     buf.set_wrap(Wrap::None);
     buf.set_size(max_width, Some(line_height + 4.0));
     let attrs = Attrs::new()
-        .family(Family::SansSerif)
+        .family(if monospace {
+            Family::Monospace
+        } else {
+            Family::SansSerif
+        })
         .weight(Weight(weight))
         .color(color.to_cosmic_color());
     buf.set_text(text, &attrs, Shaping::Advanced, None);
@@ -1306,6 +1451,345 @@ pub fn shape_ui_text_into(
         }
     }
     max_w
+}
+
+fn measure_ui_text_width(
+    font_system: &mut FontSystem,
+    text: &str,
+    font_size: f32,
+    line_height: f32,
+    weight: u16,
+    monospace: bool,
+) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let metrics = Metrics::new(font_size.max(8.0), line_height.max(10.0));
+    let mut buf = CosmicBuffer::new(font_system, metrics);
+    buf.set_wrap(Wrap::None);
+    buf.set_size(None, Some(line_height + 4.0));
+    let attrs = Attrs::new()
+        .family(if monospace {
+            Family::Monospace
+        } else {
+            Family::SansSerif
+        })
+        .weight(Weight(weight));
+    buf.set_text(text, &attrs, Shaping::Advanced, None);
+    buf.shape_until_scroll(font_system, false);
+    buf.layout_runs().next().map_or(0.0, |r| r.line_w)
+}
+
+fn intersect_rects(a: Rect, b: Rect) -> Option<Rect> {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.w).min(b.x + b.w);
+    let y1 = (a.y + a.h).min(b.y + b.h);
+    (x1 > x0 && y1 > y0).then_some(Rect::new(x0, y0, x1 - x0, y1 - y0))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_code_block_chrome(
+    font_system: &mut FontSystem,
+    shaped: &CachedBlockShape,
+    block_range: ByteRange,
+    screen_top_y: f32,
+    text_origin_y: f32,
+    measured_h: f32,
+    vp: &EditorViewport<'_>,
+    style: &ResolvedThemeStyle,
+    draw: &mut DrawList,
+    code_block_buttons: &mut Vec<CodeBlockButtonHit>,
+) {
+    let box_rect = Rect::new(
+        vp.content_left_x + 4.0,
+        screen_top_y + 2.0,
+        (vp.content_width_px - 8.0).max(40.0),
+        (measured_h - 4.0).max(20.0),
+    );
+    draw.rects.push(
+        SceneRect::rounded(box_rect, style.code_block_bg, 6.0 * style.zoom_scale)
+            .with_border(1.0, style.code_block_border)
+            .with_clip(Some(vp.doc_rect)),
+    );
+
+    let Some(info_str) = &shaped.display.code_fence_info else {
+        return;
+    };
+
+    let header_h = shaped.display.code_header_h;
+    let header_bottom_y = box_rect.y + header_h;
+    draw.rects.push(
+        SceneRect::solid(
+            Rect::new(box_rect.x + 1.0, header_bottom_y, (box_rect.w - 2.0).max(1.0), 1.0),
+            style.code_block_border,
+        )
+        .with_clip(Some(vp.doc_rect)),
+    );
+
+    // Header pills (Language Selector + Line Numbers toggle)
+    if header_bottom_y > vp.doc_rect.y && box_rect.y < vp.doc_rect.y + vp.doc_rect.h {
+        let ui_font = (style.base_font_size_px * 0.78).clamp(10.0, 14.0);
+        let pill_pad_x = 7.0 * style.zoom_scale;
+        let pill_y = box_rect.y + 3.0 * style.zoom_scale;
+        let pill_h = (header_h - 6.0 * style.zoom_scale).max(14.0);
+        let ui_lh = (pill_h - 2.0).max(12.0);
+        let text_y = pill_y + (pill_h - ui_lh) * 0.5;
+
+        // Right-aligned Line Numbers ("LN") toggle button
+        let ln_label = "LN";
+        let ln_tw = measure_ui_text_width(font_system, ln_label, ui_font, ui_lh, 600, true);
+        let ln_w = (ln_tw + pill_pad_x * 2.0).round();
+        let ln_x = (box_rect.x + box_rect.w - ln_w - 8.0 * style.zoom_scale).max(box_rect.x + 8.0);
+        let ln_rect = Rect::new(ln_x, pill_y, ln_w, pill_h);
+        let (ln_bg, ln_border, ln_fg) = if vp.show_code_line_numbers {
+            (
+                style.chrome.accent.with_alpha(38),
+                style.chrome.accent,
+                style.chrome.accent,
+            )
+        } else {
+            (
+                style.code_block_border.with_alpha(80),
+                style.code_block_border,
+                style.muted_marker_color,
+            )
+        };
+        draw.rects.push(
+            SceneRect::rounded(ln_rect, ln_bg, 4.0 * style.zoom_scale)
+                .with_border(1.0, ln_border)
+                .with_clip(Some(vp.doc_rect)),
+        );
+        shape_ui_text_family_into(
+            font_system,
+            ln_label,
+            ln_x + pill_pad_x,
+            text_y,
+            ui_font,
+            ui_lh,
+            600,
+            true,
+            ln_fg,
+            Some(ln_w),
+            Some(vp.doc_rect),
+            vp.scale_factor,
+            &mut draw.glyphs,
+        );
+        if let Some(hit_r) = intersect_rects(ln_rect, vp.doc_rect) {
+            code_block_buttons.push(CodeBlockButtonHit {
+                kind: CodeBlockButtonKind::ToggleLineNumbers,
+                block_range,
+                current_language: info_str.clone(),
+                rect: hit_r,
+            });
+        }
+
+        // Left-aligned Language Selector ("lang ▾") pill
+        let max_lang_w = (ln_x - box_rect.x - 18.0 * style.zoom_scale).max(40.0);
+        let lang_label = format!("{} ▾", code_language_display_label(info_str));
+        let lang_tw = measure_ui_text_width(font_system, &lang_label, ui_font, ui_lh, 500, false);
+        let lang_w = (lang_tw + pill_pad_x * 2.0).min(max_lang_w).max(36.0);
+        let lang_x = box_rect.x + 8.0 * style.zoom_scale;
+        let lang_rect = Rect::new(lang_x, pill_y, lang_w, pill_h);
+        draw.rects.push(
+            SceneRect::rounded(
+                lang_rect,
+                style.code_block_border.with_alpha(70),
+                4.0 * style.zoom_scale,
+            )
+            .with_border(1.0, style.code_block_border)
+            .with_clip(Some(vp.doc_rect)),
+        );
+        let lang_clip = intersect_rects(
+            Rect::new(lang_x, pill_y, (lang_w - 2.0).max(1.0), pill_h),
+            vp.doc_rect,
+        );
+        shape_ui_text_family_into(
+            font_system,
+            &lang_label,
+            lang_x + pill_pad_x,
+            text_y,
+            ui_font,
+            ui_lh,
+            500,
+            false,
+            style.code_block_text,
+            Some((lang_w - pill_pad_x * 1.5).max(16.0)),
+            lang_clip,
+            vp.scale_factor,
+            &mut draw.glyphs,
+        );
+        if let Some(hit_r) = intersect_rects(lang_rect, vp.doc_rect) {
+            code_block_buttons.push(CodeBlockButtonHit {
+                kind: CodeBlockButtonKind::LanguagePicker,
+                block_range,
+                current_language: info_str.clone(),
+                rect: hit_r,
+            });
+        }
+    }
+
+    // Gutter divider & viewport-culled logical line numbers
+    if vp.show_code_line_numbers
+        && shaped.display.code_gutter_w > 0.0
+        && shaped.display.code_body_line_count > 0
+    {
+        let gutter_right_x = box_rect.x + shaped.display.code_gutter_w;
+        let gutter_h = (box_rect.y + box_rect.h - header_bottom_y - 2.0).max(0.0);
+        if gutter_h > 1.0 {
+            draw.rects.push(
+                SceneRect::solid(
+                    Rect::new(gutter_right_x, header_bottom_y, 1.0, gutter_h),
+                    style.code_block_border.with_alpha(140),
+                )
+                .with_clip(Some(vp.doc_rect)),
+            );
+        }
+
+        let num_font = (style.code_font_size_px * 0.88).max(9.0);
+        let right_pad = 6.0 * style.zoom_scale;
+        let first_body_i = shaped.display.code_first_body_line_i;
+        let end_body_i = first_body_i + shaped.display.code_body_line_count;
+        let mut prev_line_i: Option<usize> = None;
+
+        for run in shaped.buffer.layout_runs() {
+            if prev_line_i == Some(run.line_i) {
+                continue;
+            }
+            prev_line_i = Some(run.line_i);
+            if run.line_i < first_body_i || run.line_i >= end_body_i {
+                continue;
+            }
+            let abs_y = text_origin_y + run.line_top;
+            if abs_y + run.line_height < vp.doc_rect.y || abs_y > vp.doc_rect.y + vp.doc_rect.h {
+                continue;
+            }
+            let line_num = (run.line_i - first_body_i + 1).to_string();
+            let num_w =
+                measure_ui_text_width(font_system, &line_num, num_font, run.line_height, 400, true);
+            let num_x = (gutter_right_x - right_pad - num_w).max(box_rect.x + 2.0);
+            shape_ui_text_family_into(
+                font_system,
+                &line_num,
+                num_x,
+                abs_y,
+                num_font,
+                run.line_height,
+                400,
+                true,
+                style.muted_marker_color,
+                None,
+                Some(vp.doc_rect),
+                vp.scale_factor,
+                &mut draw.glyphs,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_block_images(
+    font_system: &mut FontSystem,
+    shaped: &CachedBlockShape,
+    text_origin_x: f32,
+    text_origin_y: f32,
+    block_focused: bool,
+    vp: &EditorViewport<'_>,
+    style: &ResolvedThemeStyle,
+    draw: &mut DrawList,
+    requested_images: &mut Vec<String>,
+) {
+    let opacity = if vp.focus_mode && !block_focused {
+        0.45
+    } else {
+        1.0
+    };
+    let radius = 6.0 * style.zoom_scale;
+
+    for (idx, item) in shaped.display.images.iter().enumerate() {
+        if !item.src.is_empty() && !requested_images.iter().any(|s| s == &item.src) {
+            requested_images.push(item.src.clone());
+        }
+        let Some((rel_rect, _)) = shaped.image_hit_rects_rel.get(idx) else {
+            continue;
+        };
+        let card_rect = rel_rect.translate(text_origin_x, text_origin_y);
+        if card_rect.y + card_rect.h < vp.doc_rect.y - 8.0
+            || card_rect.y > vp.doc_rect.y + vp.doc_rect.h + 8.0
+        {
+            continue;
+        }
+
+        match item.status {
+            ImageLoadStatus::Loaded { .. } => {
+                draw.images.push(SceneImage {
+                    rect: card_rect,
+                    source: item.src.clone(),
+                    corner_radius: radius,
+                    opacity,
+                    clip: Some(vp.doc_rect),
+                });
+            }
+            ImageLoadStatus::Pending | ImageLoadStatus::Failed | ImageLoadStatus::NetworkBlocked => {
+                draw.rects.push(
+                    SceneRect::rounded(card_rect, style.code_block_bg, radius)
+                        .with_border(1.0, style.code_block_border)
+                        .with_clip(Some(vp.doc_rect)),
+                );
+                let title = match item.status {
+                    ImageLoadStatus::Pending => "Loading image...",
+                    ImageLoadStatus::Failed => "Image failed to load",
+                    ImageLoadStatus::NetworkBlocked => "Network images disabled",
+                    ImageLoadStatus::Loaded { .. } => unreachable!(),
+                };
+                let subtitle = if !item.alt.is_empty() {
+                    item.alt.as_str()
+                } else {
+                    item.src.as_str()
+                };
+                let label_color = if matches!(item.status, ImageLoadStatus::Failed) {
+                    style.chrome.danger
+                } else {
+                    style.muted_marker_color
+                };
+                let pad_x = 12.0 * style.zoom_scale;
+                let fs = (style.base_font_size_px * 0.84).clamp(11.0, 15.0);
+                let lh = (fs * 1.35).round();
+                let top_y = card_rect.y + ((card_rect.h - lh * 2.0) * 0.5).max(6.0);
+                let card_clip = intersect_rects(card_rect, vp.doc_rect);
+                shape_ui_text_into(
+                    font_system,
+                    title,
+                    card_rect.x + pad_x,
+                    top_y,
+                    fs,
+                    lh,
+                    600,
+                    label_color,
+                    Some((card_rect.w - pad_x * 2.0).max(40.0)),
+                    card_clip,
+                    vp.scale_factor,
+                    &mut draw.glyphs,
+                );
+                if !subtitle.is_empty() {
+                    shape_ui_text_into(
+                        font_system,
+                        subtitle,
+                        card_rect.x + pad_x,
+                        top_y + lh,
+                        (fs * 0.9).max(10.0),
+                        lh,
+                        400,
+                        style.text_color,
+                        Some((card_rect.w - pad_x * 2.0).max(40.0)),
+                        card_clip,
+                        vp.scale_factor,
+                        &mut draw.glyphs,
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1979,6 +2463,7 @@ fn enter_table_from_adjacent(
     hit_cell_at_target_x(cell, block_start, target_x_rel_content, target_y)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_block_display(
     node: &BlockNode,
     raw_text: &str,
@@ -1987,6 +2472,9 @@ fn build_block_display(
     style: &ResolvedThemeStyle,
     is_focused: bool,
     focus_mode: bool,
+    content_width_px: f32,
+    show_code_line_numbers: bool,
+    image_status: Option<ImageStatusResolver<'_>>,
 ) -> BlockDisplay {
     let block_start = node.range.start;
     let is_source = view.mode == ViewMode::Source;
@@ -1995,6 +2483,7 @@ fn build_block_display(
     let mut hidden: Vec<Range<usize>> = Vec::new();
     let mut marker_ranges: Vec<Range<usize>> = Vec::new();
     let mut synthetic_prefix: Option<&'static str> = None;
+    let mut empty_src_fallback: Option<ByteOffset> = None;
     let mut left_indent_px = 12.0;
     let mut top_pad_px = 3.0 * style.zoom_scale;
     let mut bottom_pad_px = 4.0 * style.zoom_scale;
@@ -2003,6 +2492,13 @@ fn build_block_display(
     let mut hr_rule = false;
     let mut heading_level = None;
     let mut task_checkbox = None;
+    let mut code_fence_info: Option<String> = None;
+    let mut code_header_h = 0.0f32;
+    let mut code_gutter_w = 0.0f32;
+    let mut code_first_body_line_i = 0usize;
+    let mut code_body_line_count = 0usize;
+    let mut code_syntax: Option<(ByteOffset, Vec<CodeSyntaxSpan>)> = None;
+    let mut images: Vec<BlockImageItem> = Vec::new();
     let mut base_color = style.apply_focus_mode(style.text_color, is_focused, focus_mode);
     let mut base_font_size = style.base_font_size_px;
     let mut base_line_height = style.base_line_height_px;
@@ -2095,7 +2591,83 @@ fn build_block_display(
                 }
             }
         }
-        BlockKind::CodeFence { .. } | BlockKind::YamlFrontMatter => {
+        BlockKind::CodeFence { info_string } => {
+            let layout = parse_code_fence_structure(raw_text);
+            base_font_size = style.code_font_size_px;
+            base_line_height = style.code_line_height_px;
+            base_monospace = true;
+
+            if is_source {
+                left_indent_px = 16.0 * style.zoom_scale;
+                top_pad_px = 8.0 * style.zoom_scale;
+                bottom_pad_px = 8.0 * style.zoom_scale;
+                base_color = style.apply_focus_mode(style.code_block_text, is_focused, focus_mode);
+                if layout.open_line_end > 0 {
+                    marker_ranges.push(0..layout.open_line_end);
+                }
+                if let Some(cs) = layout.close_line_start {
+                    marker_ranges.push(cs..block_len);
+                }
+            } else {
+                code_box = true;
+                code_fence_info = Some(info_string.clone());
+                code_header_h = (26.0 * style.zoom_scale).round();
+                top_pad_px = code_header_h + 6.0 * style.zoom_scale;
+                bottom_pad_px = 10.0 * style.zoom_scale;
+                code_body_line_count = layout.body_line_count;
+                if show_code_line_numbers && code_body_line_count > 0 {
+                    let digits = code_body_line_count.to_string().len().max(2);
+                    code_gutter_w = (digits as f32 * (style.code_font_size_px * 0.62)
+                        + 14.0 * style.zoom_scale)
+                        .round()
+                        .max(30.0 * style.zoom_scale);
+                    left_indent_px = 8.0 * style.zoom_scale + code_gutter_w + 10.0 * style.zoom_scale;
+                } else {
+                    left_indent_px = 16.0 * style.zoom_scale;
+                }
+                base_color = style.apply_focus_mode(style.code_block_text, is_focused, focus_mode);
+
+                let inside = exp_sel.is_caret() && node.range.contains_inclusive(exp_sel.head);
+                if !inside {
+                    code_first_body_line_i = 0;
+                    if layout.open_hide_end > 0 {
+                        hidden.push(0..layout.open_hide_end);
+                    }
+                    if layout.close_line_start.is_some() && layout.close_hide_start < block_len {
+                        hidden.push(layout.close_hide_start..block_len);
+                    }
+                    empty_src_fallback = Some(block_start + layout.open_hide_end);
+                } else {
+                    code_first_body_line_i =
+                        usize::from(layout.open_hide_end > layout.open_line_end);
+                    if layout.open_line_end > 0 {
+                        marker_ranges.push(0..layout.open_line_end);
+                    }
+                    if let Some(cs) = layout.close_line_start {
+                        marker_ranges.push(cs..block_len);
+                    }
+                }
+
+                // PRD 4.1.1 F #9: Freeze heavy token highlighting while IME preedit targets this block.
+                let ime_targets_block = view.ime_preedit.is_some() && {
+                    let comp_range = view.ime_composition_selection.unwrap_or(view.selection).range();
+                    node.range.contains_inclusive(comp_range.start)
+                };
+                if !ime_targets_block && !layout.body_range.is_empty() {
+                    let tokens = highlight_code_slice(
+                        &raw_text[layout.body_range.clone()],
+                        info_string,
+                        style.chrome.is_dark,
+                        style.code_block_text,
+                        style.code_block_bg,
+                    );
+                    if !tokens.is_empty() {
+                        code_syntax = Some((block_start + layout.body_range.start, tokens));
+                    }
+                }
+            }
+        }
+        BlockKind::YamlFrontMatter => {
             code_box = !is_source;
             left_indent_px = 16.0 * style.zoom_scale;
             top_pad_px = 8.0 * style.zoom_scale;
@@ -2117,9 +2689,63 @@ fn build_block_display(
         BlockKind::Paragraph => {}
     }
 
+    // Collect WYSIWYG image previews (PRD I-01) for non-code/non-table blocks.
+    if !is_source
+        && !matches!(
+            node.kind,
+            BlockKind::CodeFence { .. } | BlockKind::YamlFrontMatter | BlockKind::Table
+        )
+    {
+        let img_spans: Vec<&InlineSpan> = node
+            .inlines
+            .iter()
+            .filter(|s| s.kind == InlineKind::Image)
+            .collect();
+        let max_img_w = (content_width_px - left_indent_px - 28.0).clamp(120.0, 760.0);
+        for span in &img_spans {
+            let local_end = span.full_range.end.saturating_sub(block_start).min(block_len);
+            let open_end_rel = span.open_marker.end.saturating_sub(block_start).min(block_len);
+            let close_start_rel = span.close_marker.start.saturating_sub(block_start).min(block_len);
+            let inner_start = (close_start_rel + 2).min(local_end);
+            let inner_end = local_end.saturating_sub(1).max(inner_start);
+            let Some(src) = extract_link_destination(&raw_text[inner_start..inner_end]) else {
+                continue;
+            };
+            let alt = raw_text[open_end_rel.min(close_start_rel)..close_start_rel].to_string();
+            let status = image_status.map_or(ImageLoadStatus::Pending, |f| f(&src));
+            let (display_w, display_h) =
+                compute_image_display_size(status, max_img_w, style.zoom_scale);
+            images.push(BlockImageItem {
+                src,
+                alt,
+                open_end: span.open_marker.end,
+                status,
+                display_w,
+                display_h,
+            });
+        }
+
+        if node.kind == BlockKind::Paragraph && img_spans.len() == 1 {
+            let only = img_spans[0];
+            let local_start = only.full_range.start.saturating_sub(block_start).min(block_len);
+            let local_end = only.full_range.end.saturating_sub(block_start).min(block_len);
+            let standalone =
+                raw_text[..local_start].trim().is_empty() && raw_text[local_end..].trim().is_empty();
+            if standalone && !only.should_expand_markers(exp_sel) {
+                if block_len > 0 {
+                    hidden.push(0..block_len);
+                }
+                empty_src_fallback = Some(only.open_marker.end);
+            }
+        }
+    }
+
     let disallow_past_end =
         matches!(node.kind, BlockKind::Paragraph if raw_text.is_empty());
-    let (map, spans) = collect_fragment_display(
+    let syn_ref = code_syntax
+        .as_ref()
+        .map(|(body_abs_start, vec)| (*body_abs_start, vec.as_slice()));
+    let (mut map, spans) = collect_fragment_display(
         node.range,
         raw_text,
         &node.inlines,
@@ -2127,6 +2753,7 @@ fn build_block_display(
         hidden,
         marker_ranges,
         synthetic_prefix,
+        syn_ref,
         base_color,
         base_weight,
         base_monospace,
@@ -2138,6 +2765,9 @@ fn build_block_display(
         is_focused,
         focus_mode,
     );
+    if empty_src_fallback.is_some() {
+        map.empty_src_fallback = empty_src_fallback;
+    }
 
     let _ = (base_font_size, base_line_height);
     BlockDisplay {
@@ -2151,6 +2781,111 @@ fn build_block_display(
         hr_rule,
         heading_level,
         task_checkbox,
+        code_fence_info,
+        code_header_h,
+        code_gutter_w,
+        code_first_body_line_i,
+        code_body_line_count,
+        images,
+    }
+}
+
+struct CodeFenceStructure {
+    open_line_end: usize,
+    open_hide_end: usize,
+    close_line_start: Option<usize>,
+    close_hide_start: usize,
+    body_range: Range<usize>,
+    body_line_count: usize,
+}
+
+fn parse_code_fence_structure(raw_text: &str) -> CodeFenceStructure {
+    let bytes = raw_text.as_bytes();
+    let open_line_end = raw_text.find('\n').unwrap_or(raw_text.len());
+    let open_line = raw_text[..open_line_end].trim_end_matches('\r');
+    let open_hide_end = if open_line_end < raw_text.len() {
+        open_line_end + 1
+    } else {
+        raw_text.len()
+    };
+
+    let mut close_line_start = None;
+    let mut close_hide_start = raw_text.len();
+    if open_hide_end < raw_text.len()
+        && let Some((f_char, f_len, _)) = parse_opening_fence_line(open_line)
+    {
+        let last_start = raw_text[open_hide_end..]
+            .rfind('\n')
+            .map_or(open_hide_end, |rel| open_hide_end + rel + 1);
+        let last_line = raw_text[last_start..].trim_end_matches('\r');
+        if is_closing_fence_line(last_line, f_char, f_len) {
+            close_line_start = Some(last_start);
+            close_hide_start = if last_start >= open_hide_end + 2
+                && &bytes[last_start - 2..last_start] == b"\r\n"
+            {
+                last_start - 2
+            } else if last_start > open_hide_end && bytes[last_start - 1] == b'\n' {
+                last_start - 1
+            } else {
+                last_start
+            };
+        }
+    }
+
+    let (body_range, body_line_count) = if let Some(cs) = close_line_start {
+        let count = if cs == open_hide_end {
+            0
+        } else {
+            raw_text[open_hide_end..cs]
+                .bytes()
+                .filter(|&b| b == b'\n')
+                .count()
+                .max(1)
+        };
+        (open_hide_end..close_hide_start.max(open_hide_end), count)
+    } else {
+        let count = if open_hide_end < raw_text.len() {
+            raw_text[open_hide_end..]
+                .bytes()
+                .filter(|&b| b == b'\n')
+                .count()
+                + 1
+        } else {
+            0
+        };
+        (open_hide_end..raw_text.len(), count)
+    };
+
+    CodeFenceStructure {
+        open_line_end,
+        open_hide_end,
+        close_line_start,
+        close_hide_start,
+        body_range,
+        body_line_count,
+    }
+}
+
+fn compute_image_display_size(
+    status: ImageLoadStatus,
+    max_w: f32,
+    zoom_scale: f32,
+) -> (f32, f32) {
+    let max_h = (520.0 * zoom_scale).max(200.0);
+    match status {
+        ImageLoadStatus::Loaded { width, height } if width > 0 && height > 0 => {
+            let nat_w = (width as f32) * zoom_scale;
+            let nat_h = (height as f32) * zoom_scale;
+            let scale = (max_w / nat_w).min(max_h / nat_h).min(1.0);
+            (
+                (nat_w * scale).max(24.0).round(),
+                (nat_h * scale).max(24.0).round(),
+            )
+        }
+        _ => (
+            max_w.min(420.0 * zoom_scale).max(160.0).round(),
+            (56.0 * zoom_scale).max(40.0).round(),
+        ),
     }
 }
 
@@ -2163,6 +2898,7 @@ fn collect_fragment_display(
     mut hidden: Vec<Range<usize>>,
     mut marker_ranges: Vec<Range<usize>>,
     synthetic_prefix: Option<&str>,
+    code_syntax: Option<(ByteOffset, &[CodeSyntaxSpan])>,
     base_color: RgbaColor,
     base_weight: u16,
     base_monospace: bool,
@@ -2273,6 +3009,7 @@ fn collect_fragment_display(
         &rebased_inlines,
         &map,
         &marker_ranges,
+        code_syntax,
         preedit_vis_range,
         base_color,
         base_weight,
@@ -2386,6 +3123,7 @@ fn build_table_display(
                     rel_src.start,
                     Vec::new(),
                     Vec::new(),
+                    None,
                     None,
                     base_color,
                     default_weight,
@@ -2540,6 +3278,7 @@ fn build_visual_text_map(
         display_text,
         line_starts,
         segments,
+        empty_src_fallback: None,
         ime_splice: None,
     }
 }
@@ -2559,6 +3298,7 @@ fn build_display_spans_with_inlines(
     inlines_mapped: &[(InlineKind, ByteRange)],
     map: &VisualTextMap,
     marker_ranges: &[Range<usize>],
+    code_syntax: Option<(ByteOffset, &[CodeSyntaxSpan])>,
     preedit_vis_range: Option<Range<usize>>,
     base_color: RgbaColor,
     base_weight: u16,
@@ -2600,6 +3340,34 @@ fn build_display_spans_with_inlines(
         cuts.push(r.start);
         cuts.push(r.end);
     }
+    let syntax_vis: Vec<(Range<usize>, RgbaColor, bool, bool)> =
+        if let Some((body_abs_start, syn_spans)) = code_syntax {
+            let mut v: Vec<_> = syn_spans
+                .iter()
+                .filter_map(|tok| {
+                    let s = map.source_to_visual(
+                        (body_abs_start + tok.range.start).clamp(map_start, map_end),
+                    );
+                    let e = map.source_to_visual(
+                        (body_abs_start + tok.range.end).clamp(map_start, map_end),
+                    );
+                    (s < e).then_some((
+                        s..e,
+                        style.apply_focus_mode(tok.color, is_focused, focus_mode),
+                        tok.bold,
+                        tok.italic,
+                    ))
+                })
+                .collect();
+            for (r, ..) in &v {
+                cuts.push(r.start);
+                cuts.push(r.end);
+            }
+            v.sort_by_key(|(r, ..)| r.start);
+            v
+        } else {
+            Vec::new()
+        };
     if let Some(pre) = &preedit_vis_range {
         cuts.push(pre.start);
         cuts.push(pre.end);
@@ -2609,6 +3377,7 @@ fn build_display_spans_with_inlines(
     cuts.dedup();
 
     let mut out = Vec::with_capacity(cuts.len().saturating_sub(1));
+    let mut syn_idx = 0usize;
     let mut i = 0;
     while i + 1 < cuts.len() {
         let a = cuts[i];
@@ -2634,6 +3403,24 @@ fn build_display_spans_with_inlines(
         let mut underline = in_ime;
         let mut inline_code_bg = false;
         let mut color = base_color;
+
+        if !in_ime && !in_marker {
+            while syn_idx < syntax_vis.len() && syntax_vis[syn_idx].0.end <= a {
+                syn_idx += 1;
+            }
+            if let Some((sr, sc, sbold, sitalic)) = syntax_vis.get(syn_idx)
+                && a >= sr.start
+                && b <= sr.end
+            {
+                color = *sc;
+                if *sbold {
+                    bold = true;
+                }
+                if *sitalic {
+                    italic = true;
+                }
+            }
+        }
 
         if !in_ime {
             for (kind, r) in &inline_vis {
@@ -2753,7 +3540,11 @@ fn shape_rich_text_buffer(
 
     let mut run_count = 0usize;
     let mut max_line_w = 0.0f32;
-    let mut text_height = line_height;
+    let mut text_height = if empty_fallback_height.is_some() {
+        0.0
+    } else {
+        line_height
+    };
     for run in buffer.layout_runs() {
         run_count += 1;
         max_line_w = max_line_w.max(run.line_w);
@@ -2802,6 +3593,14 @@ fn shape_block(
         (style.base_font_size_px, style.base_line_height_px, 400)
     };
 
+    let empty_fallback = if display.hr_rule {
+        Some(8.0)
+    } else if !display.images.is_empty() && display.map.display_text.is_empty() {
+        Some(0.0)
+    } else {
+        None
+    };
+
     let (buffer, _, text_height, inline_code_rects) = shape_rich_text_buffer(
         font_system,
         &display.map,
@@ -2813,9 +3612,30 @@ fn shape_block(
         display.code_box,
         None,
         style,
-        if display.hr_rule { Some(8.0) } else { None },
+        empty_fallback,
     );
-    let total_height = text_height + display.top_pad_px + display.bottom_pad_px;
+
+    let mut cur_img_y = text_height
+        + if text_height > 0.5 && !display.images.is_empty() {
+            6.0 * style.zoom_scale
+        } else {
+            0.0
+        };
+    let mut image_hit_rects_rel = Vec::with_capacity(display.images.len());
+    for item in &display.images {
+        image_hit_rects_rel.push((
+            Rect::new(0.0, cur_img_y, item.display_w, item.display_h),
+            item.open_end,
+        ));
+        cur_img_y += item.display_h + 6.0 * style.zoom_scale;
+    }
+    let images_height = if display.images.is_empty() {
+        0.0
+    } else {
+        (cur_img_y - text_height).max(0.0)
+    };
+    let total_height =
+        text_height + images_height + display.top_pad_px + display.bottom_pad_px;
 
     CachedBlockShape {
         last_used_frame: frame_seq,
@@ -2824,6 +3644,7 @@ fn shape_block(
         display,
         total_height,
         inline_code_rects,
+        image_hit_rects_rel,
     }
 }
 
@@ -3050,7 +3871,7 @@ fn estimate_block_height(node: &BlockNode, style: &ResolvedThemeStyle, width_cha
         BlockKind::ThematicBreak => 16.0 * style.zoom_scale + 8.0,
         BlockKind::CodeFence { .. } | BlockKind::YamlFrontMatter => {
             let est_lines = (node.range.len() as f32 / (width_chars * 0.6).max(12.0)).clamp(2.0, 200.0);
-            est_lines * style.code_line_height_px + 16.0 * style.zoom_scale
+            est_lines * style.code_line_height_px + 40.0 * style.zoom_scale
         }
         BlockKind::Table => {
             let est_rows = ((node.range.len() as f32 / (width_chars * 0.7).max(20.0)).ceil().max(1.0) - 0.5).max(1.0);
@@ -3065,17 +3886,21 @@ fn estimate_block_height(node: &BlockNode, style: &ResolvedThemeStyle, width_cha
 
 fn style_signature(style: &ResolvedThemeStyle) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    style.chrome.is_dark.hash(&mut h);
     style.text_color.hash(&mut h);
     style.muted_marker_color.hash(&mut h);
     style.link_color.hash(&mut h);
     style.inline_code_color.hash(&mut h);
     style.code_block_text.hash(&mut h);
+    style.code_block_bg.hash(&mut h);
     style.blockquote_text.hash(&mut h);
     style.table_border.hash(&mut h);
     style.table_header_bg.hash(&mut h);
     style.base_font_family.hash(&mut h);
     style.base_font_size_px.to_bits().hash(&mut h);
     style.base_line_height_px.to_bits().hash(&mut h);
+    style.code_font_size_px.to_bits().hash(&mut h);
+    style.code_line_height_px.to_bits().hash(&mut h);
     style.zoom_scale.to_bits().hash(&mut h);
     h.finish()
 }
@@ -3088,6 +3913,9 @@ fn hash_map_and_spans(
     let block_start = map.block_range.start;
     map.display_text.hash(h);
     map.block_range.len().hash(h);
+    map.empty_src_fallback
+        .map(|o| o.saturating_sub(block_start))
+        .hash(h);
     map.segments.len().hash(h);
     for seg in &map.segments {
         seg.vis_start.hash(h);
@@ -3121,6 +3949,16 @@ fn shape_cache_key(
     style_sig.hash(&mut h);
     display.top_pad_px.to_bits().hash(&mut h);
     display.bottom_pad_px.to_bits().hash(&mut h);
+    display.code_gutter_w.to_bits().hash(&mut h);
+    display.code_fence_info.hash(&mut h);
+    display.images.len().hash(&mut h);
+    for img in &display.images {
+        img.src.hash(&mut h);
+        img.alt.hash(&mut h);
+        img.status.hash(&mut h);
+        img.display_w.to_bits().hash(&mut h);
+        img.display_h.to_bits().hash(&mut h);
+    }
     code_box.hash(&mut h);
     h.finish()
 }
@@ -3199,6 +4037,9 @@ mod tests {
             &style,
             false,
             false,
+            780.0,
+            true,
+            None,
         );
         assert_eq!(d_collapsed.map.display_text, "标题 加粗 正文");
         // Clicking at byte offset of `加` in visual (`"标题 ".len()`) maps back to exact source byte after `**`!
@@ -3220,6 +4061,9 @@ mod tests {
             &style,
             true,
             false,
+            780.0,
+            true,
+            None,
         );
         assert_eq!(d_expanded.map.display_text, "## 标题 **加粗** 正文");
         assert_eq!(d_expanded.map.source_to_visual(caret_in_bold), caret_in_bold);
@@ -3247,6 +4091,9 @@ mod tests {
             &style,
             true,
             false,
+            780.0,
+            true,
+            None,
         );
         assert_eq!(d.map.display_text, "加粗 世界ni hao");
         let pre_range = d.map.preedit_visual_range().expect("ime range present");
@@ -3285,8 +4132,10 @@ mod tests {
             view: &view,
             focus_mode: false,
             show_caret: true,
+            show_code_line_numbers: false,
             find_matches: &[],
             active_find: None,
+            image_status: None,
         };
         let scene = cache.build_editor_scene(inc.blocks(), &style, &vp, |r| {
             inc.source()[r.start..r.end].to_string()
@@ -3344,8 +4193,10 @@ mod tests {
             view: &view,
             focus_mode: false,
             show_caret: true,
+            show_code_line_numbers: false,
             find_matches: &[],
             active_find: None,
+            image_status: None,
         };
         let scene = cache.build_editor_scene(&blocks, &style, &vp, |r| doc[r.start..r.end].to_string());
         // Caret placed in 3rd paragraph (block 4) must position caret_doc_y below block 2!
@@ -3434,8 +4285,10 @@ mod tests {
             view: &view,
             focus_mode: false,
             show_caret: true,
+            show_code_line_numbers: false,
             find_matches: &[],
             active_find: None,
+            image_status: None,
         };
         let _ = cache.build_editor_scene(&blocks, &style, &vp, |r| doc[r.start..r.end].to_string());
         let rec2 = cache.last_hit_blocks[2];
@@ -3485,8 +4338,10 @@ mod tests {
             view: &view,
             focus_mode: false,
             show_caret: true,
+            show_code_line_numbers: false,
             find_matches: &[],
             active_find: None,
+            image_status: None,
         };
         let scene = cache.build_editor_scene(&blocks, &style, &vp, |r| doc[r.start..r.end].to_string());
 
@@ -3683,8 +4538,10 @@ mod tests {
             view: &view,
             focus_mode: false,
             show_caret: true,
+            show_code_line_numbers: false,
             find_matches: &[],
             active_find: None,
+            image_status: None,
         };
         let scene = cache.build_editor_scene(&blocks, &style, &vp, |r| {
             wide_body_doc[r.start..r.end].to_string()
@@ -3733,5 +4590,256 @@ mod tests {
         assert_eq!(short_tbl.rows[1].cells.len(), 2);
         assert_eq!(short_tbl.rows[1].cells[0].map.display_text, "1");
         assert_eq!(short_tbl.rows[1].cells[1].map.display_text, "");
+    }
+
+    #[test]
+    fn test_code_fence_wysiwyg_highlight_freeze_line_numbers_and_buttons() {
+        let doc = "Intro paragraph\n\n```rust\nfn main() {\n    let msg = \"hi\";\n}\n```\n\nOutro";
+        let blocks = parse_blocks(doc);
+        let fence_idx = blocks
+            .iter()
+            .position(|b| matches!(b.kind, BlockKind::CodeFence { .. }))
+            .expect("code fence block");
+        let fence_block = &blocks[fence_idx];
+
+        let style = ResolvedThemeStyle::default();
+        let mut cache = ShapedDocumentCache::new();
+
+        // 1. Caret outside -> fences collapsed, syntax tokens active, buttons + line numbers emitted.
+        let outside_view = EditorViewState {
+            mode: ViewMode::Wysiwyg,
+            selection: Selection::caret(0),
+            ..Default::default()
+        };
+        let vp_outside = EditorViewport {
+            doc_rect: Rect::new(0.0, 0.0, 900.0, 720.0),
+            content_left_x: 60.0,
+            content_width_px: 780.0,
+            scroll_y: 0.0,
+            overscan_px: 120.0,
+            scale_factor: 1.0,
+            source_rev: 1,
+            source_len: doc.len(),
+            view: &outside_view,
+            focus_mode: false,
+            show_caret: true,
+            show_code_line_numbers: true,
+            find_matches: &[],
+            active_find: None,
+            image_status: None,
+        };
+        let scene_outside = cache.build_editor_scene(&blocks, &style, &vp_outside, |r| {
+            doc[r.start..r.end].to_string()
+        });
+        assert_eq!(scene_outside.code_block_buttons.len(), 2);
+        assert!(scene_outside
+            .code_block_buttons
+            .iter()
+            .any(|b| b.kind == CodeBlockButtonKind::LanguagePicker && b.current_language == "rust"));
+        assert!(scene_outside
+            .code_block_buttons
+            .iter()
+            .any(|b| b.kind == CodeBlockButtonKind::ToggleLineNumbers));
+
+        let rec = cache.last_hit_blocks[fence_idx];
+        let shaped_collapsed = cache.shaped_lru.get(&rec.shape_hash).unwrap();
+        assert_eq!(
+            shaped_collapsed.map.display_text,
+            "fn main() {\n    let msg = \"hi\";\n}"
+        );
+        let distinct_colors: std::collections::HashSet<RgbaColor> =
+            shaped_collapsed.display.spans.iter().map(|s| s.color).collect();
+        assert!(
+            distinct_colors.len() >= 2,
+            "expected multi-color syntect token spans in WYSIWYG code block"
+        );
+        assert_eq!(shaped_collapsed.display.code_first_body_line_i, 0);
+        assert_eq!(shaped_collapsed.display.code_body_line_count, 3);
+
+        // 2. Caret inside -> fence markers expanded in muted marker color.
+        let body_caret = doc.find("fn main").unwrap() + 2;
+        let inside_view = EditorViewState {
+            mode: ViewMode::Wysiwyg,
+            selection: Selection::caret(body_caret),
+            ..Default::default()
+        };
+        let vp_inside = EditorViewport {
+            source_rev: 2,
+            view: &inside_view,
+            ..vp_outside
+        };
+        let _ = cache.build_editor_scene(&blocks, &style, &vp_inside, |r| {
+            doc[r.start..r.end].to_string()
+        });
+        let shaped_expanded = cache
+            .shaped_lru
+            .get(&cache.last_hit_blocks[fence_idx].shape_hash)
+            .unwrap();
+        assert_eq!(
+            shaped_expanded.map.display_text,
+            &doc[fence_block.range.start..fence_block.range.end]
+        );
+        assert_eq!(shaped_expanded.display.code_first_body_line_i, 1);
+        assert_eq!(shaped_expanded.display.code_body_line_count, 3);
+        assert_eq!(
+            shaped_expanded.map.visual_to_source_rebased(
+                shaped_expanded
+                    .map
+                    .source_to_visual_rebased(body_caret, fence_block.range.start),
+                fence_block.range.start
+            ),
+            body_caret
+        );
+
+        // 3. IME preedit active inside CodeFence freezes heavy syntax token coloring (PRD 4.1.1 F #9).
+        let ime_view = EditorViewState {
+            mode: ViewMode::Wysiwyg,
+            selection: Selection::caret(body_caret),
+            ime_composition_selection: Some(Selection::caret(body_caret)),
+            ime_preedit: Some("zhongwen".to_string()),
+            expansion_frozen: true,
+        };
+        let vp_ime = EditorViewport {
+            source_rev: 3,
+            view: &ime_view,
+            ..vp_outside
+        };
+        let _ = cache.build_editor_scene(&blocks, &style, &vp_ime, |r| {
+            doc[r.start..r.end].to_string()
+        });
+        let shaped_ime = cache
+            .shaped_lru
+            .get(&cache.last_hit_blocks[fence_idx].shape_hash)
+            .unwrap();
+        let non_marker_non_ime_colors: std::collections::HashSet<RgbaColor> = shaped_ime
+            .display
+            .spans
+            .iter()
+            .filter(|s| !s.ime_preedit && s.color != style.muted_marker_color)
+            .map(|s| s.color)
+            .collect();
+        assert_eq!(
+            non_marker_non_ime_colors.len(),
+            1,
+            "syntax highlighting colors must freeze during active IME composition in code fence"
+        );
+
+        // 4. Empty collapsed code fence click focuses into inner body line cleanly.
+        let empty_doc = "Header\n\n```python\n```";
+        let empty_blocks = parse_blocks(empty_doc);
+        let empty_vp = EditorViewport {
+            source_rev: 4,
+            source_len: empty_doc.len(),
+            view: &outside_view,
+            ..vp_outside
+        };
+        let _ = cache.build_editor_scene(&empty_blocks, &style, &empty_vp, |r| {
+            empty_doc[r.start..r.end].to_string()
+        });
+        let empty_rec = cache.last_hit_blocks[2];
+        let click_empty = cache
+            .hit_test(
+                empty_rec.text_origin_x + 8.0,
+                empty_rec.row_rect.y + empty_rec.row_rect.h * 0.65,
+            )
+            .expect("empty fence click");
+        assert_eq!(
+            click_empty,
+            EditorHitTarget::Text(empty_doc.find("```python\n").unwrap() + "```python\n".len())
+        );
+    }
+
+    #[test]
+    fn test_wysiwyg_image_collapse_expand_aspect_ratio_and_placeholders() {
+        let doc = "Intro\n\n![Arch Diagram](./assets/arch.png)\n\n![Missing](https://example.com/a.png)";
+        let blocks = parse_blocks(doc);
+        let style = ResolvedThemeStyle::default();
+        let mut cache = ShapedDocumentCache::new();
+
+        let outside_view = EditorViewState {
+            mode: ViewMode::Wysiwyg,
+            selection: Selection::caret(0),
+            ..Default::default()
+        };
+        let resolver = |src: &str| match src {
+            "./assets/arch.png" => ImageLoadStatus::Loaded {
+                width: 1200,
+                height: 600,
+            },
+            "https://example.com/a.png" => ImageLoadStatus::NetworkBlocked,
+            _ => ImageLoadStatus::Failed,
+        };
+        let vp_outside = EditorViewport {
+            doc_rect: Rect::new(0.0, 0.0, 900.0, 720.0),
+            content_left_x: 60.0,
+            content_width_px: 780.0,
+            scroll_y: 0.0,
+            overscan_px: 120.0,
+            scale_factor: 1.0,
+            source_rev: 1,
+            source_len: doc.len(),
+            view: &outside_view,
+            focus_mode: false,
+            show_caret: true,
+            show_code_line_numbers: true,
+            find_matches: &[],
+            active_find: None,
+            image_status: Some(&resolver),
+        };
+        let scene = cache.build_editor_scene(&blocks, &style, &vp_outside, |r| {
+            doc[r.start..r.end].to_string()
+        });
+
+        assert_eq!(
+            scene.requested_images,
+            vec![
+                "./assets/arch.png".to_string(),
+                "https://example.com/a.png".to_string(),
+            ]
+        );
+        assert_eq!(scene.draw.images.len(), 1);
+        let img = &scene.draw.images[0];
+        assert_eq!(img.source, "./assets/arch.png");
+        // 1200x600 scaled down into <=740px width maintains exact 2:1 aspect ratio.
+        let ratio = img.rect.w / img.rect.h;
+        assert!((ratio - 2.0).abs() < 0.05, "expected ~2.0 ratio, got {ratio}");
+
+        // Standalone collapsed image has empty visual text and clicking it moves caret inside alt (`![Arch`).
+        let rec_img = cache.last_hit_blocks[2];
+        let shaped_img = cache.shaped_lru.get(&rec_img.shape_hash).unwrap();
+        assert_eq!(shaped_img.map.display_text, "");
+        let click_img = cache
+            .hit_test(img.rect.x + 20.0, img.rect.y + 20.0)
+            .expect("image card click");
+        assert_eq!(
+            click_img,
+            EditorHitTarget::Text(doc.find("![").unwrap() + 2)
+        );
+
+        // Moving caret inside `![Arch Diagram](./assets/arch.png)` expands the raw syntax above the image preview.
+        let inside_alt = doc.find("Arch Diagram").unwrap() + 2;
+        let inside_view = EditorViewState {
+            mode: ViewMode::Wysiwyg,
+            selection: Selection::caret(inside_alt),
+            ..Default::default()
+        };
+        let vp_inside = EditorViewport {
+            source_rev: 2,
+            view: &inside_view,
+            ..vp_outside
+        };
+        let scene_inside = cache.build_editor_scene(&blocks, &style, &vp_inside, |r| {
+            doc[r.start..r.end].to_string()
+        });
+        assert_eq!(scene_inside.draw.images.len(), 1);
+        let shaped_expanded = cache
+            .shaped_lru
+            .get(&cache.last_hit_blocks[2].shape_hash)
+            .unwrap();
+        assert_eq!(
+            shaped_expanded.map.display_text,
+            "![Arch Diagram](./assets/arch.png)"
+        );
+        assert!(scene_inside.draw.images[0].rect.y > rec_img.text_origin_y + 12.0);
     }
 }

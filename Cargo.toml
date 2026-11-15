@@ -21,6 +21,8 @@ rust-version = "1.88"
 ropey = "1.6.1"
 crc32fast = "1.4.2"
 pulldown-cmark = "0.12"
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 cosmic-text = "0.19"

@@ -7,12 +7,18 @@ use vellmark_parser::{BlockKind, BlockNode};
 
 pub mod shaper;
 pub mod style;
+pub mod syntax;
 
 pub use shaper::{
-    DrawList, EditorHitTarget, EditorSceneResult, EditorViewport, Rect, SceneGlyph, SceneRect,
-    ShapedDocumentCache, VisualTextMap, shape_ui_text_into,
+    CodeBlockButtonHit, CodeBlockButtonKind, DrawList, EditorHitTarget, EditorSceneResult,
+    EditorViewport, ImageLoadStatus, ImageStatusResolver, Rect, SceneGlyph, SceneImage,
+    SceneRect, ShapedDocumentCache, VisualTextMap, shape_ui_text_into,
 };
 pub use style::{HeadingStyle, ResolvedThemeStyle, RgbaColor, UiChromeColors};
+pub use syntax::{
+    CodeLanguageEntry, CodeSyntaxSpan, code_language_catalog, code_language_display_label,
+    highlight_code_slice, normalize_fence_language_token,
+};
 
 /// Computes the new scroll offset `scroll_y` so that the cursor line's screen Y coordinate
 /// remains invariant when marker expansion changes the height of blocks before the cursor line (PRD 4.1.1 A).

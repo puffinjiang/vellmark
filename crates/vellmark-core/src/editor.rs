@@ -34,6 +34,11 @@ pub enum EditorAction {
     ToggleInlineCode,
     ToggleStrikethrough,
     InsertLink(String),
+    InsertCodeBlock(String),
+    SetCodeFenceLanguage {
+        block_range: ByteRange,
+        language: String,
+    },
     SetHeadingLevel(u8),
     ToggleTaskCheckbox,
     AlignCurrentTable,
@@ -225,6 +230,14 @@ impl EditorController {
         self.ctx().insert_link(url);
     }
 
+    pub fn insert_code_block(&mut self, language: &str) {
+        self.ctx().insert_code_block(language);
+    }
+
+    pub fn set_code_fence_language(&mut self, block_range: ByteRange, language: &str) -> bool {
+        self.ctx().set_code_fence_language(block_range, language)
+    }
+
     pub fn set_heading_level(&mut self, level: u8) {
         self.ctx().set_heading_level(level);
     }
@@ -282,6 +295,13 @@ impl EditorContext<'_> {
             EditorAction::ToggleInlineCode => self.toggle_inline_wrap("`"),
             EditorAction::ToggleStrikethrough => self.toggle_inline_wrap("~~"),
             EditorAction::InsertLink(url) => self.insert_link(&url),
+            EditorAction::InsertCodeBlock(lang) => self.insert_code_block(&lang),
+            EditorAction::SetCodeFenceLanguage {
+                block_range,
+                language,
+            } => {
+                self.set_code_fence_language(block_range, &language);
+            }
             EditorAction::SetHeadingLevel(lvl) => self.set_heading_level(lvl),
             EditorAction::ToggleTaskCheckbox => {
                 self.toggle_task_checkbox();
@@ -589,6 +609,127 @@ impl EditorContext<'_> {
             EditKind::Structural,
         );
         *self.selection = sel_after;
+    }
+
+    /// Insert a fenced code block (wrapping non-empty selection or inserting an empty block, PRD M-04).
+    pub fn insert_code_block(&mut self, language: &str) {
+        self.abort_ime_preedit();
+        self.normalize_selection_out_of_crlf();
+        let range = self.selection.range();
+        let sel_before = *self.selection;
+        let nl = self.dominant_line_ending();
+        let lang: String = language
+            .chars()
+            .filter(|c| !matches!(c, '\r' | '\n' | '`'))
+            .collect::<String>()
+            .trim()
+            .to_string();
+
+        let lead_nl = if range.start > 0
+            && self.buffer.slice_to_string(ByteRange::new(range.start - 1, range.start)) != "\n"
+        {
+            nl
+        } else {
+            ""
+        };
+        let trail_nl = if range.end < self.buffer.len_bytes() {
+            let next = self
+                .buffer
+                .slice_to_string(ByteRange::new(range.end, range.end + 1));
+            if next != "\n" && next != "\r" { nl } else { "" }
+        } else {
+            ""
+        };
+
+        let header = format!("{lead_nl}```{lang}{nl}");
+        let (snippet, caret_pos) = if range.is_empty() {
+            let caret = range.start + header.len();
+            (format!("{header}{nl}```{trail_nl}"), caret)
+        } else {
+            let selected = self.buffer.slice_to_string(range);
+            let close_nl = if selected.ends_with('\n') { "" } else { nl };
+            let caret = range.start + header.len() + selected.len();
+            (format!("{header}{selected}{close_nl}```{trail_nl}"), caret)
+        };
+        let sel_after = Selection::caret(caret_pos);
+        self.undo.apply_edit(
+            self.buffer,
+            range,
+            &snippet,
+            sel_before,
+            sel_after,
+            EditKind::Structural,
+        );
+        *self.selection = sel_after;
+    }
+
+    /// Update the language info string on an existing fenced code block as an undoable edit (PRD M-04).
+    pub fn set_code_fence_language(&mut self, block_range: ByteRange, language: &str) -> bool {
+        self.abort_ime_preedit();
+        self.normalize_selection_out_of_crlf();
+        let total = self.buffer.len_bytes();
+        if block_range.start >= total || block_range.start >= block_range.end {
+            return false;
+        }
+        let clamped_end = block_range.end.min(total);
+        let raw_block = self
+            .buffer
+            .slice_to_string(ByteRange::new(block_range.start, clamped_end));
+        let line_lf = raw_block.find('\n').unwrap_or(raw_block.len());
+        let first_line = raw_block[..line_lf].trim_end_matches('\r');
+        let Some((f_char, f_len, _)) = crate::table::parse_opening_fence_line(first_line) else {
+            return false;
+        };
+        let indent = first_line
+            .as_bytes()
+            .iter()
+            .take_while(|&&b| b == b' ')
+            .count();
+        let fence_end_rel = indent + f_len;
+        let line_content_end_rel = first_line.len();
+        let sanitized: String = language
+            .chars()
+            .filter(|&c| c != '\r' && c != '\n' && !(f_char == b'`' && c == '`'))
+            .collect::<String>()
+            .trim()
+            .to_string();
+
+        if first_line[fence_end_rel..] == sanitized {
+            return false;
+        }
+
+        let replace_range = ByteRange::new(
+            block_range.start + fence_end_rel,
+            block_range.start + line_content_end_rel,
+        );
+        let delta = sanitized.len() as isize - (replace_range.end - replace_range.start) as isize;
+        let shift_off = |off: ByteOffset| -> ByteOffset {
+            if off <= replace_range.start {
+                off
+            } else if off <= replace_range.end {
+                replace_range.start + sanitized.len()
+            } else {
+                ((off as isize) + delta).max(0) as usize
+            }
+        };
+        let sel_before = *self.selection;
+        let sel_after = Selection::new(
+            self.buffer.snap_out_of_crlf(shift_off(sel_before.anchor)),
+            self.buffer.snap_out_of_crlf(shift_off(sel_before.head)),
+        );
+        self.undo.apply_edit(
+            self.buffer,
+            replace_range,
+            &sanitized,
+            sel_before,
+            sel_after,
+            EditKind::Structural,
+        );
+        *self.selection = Selection::new(
+            self.buffer.snap_out_of_crlf(sel_after.anchor),
+            self.buffer.snap_out_of_crlf(sel_after.head),
+        );
+        true
     }
 
     /// Convert current line to Paragraph (`level == 0`) or Heading 1–6 (`1..=6`, PRD 4.10 `Cmd/Ctrl + 0..6`).
@@ -3622,5 +3763,29 @@ mod tests {
         bs.set_selection(0, 4);
         bs.insert_link(r"http://example.com/a\b\");
         assert_eq!(bs.buffer.to_string(), r"[text](http://example.com/a\\b\\)");
+    }
+
+    #[test]
+    fn test_insert_code_block_and_set_code_fence_language_undoable() {
+        let mut ed = EditorController::from_str("let x = 1;");
+        ed.set_selection(0, 10);
+        ed.insert_code_block("rust");
+        assert_eq!(ed.buffer.to_string(), "```rust\nlet x = 1;\n```");
+
+        assert!(ed.set_code_fence_language(ByteRange::new(0, ed.buffer.len_bytes()), "python"));
+        assert_eq!(ed.buffer.to_string(), "```python\nlet x = 1;\n```");
+
+        ed.undo();
+        assert_eq!(ed.buffer.to_string(), "```rust\nlet x = 1;\n```");
+
+        ed.undo();
+        assert_eq!(ed.buffer.to_string(), "let x = 1;");
+
+        // Verify empty block insertion & backtick sanitization on tilde/backtick fence
+        let mut ed2 = EditorController::from_str("hello");
+        ed2.set_caret(5);
+        ed2.insert_code_block("ts`x");
+        assert_eq!(ed2.buffer.to_string(), "hello\n```tsx\n\n```");
+        assert_eq!(ed2.selection.head, "hello\n```tsx\n".len());
     }
 }
