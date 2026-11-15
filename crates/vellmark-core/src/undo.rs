@@ -196,9 +196,9 @@ impl UndoHistory {
         self.redo_stack.clear();
 
         // Coalesce consecutive single-insert Typing transactions when adjacent (PRD E-06).
-        if tx.kind == EditKind::Typing && tx.ops.len() == 1 && tx.ops[0].deleted.is_empty() {
-            if let Some(prev) = self.undo_stack.last_mut() {
-                if prev.kind == EditKind::Typing && prev.ops.len() == 1 && prev.ops[0].deleted.is_empty() {
+        if tx.kind == EditKind::Typing && tx.ops.len() == 1 && tx.ops[0].deleted.is_empty()
+            && let Some(prev) = self.undo_stack.last_mut()
+                && prev.kind == EditKind::Typing && prev.ops.len() == 1 && prev.ops[0].deleted.is_empty() {
                     let prev_end = prev.ops[0].range.start + prev.ops[0].inserted.len();
                     if tx.ops[0].range.start == prev_end && !tx.ops[0].inserted.contains('\n') {
                         prev.ops[0].inserted.push_str(&tx.ops[0].inserted);
@@ -206,8 +206,6 @@ impl UndoHistory {
                         return;
                     }
                 }
-            }
-        }
 
         self.undo_stack.push(tx);
     }

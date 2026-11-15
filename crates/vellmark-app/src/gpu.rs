@@ -168,7 +168,7 @@ impl GlyphAtlas {
             }
             SwashContent::SubpixelMask => {
                 let mut out = Vec::with_capacity((w * h * 4) as usize);
-                for chunk in img.data.chunks_exact(3) {
+                for chunk in img.data.as_chunks::<3>().0 {
                     let lum =
                         (0.299 * chunk[0] as f32 + 0.587 * chunk[1] as f32 + 0.114 * chunk[2] as f32)
                             .round()

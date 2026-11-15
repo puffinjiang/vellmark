@@ -573,11 +573,10 @@ fn parse_css_border(raw: &str, base_px: f32) -> (Option<f32>, Option<RgbaColor>)
     let mut width = None;
     let mut color = None;
     // Handle `rgba(...)` or `rgb(...)` without splitting inside parens.
-    if let Some(rgb_start) = raw.find("rgb") {
-        if let Some(close) = raw[rgb_start..].find(')') {
+    if let Some(rgb_start) = raw.find("rgb")
+        && let Some(close) = raw[rgb_start..].find(')') {
             color = parse_css_color(&raw[rgb_start..=rgb_start + close]);
         }
-    }
     for token in raw.split_whitespace() {
         if width.is_none() && (token.ends_with("px") || token.ends_with("em")) {
             width = parse_css_length_px(token, base_px);

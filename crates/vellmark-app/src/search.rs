@@ -147,7 +147,7 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
 
     for nc in needle.chars() {
         let mut found = None;
-        while let Some((idx, hc)) = h_chars.next() {
+        for (idx, hc) in h_chars.by_ref() {
             if hc == nc {
                 found = Some(idx);
                 break;

@@ -114,15 +114,12 @@ fn resolve_builtin_theme(name: &str) -> Option<BuiltinTheme> {
 }
 
 fn resolve_theme_css(spec: &Path) -> Result<String, String> {
-    if !spec.exists() {
-        if let Some(name) = spec.to_str() {
-            if spec.components().count() == 1 {
-                if let Some(builtin) = resolve_builtin_theme(name) {
+    if !spec.exists()
+        && let Some(name) = spec.to_str()
+            && spec.components().count() == 1
+                && let Some(builtin) = resolve_builtin_theme(name) {
                     return Ok(builtin.css_source().to_string());
                 }
-            }
-        }
-    }
     fs::read_to_string(spec).map_err(|e| format!("Failed to read theme {}: {e}", spec.display()))
 }
 

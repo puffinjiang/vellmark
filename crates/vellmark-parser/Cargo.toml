@@ -3,6 +3,7 @@ name = "vellmark-parser"
 description = "Incremental Markdown parser with exact source byte-offset mapping and visibility expansion rules for Vellmark."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

@@ -258,11 +258,10 @@ language = \"{lang_name}\"\n",
     }
 
     pub fn save_to_file(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
-        }
         fs::write(path, self.to_toml_string())
     }
 
@@ -302,9 +301,11 @@ mod tests {
 
     #[test]
     fn test_config_roundtrip_and_system_theme_and_zoom() {
-        let mut cfg = AppConfig::default();
-        cfg.follow_system_theme = false;
-        cfg.theme = BuiltinTheme::Academic;
+        let mut cfg = AppConfig {
+            follow_system_theme: false,
+            theme: BuiltinTheme::Academic,
+            ..Default::default()
+        };
         cfg.zoom_in();
         cfg.zoom_in();
         assert_eq!(cfg.zoom_percent, 120);

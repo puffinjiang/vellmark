@@ -139,21 +139,19 @@ pub fn expand_replacement(
                 continue;
             }
             if next == b'&' || next == b'0' {
-                if let Some(Some(r)) = matched.captures.first() {
-                    if let Some(sub) = text.get(r.start..r.end) {
+                if let Some(Some(r)) = matched.captures.first()
+                    && let Some(sub) = text.get(r.start..r.end) {
                         out.push_str(sub);
                     }
-                }
                 i += 2;
                 continue;
             }
             if next.is_ascii_digit() {
                 let idx = (next - b'0') as usize;
-                if let Some(Some(r)) = matched.captures.get(idx) {
-                    if let Some(sub) = text.get(r.start..r.end) {
+                if let Some(Some(r)) = matched.captures.get(idx)
+                    && let Some(sub) = text.get(r.start..r.end) {
                         out.push_str(sub);
                     }
-                }
                 i += 2;
                 continue;
             }
@@ -243,7 +241,7 @@ pub fn replace_all_in_buffer(
     // Apply in reverse document order so each `op` holds exact pre-edit coordinates,
     // making both forward redo and `.rev()` undo offset-exact with zero shifting.
     let mut ops = Vec::with_capacity(matches.len());
-    for (m, rep) in matches.iter().zip(replacements.into_iter()).rev() {
+    for (m, rep) in matches.iter().zip(replacements).rev() {
         let deleted = buffer.replace_bytes(m.range, &rep);
         ops.push(EditOp {
             range: m.range,
@@ -379,14 +377,14 @@ fn is_whole_word_match(text: &str, range: ByteRange) -> bool {
     let prev = text[..range.start].chars().next_back();
     let next = text[range.end..].chars().next();
 
-    let left_ok = match (prev, first) {
-        (Some(p), Some(f)) if is_word_char(p) && is_word_char(f) => false,
-        _ => true,
-    };
-    let right_ok = match (last, next) {
-        (Some(l), Some(n)) if is_word_char(l) && is_word_char(n) => false,
-        _ => true,
-    };
+    let left_ok = !matches!(
+        (prev, first),
+        (Some(p), Some(f)) if is_word_char(p) && is_word_char(f)
+    );
+    let right_ok = !matches!(
+        (last, next),
+        (Some(l), Some(n)) if is_word_char(l) && is_word_char(n)
+    );
     left_ok && right_ok
 }
 
@@ -865,13 +863,14 @@ impl CompiledRegex {
     fn compile(pattern: &str, case_sensitive: bool) -> Result<Self, FindError> {
         let mut parser = RegexParser::new(pattern);
         let (ast, capture_count) = parser.parse_all()?;
-        let mut insts = Vec::new();
         // Unanchored lazy prefix: 0: Split(3, 1), 1: AnyCharIncludingNewline, 2: Jump(0)
         // followed by Save(0), <ast>, Save(1), Match.
-        insts.push(Inst::Split(3, 1));
-        insts.push(Inst::Char(CharMatcher::AnyCharIncludingNewline));
-        insts.push(Inst::Jump(0));
-        insts.push(Inst::Save(0));
+        let mut insts = vec![
+            Inst::Split(3, 1),
+            Inst::Char(CharMatcher::AnyCharIncludingNewline),
+            Inst::Jump(0),
+            Inst::Save(0),
+        ];
         compile_ast(&ast, &mut insts)?;
         if insts.len() + 2 > MAX_NFA_INSTS {
             return Err(FindError::InvalidRegex(
@@ -954,8 +953,8 @@ impl CompiledRegex {
                         break;
                     }
                     Inst::Char(matcher) => {
-                        if let Some(ch) = opt_ch {
-                            if matcher.matches(ch, self.case_sensitive) {
+                        if let Some(ch) = opt_ch
+                            && matcher.matches(ch, self.case_sensitive) {
                                 self.add_thread(
                                     &mut next,
                                     pc + 1,
@@ -966,7 +965,6 @@ impl CompiledRegex {
                                     &mut seen,
                                 );
                             }
-                        }
                     }
                     _ => {}
                 }
@@ -987,8 +985,10 @@ impl CompiledRegex {
             let end = slots.get(1).copied().flatten().unwrap_or(start);
             let range = ByteRange::new(start, end);
             let captures = slots
-                .chunks_exact(2)
-                .map(|pair| match (pair[0], pair[1]) {
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[s, e]| match (s, e) {
                     (Some(s), Some(e)) => Some(ByteRange::new(s, e)),
                     _ => None,
                 })

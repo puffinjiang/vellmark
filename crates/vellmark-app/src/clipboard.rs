@@ -84,16 +84,14 @@ impl ClipboardBackend for NativeClipboard {
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             let change_count = pb.changeCount();
-            if let Ok(guard) = self.last_self_write.lock() {
-                if let Some((saved_cc, ref md)) = *guard {
-                    if saved_cc == change_count {
+            if let Ok(guard) = self.last_self_write.lock()
+                && let Some((saved_cc, ref md)) = *guard
+                    && saved_cc == change_count {
                         return ClipboardContent {
                             text: Some(md.clone()),
                             html: None,
                         };
                     }
-                }
-            }
             let text = pb.stringForType(NSPasteboardTypeString).map(|s| s.to_string());
             let html = pb.stringForType(NSPasteboardTypeHTML).map(|s| s.to_string());
             ClipboardContent { text, html }

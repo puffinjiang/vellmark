@@ -598,8 +598,8 @@ impl ShapedDocumentCache {
             let raw_text = read_slice(node.range);
             let block_focused = node.range.contains_inclusive(exp_sel.head);
 
-            if matches!(node.kind, BlockKind::Table) && vp.view.mode != ViewMode::Source {
-                if let Some(table_display) = build_table_display(
+            if matches!(node.kind, BlockKind::Table) && vp.view.mode != ViewMode::Source
+                && let Some(table_display) = build_table_display(
                     node,
                     &raw_text,
                     vp.view,
@@ -686,7 +686,6 @@ impl ShapedDocumentCache {
                     });
                     continue;
                 }
-            }
 
             let display = build_block_display(
                 node,
@@ -905,8 +904,8 @@ impl ShapedDocumentCache {
             let origin_x = vp.content_left_x + 12.0;
             let origin_y = vp.doc_rect.y + last_y - vp.scroll_y;
             let mut caret_x = origin_x;
-            if let Some(preedit) = &vp.view.ime_preedit {
-                if !preedit.is_empty() {
+            if let Some(preedit) = &vp.view.ime_preedit
+                && !preedit.is_empty() {
                     let pre_w = shape_ui_text_into(
                         &mut self.font_system,
                         preedit,
@@ -942,7 +941,6 @@ impl ShapedDocumentCache {
                     );
                     caret_x += pre_w;
                 }
-            }
             let cur_rect = Rect::new(caret_x, origin_y, 2.0, style.base_line_height_px);
             caret_doc_y = last_y;
             caret_line_height = style.base_line_height_px;
@@ -1029,6 +1027,7 @@ impl ShapedDocumentCache {
     }
 
     /// Move caret vertically by one visual line using real shaped coordinates (respects line wrapping & columns).
+    #[allow(clippy::too_many_arguments)]
     pub fn move_caret_vertical<S>(
         &mut self,
         caret: ByteOffset,
@@ -1056,17 +1055,16 @@ impl ShapedDocumentCache {
             .min(blocks.len() - 1);
 
         let mut crossed_target_x = preferred_x;
+        let nav_ctx = NavShapeContext {
+            blocks,
+            view,
+            exp_sel,
+            style,
+            content_width_px,
+        };
         if matches!(blocks[block_idx].kind, BlockKind::Table) && view.mode != ViewMode::Source {
-            if let Some(table_key) = self.shape_table_for_nav(
-                block_idx,
-                blocks,
-                view,
-                exp_sel,
-                style,
-                content_width_px,
-                &mut read_slice,
-            ) {
-                if let Some(table) = self.table_lru.get(&table_key) {
+            if let Some(table_key) = self.shape_table_for_nav(block_idx, &nav_ctx, &mut read_slice)
+                && let Some(table) = self.table_lru.get(&table_key) {
                     match move_caret_vertical_in_table(
                         table,
                         blocks[block_idx].range.start,
@@ -1081,10 +1079,8 @@ impl ShapedDocumentCache {
                         }
                     }
                 }
-            }
         } else {
-            let cur_offset = self
-                .shape_single_for_nav(block_idx, blocks, view, exp_sel, style, content_width_px, &mut read_slice);
+            let cur_offset = self.shape_single_for_nav(block_idx, &nav_ctx, &mut read_slice);
             let Some((cur_shaped, caret_vis)) = cur_offset else {
                 return (caret, preferred_x);
             };
@@ -1140,17 +1136,9 @@ impl ShapedDocumentCache {
             block_idx + 1
         };
 
-        if matches!(blocks[next_idx].kind, BlockKind::Table) && view.mode != ViewMode::Source {
-            if let Some(table_key) = self.shape_table_for_nav(
-                next_idx,
-                blocks,
-                view,
-                exp_sel,
-                style,
-                content_width_px,
-                &mut read_slice,
-            ) {
-                if let Some(table) = self.table_lru.get(&table_key) {
+        if matches!(blocks[next_idx].kind, BlockKind::Table) && view.mode != ViewMode::Source
+            && let Some(table_key) = self.shape_table_for_nav(next_idx, &nav_ctx, &mut read_slice)
+                && let Some(table) = self.table_lru.get(&table_key) {
                     return (
                         enter_table_from_adjacent(
                             table,
@@ -1161,11 +1149,9 @@ impl ShapedDocumentCache {
                         Some(target_x),
                     );
                 }
-            }
-        }
 
         if let Some((adj_shaped, _)) =
-            self.shape_single_for_nav(next_idx, blocks, view, exp_sel, style, content_width_px, &mut read_slice)
+            self.shape_single_for_nav(next_idx, &nav_ctx, &mut read_slice)
         {
             let target_y = if direction < 0 {
                 (adj_shaped.total_height - adj_shaped.display.bottom_pad_px - style.base_line_height_px * 0.4)
@@ -1192,29 +1178,38 @@ impl ShapedDocumentCache {
     fn shape_table_for_nav<S>(
         &mut self,
         block_idx: usize,
-        blocks: &[BlockNode],
-        view: &EditorViewState,
-        exp_sel: Selection,
-        style: &ResolvedThemeStyle,
-        content_width_px: f32,
+        ctx: &NavShapeContext<'_>,
         read_slice: &mut S,
     ) -> Option<u64>
     where
         S: FnMut(ByteRange) -> String,
     {
-        let node = blocks.get(block_idx)?;
+        let node = ctx.blocks.get(block_idx)?;
         let raw = read_slice(node.range);
-        let rows_display = build_table_display(node, &raw, view, exp_sel, style, true, false)?;
-        let avail_table_w = (content_width_px - 8.0).max(120.0);
-        let style_sig = style_signature(style);
+        let rows_display = build_table_display(
+            node,
+            &raw,
+            ctx.view,
+            ctx.exp_sel,
+            ctx.style,
+            true,
+            false,
+        )?;
+        let avail_table_w = (ctx.content_width_px - 8.0).max(120.0);
+        let style_sig = style_signature(ctx.style);
         let key = shape_table_cache_key(&rows_display, avail_table_w, style_sig, true, false);
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let frame_seq = self.frame_seq;
         if let Some(cached) = self.table_lru.get_mut(&key) {
             cached.last_used_frame = frame_seq;
         } else {
-            let shaped =
-                shape_table_block(&mut self.font_system, rows_display, avail_table_w, style, frame_seq);
+            let shaped = shape_table_block(
+                &mut self.font_system,
+                rows_display,
+                avail_table_w,
+                ctx.style,
+                frame_seq,
+            );
             if self.table_lru.len() >= MAX_SHAPED_TABLE_CACHE {
                 evict_oldest_table_lru(&mut self.table_lru);
             }
@@ -1226,24 +1221,20 @@ impl ShapedDocumentCache {
     fn shape_single_for_nav<S>(
         &mut self,
         block_idx: usize,
-        blocks: &[BlockNode],
-        view: &EditorViewState,
-        exp_sel: Selection,
-        style: &ResolvedThemeStyle,
-        content_width_px: f32,
+        ctx: &NavShapeContext<'_>,
         read_slice: &mut S,
     ) -> Option<(&CachedBlockShape, usize)>
     where
         S: FnMut(ByteRange) -> String,
     {
-        let node = blocks.get(block_idx)?;
+        let node = ctx.blocks.get(block_idx)?;
         let raw = read_slice(node.range);
-        let display = build_block_display(node, &raw, view, exp_sel, style, true, false);
+        let display = build_block_display(node, &raw, ctx.view, ctx.exp_sel, ctx.style, true, false);
         let caret_vis = display
             .map
-            .source_to_visual(view.selection.head.clamp(node.range.start, node.range.end));
-        let avail_w = (content_width_px - display.left_indent_px - 24.0).max(80.0);
-        let style_sig = style_signature(style);
+            .source_to_visual(ctx.view.selection.head.clamp(node.range.start, node.range.end));
+        let avail_w = (ctx.content_width_px - display.left_indent_px - 24.0).max(80.0);
+        let style_sig = style_signature(ctx.style);
         let key = shape_cache_key(
             &display,
             avail_w,
@@ -1253,11 +1244,19 @@ impl ShapedDocumentCache {
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let frame_seq = self.frame_seq;
         if !self.shaped_lru.contains_key(&key) {
-            let shaped = shape_block(&mut self.font_system, display, avail_w, style, key, frame_seq);
+            let shaped = shape_block(&mut self.font_system, display, avail_w, ctx.style, key, frame_seq);
             self.shaped_lru.insert(key, shaped);
         }
         self.shaped_lru.get(&key).map(|s| (s, caret_vis))
     }
+}
+
+struct NavShapeContext<'a> {
+    blocks: &'a [BlockNode],
+    view: &'a EditorViewState,
+    exp_sel: Selection,
+    style: &'a ResolvedThemeStyle,
+    content_width_px: f32,
 }
 
 /// Helper for `vellmark-app` UI chrome (tabs, file tree, outline, find bar, status bar)
@@ -1417,8 +1416,8 @@ fn render_text_buffer_contents(
         }
     }
 
-    if let Some(pre_vis) = map.preedit_visual_range() {
-        if !pre_vis.is_empty() {
+    if let Some(pre_vis) = map.preedit_visual_range()
+        && !pre_vis.is_empty() {
             let c0 = map.visual_to_line_col(pre_vis.start);
             let c1 = map.visual_to_line_col(pre_vis.end);
             for run in buffer.layout_runs() {
@@ -1445,7 +1444,6 @@ fn render_text_buffer_contents(
                 }
             }
         }
-    }
 
     let scale = vp.scale_factor.max(0.5);
     for run in buffer.layout_runs() {
@@ -1910,8 +1908,8 @@ fn move_caret_vertical_in_table(
         while target_col > 0 && next_row.cells[target_col].is_placeholder {
             target_col -= 1;
         }
-        if let Some(next_cell) = next_row.cells.get(target_col) {
-            if !next_cell.is_placeholder {
+        if let Some(next_cell) = next_row.cells.get(target_col)
+            && !next_cell.is_placeholder {
                 let target_y = if direction < 0 {
                     next_cell
                         .buffer
@@ -1927,7 +1925,6 @@ fn move_caret_vertical_in_table(
                     target_x,
                 );
             }
-        }
     }
 
     TableNavOutcome::Exited(target_x)
@@ -2062,7 +2059,8 @@ fn build_block_display(
                 0
             };
             if quote_prefix_len > 0 {
-                if !is_source && !(exp_sel.is_caret() && node.range.contains_inclusive(exp_sel.head))
+                if !is_source
+                    && (!exp_sel.is_caret() || !node.range.contains_inclusive(exp_sel.head))
                 {
                     hidden.push(0..quote_prefix_len);
                 } else {
@@ -2240,8 +2238,8 @@ fn collect_fragment_display(
     let mut map = build_visual_text_map(map_base_offset, frag_raw, &merged_hidden, synthetic_prefix);
 
     let mut preedit_vis_range: Option<Range<usize>> = None;
-    if allow_ime {
-        if let Some(preedit) = &view.ime_preedit {
+    if allow_ime
+        && let Some(preedit) = &view.ime_preedit {
             let comp_sel = view.ime_composition_selection.unwrap_or(view.selection);
             let comp_range = comp_sel.range();
             let owns_comp = frag_range_abs.contains_inclusive(comp_range.start)
@@ -2270,7 +2268,6 @@ fn collect_fragment_display(
                 preedit_vis_range = Some(v_start..new_v_end);
             }
         }
-    }
 
     let spans = build_display_spans_with_inlines(
         &rebased_inlines,
@@ -2341,8 +2338,8 @@ fn build_table_display(
                 let cell = &row.cells[c_idx];
                 let mut rel_s = cell.content_range.start;
                 let mut rel_e = cell.content_range.end;
-                if let Some(abs_c) = active_caret_abs {
-                    if abs_c >= node.range.start {
+                if let Some(abs_c) = active_caret_abs
+                    && abs_c >= node.range.start {
                         let rel_c = abs_c - node.range.start;
                         if rel_c >= cell.raw_range.start && rel_c <= cell.raw_range.end {
                             let raw_slice = &raw_text[cell.raw_range.start..cell.raw_range.end];
@@ -2364,7 +2361,6 @@ fn build_table_display(
                             }
                         }
                     }
-                }
                 let rel_src = ByteRange::new(rel_s, rel_e);
                 let cell_abs_src = ByteRange::new(node.range.start + rel_s, node.range.start + rel_e);
                 let cell_abs_raw = ByteRange::new(
@@ -2470,12 +2466,11 @@ fn merge_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
     ranges.sort_by_key(|r| (r.start, r.end));
     let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
     for r in ranges {
-        if let Some(last) = merged.last_mut() {
-            if r.start <= last.end {
+        if let Some(last) = merged.last_mut()
+            && r.start <= last.end {
                 last.end = last.end.max(r.end);
                 continue;
             }
-        }
         merged.push(r);
     }
     merged
@@ -2492,11 +2487,10 @@ fn build_visual_text_map(
     let mut cursor = 0usize;
 
     let mut first_content_local = 0usize;
-    if let Some(h0) = hidden.first() {
-        if h0.start == 0 {
+    if let Some(h0) = hidden.first()
+        && h0.start == 0 {
             first_content_local = h0.end;
         }
-    }
     if let Some(syn) = synthetic_prefix {
         let vs = display_text.len();
         display_text.push_str(syn);
@@ -2765,11 +2759,10 @@ fn shape_rich_text_buffer(
         max_line_w = max_line_w.max(run.line_w);
         text_height = text_height.max(run.line_top + run.line_height);
     }
-    if run_count == 0 {
-        if let Some(fb) = empty_fallback_height {
+    if run_count == 0
+        && let Some(fb) = empty_fallback_height {
             text_height = fb;
         }
-    }
 
     let mut inline_code_rects = Vec::new();
     for sp in spans {
@@ -3191,12 +3184,13 @@ mod tests {
         let style = ResolvedThemeStyle::default();
 
         // Caret outside block -> both `## ` and `**` collapse cleanly
-        let mut outside_view = EditorViewState::default();
-        outside_view.selection = Selection::caret(0);
         // Move caret outside block's range (`blocks[0].range.end + 1` or parse 2 blocks)
         let two_block_src = "## 标题 **加粗** 正文\n下一行";
         let two_blocks = parse_blocks(two_block_src);
-        outside_view.selection = Selection::caret(two_block_src.len());
+        let outside_view = EditorViewState {
+            selection: Selection::caret(two_block_src.len()),
+            ..Default::default()
+        };
         let d_collapsed = build_block_display(
             &two_blocks[0],
             &two_block_src[two_blocks[0].range.start..two_blocks[0].range.end],
@@ -3237,11 +3231,13 @@ mod tests {
         let blocks = parse_blocks(src);
         let style = ResolvedThemeStyle::default();
         let caret_pos = src.len();
-        let mut view = EditorViewState::default();
-        view.selection = Selection::caret(caret_pos);
-        view.ime_composition_selection = Some(Selection::caret(caret_pos));
-        view.ime_preedit = Some("ni hao".to_string());
-        view.expansion_frozen = true;
+        let view = EditorViewState {
+            selection: Selection::caret(caret_pos),
+            ime_composition_selection: Some(Selection::caret(caret_pos)),
+            ime_preedit: Some("ni hao".to_string()),
+            expansion_frozen: true,
+            ..Default::default()
+        };
 
         let d = build_block_display(
             &blocks[0],
@@ -3331,8 +3327,10 @@ mod tests {
 
         let style = ResolvedThemeStyle::default();
         let mut cache = ShapedDocumentCache::new();
-        let mut view = EditorViewState::default();
-        view.selection = Selection::caret(blocks[4].range.start + 3);
+        let view = EditorViewState {
+            selection: Selection::caret(blocks[4].range.start + 3),
+            ..Default::default()
+        };
 
         let vp = EditorViewport {
             doc_rect: Rect::new(0.0, 0.0, 900.0, 720.0),

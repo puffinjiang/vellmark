@@ -113,13 +113,12 @@ fn strip_forbidden_element(html: &str, tag_lower: &str) -> String {
                     if matches!(
                         after_close,
                         Some(b'>') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
-                    ) {
-                        if let Some(close_gt) = out[close_pos + close_pat.len()..].find('>') {
+                    )
+                        && let Some(close_gt) = out[close_pos + close_pat.len()..].find('>') {
                             out.replace_range(start..close_pos + close_pat.len() + close_gt + 1, "");
                             removed = true;
                             break;
                         }
-                    }
                     close_search = close_pos + close_pat.len();
                 } else {
                     break;
@@ -334,13 +333,12 @@ fn decode_html_entities(input: &str) -> String {
     let mut i = 0;
 
     while i < bytes.len() {
-        if bytes[i] == b'&' {
-            if let Some((ch, consumed)) = parse_entity_at(&input[i..]) {
+        if bytes[i] == b'&'
+            && let Some((ch, consumed)) = parse_entity_at(&input[i..]) {
                 out.push(ch);
                 i += consumed;
                 continue;
             }
-        }
         let ch = input[i..].chars().next().unwrap();
         out.push(ch);
         i += ch.len_utf8();
@@ -387,7 +385,7 @@ fn parse_entity_at(s: &str) -> Option<(char, usize)> {
             (b"apos;".as_slice(), '\''),
             (b"nbsp;".as_slice(), ' '),
         ] {
-            if rest.as_bytes().len() >= name.len()
+            if rest.len() >= name.len()
                 && rest.as_bytes()[..name.len()].eq_ignore_ascii_case(name)
             {
                 return Some((ch, 1 + name.len()));
@@ -419,8 +417,8 @@ pub fn html_to_markdown(html: &str) -> String {
     let mut i = 0usize;
 
     while i < bytes.len() {
-        if bytes[i] == b'<' {
-            if let Some(tag_end) = find_tag_end(&cleaned, i) {
+        if bytes[i] == b'<'
+            && let Some(tag_end) = find_tag_end(&cleaned, i) {
                 let raw_tag = &cleaned[i..=tag_end];
                 i = tag_end + 1;
 
@@ -478,14 +476,12 @@ pub fn html_to_markdown(html: &str) -> String {
                         "code" => {
                             if !in_pre {
                                 target.push('`');
-                            } else if let Some(cls) = extract_tag_attr(raw_tag, "class") {
-                                if let Some(lang) = cls.split_whitespace().find_map(|c| c.strip_prefix("language-")) {
-                                    if target.ends_with("```\n") {
+                            } else if let Some(cls) = extract_tag_attr(raw_tag, "class")
+                                && let Some(lang) = cls.split_whitespace().find_map(|c| c.strip_prefix("language-"))
+                                    && target.ends_with("```\n") {
                                         let insert_at = target.len() - 1;
                                         target.insert_str(insert_at, lang);
                                     }
-                                }
-                            }
                         }
                         "pre" => {
                             ensure_blank_line_before(target);
@@ -498,19 +494,17 @@ pub fn html_to_markdown(html: &str) -> String {
                             target.push_str("> ");
                         }
                         "ul" => {
-                            if list_stack.is_empty() && !target.is_empty() && !target.ends_with("\n\n") {
-                                if !target.ends_with('\n') {
+                            if list_stack.is_empty() && !target.is_empty() && !target.ends_with("\n\n")
+                                && !target.ends_with('\n') {
                                     target.push('\n');
                                 }
-                            }
                             list_stack.push(None);
                         }
                         "ol" => {
-                            if list_stack.is_empty() && !target.is_empty() && !target.ends_with("\n\n") {
-                                if !target.ends_with('\n') {
+                            if list_stack.is_empty() && !target.is_empty() && !target.ends_with("\n\n")
+                                && !target.ends_with('\n') {
                                     target.push('\n');
                                 }
-                            }
                             list_stack.push(Some(1));
                         }
                         "li" => {
@@ -629,7 +623,6 @@ pub fn html_to_markdown(html: &str) -> String {
                 }
                 continue;
             }
-        }
 
         // Plain text segment until next `<` (if `bytes[i] == b'<'` lacked a closing `>`, advance past `<`
         // so malformed fragments like `<p>1 < 2` never loop forever).
@@ -755,9 +748,9 @@ fn format_gfm_table_from_rows(rows: &[Vec<String>]) -> String {
     let mut out = Vec::with_capacity(rows.len() + 1);
     for (idx, row) in rows.iter().enumerate() {
         let mut line = String::from("|");
-        for c in 0..cols {
+        for (c, &col_width) in widths.iter().enumerate() {
             let cell = row.get(c).map(|s| s.as_str()).unwrap_or("");
-            let pad = widths[c].saturating_sub(cell.chars().count());
+            let pad = col_width.saturating_sub(cell.chars().count());
             line.push(' ');
             line.push_str(cell);
             for _ in 0..pad {

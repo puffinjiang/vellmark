@@ -78,13 +78,11 @@ fn build_initial_workbench_with_recovery(
 
 fn run_headless(paths: &[PathBuf]) {
     let (mut workbench, _) = build_initial_workbench_with_recovery(paths, None);
-    if workbench.workspace_root.is_none() {
-        if let Ok(cwd) = std::env::current_dir() {
-            if Path::new(&cwd).exists() {
+    if workbench.workspace_root.is_none()
+        && let Ok(cwd) = std::env::current_dir()
+            && Path::new(&cwd).exists() {
                 let _ = workbench.open_folder(cwd);
             }
-        }
-    }
 
     let stats = workbench.active_tab().map(|t| t.stats());
     println!(

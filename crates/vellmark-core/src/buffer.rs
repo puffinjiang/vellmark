@@ -87,6 +87,8 @@ impl TextBuffer {
         }
     }
 
+    /// Infallible convenience constructor matching `ropey::Rope::from_str`.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> Self {
         Self {
             rope: Rope::from_str(text),

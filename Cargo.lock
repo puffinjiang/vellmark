@@ -2097,7 +2097,6 @@ version = "0.1.0"
 dependencies = [
  "vellmark-core",
  "vellmark-parser",
- "vellmark-theme",
 ]
 
 [[package]]

@@ -327,10 +327,8 @@ impl MemoryLinkOpener {
 
 impl LinkOpenerBackend for MemoryLinkOpener {
     fn open_url(&self, url: &str) -> Result<(), String> {
-        if let Ok(g) = self.fail_with.lock() {
-            if let Some(err) = &*g {
-                return Err(err.clone());
-            }
+        if let Some(err) = self.fail_with.lock().ok().and_then(|g| g.clone()) {
+            return Err(err);
         }
         if let Ok(mut g) = self.opened.lock() {
             g.push(url.to_string());
@@ -377,15 +375,152 @@ fn extract_uri_scheme(value: &str) -> Option<&str> {
     }
 }
 
-fn is_allowed_external_url(url: &str) -> bool {
-    if has_ascii_prefix_ignore_case(url, "http://") {
-        return url.len() > "http://".len();
+fn is_supported_external_scheme(scheme: &str) -> bool {
+    scheme.eq_ignore_ascii_case("http")
+        || scheme.eq_ignore_ascii_case("https")
+        || scheme.eq_ignore_ascii_case("mailto")
+}
+
+fn contains_uri_unwise_or_control(url: &str) -> bool {
+    url.chars().any(|ch| {
+        ch.is_control() || matches!(ch, '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`')
+    })
+}
+
+fn is_valid_http_authority(authority: &str) -> bool {
+    if authority.is_empty() {
+        return false;
     }
-    if has_ascii_prefix_ignore_case(url, "https://") {
-        return url.len() > "https://".len();
+    // Reject whitespace and shell/delimiter metacharacters inside host/userinfo authority
+    // (defense-in-depth for `https://x&calc`), while keeping query-string `&` (`?a=1&b=2`).
+    if authority.chars().any(|ch| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '&' | '|'
+                    | '<'
+                    | '>'
+                    | '^'
+                    | '!'
+                    | ';'
+                    | '`'
+                    | '\\'
+                    | '"'
+                    | '\''
+                    | '$'
+                    | '('
+                    | ')'
+                    | '*'
+                    | ','
+                    | '='
+            )
+    }) {
+        return false;
+    }
+    let host_port = match authority.split_once('@') {
+        Some((userinfo, rest)) => {
+            if userinfo.is_empty() || rest.contains('@') {
+                return false;
+            }
+            rest
+        }
+        None => authority,
+    };
+    if host_port.is_empty() {
+        return false;
+    }
+    if host_port.starts_with('[') {
+        let Some(end_bracket) = host_port.find(']') else {
+            return false;
+        };
+        if end_bracket <= 1 {
+            return false;
+        }
+        let after = &host_port[end_bracket + 1..];
+        return after.is_empty()
+            || after
+                .strip_prefix(':')
+                .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
+    }
+    if let Some((host, port)) = host_port.rsplit_once(':') {
+        return !host.is_empty()
+            && !port.is_empty()
+            && port.bytes().all(|b| b.is_ascii_digit());
+    }
+    true
+}
+
+fn has_valid_percent_encoding(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len()
+                || !bytes[i + 1].is_ascii_hexdigit()
+                || !bytes[i + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
+fn is_valid_mailto_url(after_scheme: &str) -> bool {
+    // Product policy: reject bare `mailto:` with neither recipient nor query headers
+    // (RFC 6068 §2 grammar technically allows both to be omitted).
+    // Also reject unencoded `#` anywhere in `mailto:` because `#` starts a URI fragment
+    // and would silently truncate recipient/header data when opened by mail clients.
+    if after_scheme.is_empty() || after_scheme.contains('#') {
+        return false;
+    }
+    let (to, query_opt) = match after_scheme.split_once('?') {
+        Some((to, query)) => (to, Some(query)),
+        None => (after_scheme, None),
+    };
+    // Per RFC 6068 §2, valid mailbox characters like `'`, `!`, `$`, `+`, `,` are allowed
+    // unencoded in `to`, whereas whitespace, invalid `%` escapes, and unencoded URI delimiters
+    // (`&`, `=`, `;`, `/`, `[`, `]`) are rejected.
+    if !to.is_empty()
+        && (!has_valid_percent_encoding(to)
+            || to
+                .chars()
+                .any(|ch| ch.is_whitespace() || matches!(ch, '&' | '=' | ';' | '/' | '[' | ']')))
+    {
+        return false;
+    }
+    if let Some(query) = query_opt {
+        if query.is_empty() || !has_valid_percent_encoding(query) {
+            return false;
+        }
+        return query.split('&').all(|field| {
+            field.split_once('=').is_some_and(|(name, _value)| {
+                !name.is_empty()
+                    && !name
+                        .chars()
+                        .any(|ch| ch.is_whitespace() || matches!(ch, '?' | '/' | '[' | ']' | ';'))
+            })
+        });
+    }
+    true
+}
+
+fn is_allowed_external_url(url: &str) -> bool {
+    if contains_uri_unwise_or_control(url) {
+        return false;
+    }
+    for prefix in ["http://", "https://"] {
+        if has_ascii_prefix_ignore_case(url, prefix) {
+            let rest = &url[prefix.len()..];
+            let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            return is_valid_http_authority(&rest[..auth_end]);
+        }
     }
     if has_ascii_prefix_ignore_case(url, "mailto:") {
-        return url.len() > "mailto:".len();
+        return is_valid_mailto_url(&url["mailto:".len()..]);
     }
     false
 }
@@ -443,8 +578,11 @@ fn validate_native_open_target(target: &str) -> Result<(), String> {
         return Err("Invalid link target".to_string());
     }
     if let Some(scheme) = extract_uri_scheme(target) {
+        if !is_supported_external_scheme(scheme) {
+            return Err(format!("Blocked unsupported URL scheme: {scheme}"));
+        }
         if !is_allowed_external_url(target) {
-            return Err(format!("Blocked unsupported URL scheme: {scheme}:"));
+            return Err("Blocked unsafe or malformed external URL".to_string());
         }
         return Ok(());
     }
@@ -1272,8 +1410,8 @@ impl GuiController {
                 false
             };
             self.pending_scroll_ensure_caret = false;
-            if need_reframe {
-                if let Some(tab) = self.workbench.active_tab() {
+            if need_reframe
+                && let Some(tab) = self.workbench.active_tab() {
                     let rev = tab.session.buffer.revision();
                     let src_len = tab.session.buffer.len_bytes();
                     let vp2 = EditorViewport {
@@ -1298,7 +1436,6 @@ impl GuiController {
                     });
                     self.last_ime_cursor_area = scene.ime_cursor_area;
                 }
-            }
         }
 
         // Scrollbar thumb indicator on right edge when document exceeds viewport height
@@ -2051,11 +2188,18 @@ impl GuiController {
         } else {
             "Diff"
         };
+        type BannerButton<'a> = (
+            &'a str,
+            UiAction,
+            vellmark_render::RgbaColor,
+            vellmark_render::RgbaColor,
+            vellmark_render::RgbaColor,
+        );
         let (accent, tint_alpha, message, buttons): (
             vellmark_render::RgbaColor,
             u8,
             String,
-            Vec<(&str, UiAction, vellmark_render::RgbaColor, vellmark_render::RgbaColor, vellmark_render::RgbaColor)>,
+            Vec<BannerButton<'_>>,
         ) = match kind {
             DocBannerKind::Conflict { theirs_updated } => (
                 chrome.danger,
@@ -2457,14 +2601,13 @@ impl GuiController {
     }
 
     fn cancel_abandoned_tab_ime(&mut self, active_tab_id: Option<u64>) {
-        if let ImeTarget::Tab(ime_tab_id) = self.ime_target {
-            if active_tab_id != Some(ime_tab_id) || self.has_focused_text_input() {
+        if let ImeTarget::Tab(ime_tab_id) = self.ime_target
+            && (active_tab_id != Some(ime_tab_id) || self.has_focused_text_input()) {
                 if let Some(tab) = self.workbench.tabs.iter_mut().find(|t| t.id == ime_tab_id) {
                     let _ = tab.edit(|ctx| ctx.ime_cancel());
                 }
                 self.ime_target = ImeTarget::None;
             }
-        }
     }
 
     /// Handle OS IME lifecycle event (`Enabled`, `Preedit`, `Commit`, `Disabled`).
@@ -2490,13 +2633,12 @@ impl GuiController {
                                 let _ = tab.edit(|ctx| ctx.ime_clear_preedit());
                             }
                         }
-                        ImeTarget::None => {
-                            if !self.has_focused_text_input() {
-                                if let Some(tab) = self.workbench.active_tab_mut() {
-                                    let _ = tab.edit(|ctx| ctx.ime_clear_preedit());
-                                }
+                        ImeTarget::None if !self.has_focused_text_input() => {
+                            if let Some(tab) = self.workbench.active_tab_mut() {
+                                let _ = tab.edit(|ctx| ctx.ime_clear_preedit());
                             }
                         }
+                        ImeTarget::None => {}
                     }
                     return;
                 }
@@ -2564,11 +2706,10 @@ impl GuiController {
                 self.ime_enabled = false;
                 let prev = self.ime_target;
                 self.ime_target = ImeTarget::None;
-                if let ImeTarget::Tab(target_id) = prev {
-                    if let Some(tab) = self.workbench.tabs.iter_mut().find(|t| t.id == target_id) {
+                if let ImeTarget::Tab(target_id) = prev
+                    && let Some(tab) = self.workbench.tabs.iter_mut().find(|t| t.id == target_id) {
                         let _ = tab.edit(|ctx| ctx.ime_cancel());
                     }
-                }
                 if let Some(tab) = self.workbench.active_tab_mut() {
                     let _ = tab.edit(|ctx| ctx.ime_cancel());
                 }
@@ -2686,8 +2827,8 @@ impl GuiController {
         self.cancel_abandoned_tab_ime(active_id);
 
         // Primary shortcuts
-        if primary && !alt {
-            if let Key::Character(ch) = logical_key {
+        if primary && !alt
+            && let Key::Character(ch) = logical_key {
                 let lower = ch.to_ascii_lowercase();
                 match lower.as_str() {
                     "s" if shift => {
@@ -2826,7 +2967,6 @@ impl GuiController {
                     _ => {}
                 }
             }
-        }
 
         // Focused overlay / modal input handling (Quick Open -> Link Prompt -> Find bar)
         if self.handle_overlay_key_press(logical_key, text, primary, shift, mods.control_key()) {
@@ -2915,8 +3055,8 @@ impl GuiController {
                 true
             }
             _ => {
-                if !primary && !mods.control_key() {
-                    if let Some(txt) = text {
+                if !primary && !mods.control_key()
+                    && let Some(txt) = text {
                         let clean: String = txt.chars().filter(|c| !c.is_control()).collect();
                         if !clean.is_empty() {
                             self.preferred_caret_x = None;
@@ -2930,7 +3070,6 @@ impl GuiController {
                             return true;
                         }
                     }
-                }
                 false
             }
         }
@@ -2973,12 +3112,13 @@ impl GuiController {
                     return true;
                 }
                 _ => {
-                    if !primary && !ctrl {
-                        if let Some(txt) = overlay_printable_key_text(logical_key, text) {
-                            self.quick_open_query.push_str(&txt);
-                            self.refresh_quick_open_matches();
-                            return true;
-                        }
+                    if let Some(txt) = (!primary && !ctrl)
+                        .then(|| overlay_printable_key_text(logical_key, text))
+                        .flatten()
+                    {
+                        self.quick_open_query.push_str(&txt);
+                        self.refresh_quick_open_matches();
+                        return true;
                     }
                 }
             }
@@ -3000,11 +3140,12 @@ impl GuiController {
                     return true;
                 }
                 _ => {
-                    if !primary && !ctrl {
-                        if let Some(txt) = overlay_printable_key_text(logical_key, text) {
-                            self.link_prompt_url.push_str(&txt);
-                            return true;
-                        }
+                    if let Some(txt) = (!primary && !ctrl)
+                        .then(|| overlay_printable_key_text(logical_key, text))
+                        .flatten()
+                    {
+                        self.link_prompt_url.push_str(&txt);
+                        return true;
                     }
                 }
             }
@@ -3033,12 +3174,13 @@ impl GuiController {
                     return true;
                 }
                 _ => {
-                    if !primary && !ctrl {
-                        if let Some(txt) = overlay_printable_key_text(logical_key, text) {
-                            self.find_query.push_str(&txt);
-                            self.run_find_next(false);
-                            return true;
-                        }
+                    if let Some(txt) = (!primary && !ctrl)
+                        .then(|| overlay_printable_key_text(logical_key, text))
+                        .flatten()
+                    {
+                        self.find_query.push_str(&txt);
+                        self.run_find_next(false);
+                        return true;
                     }
                 }
             }
@@ -3123,16 +3265,14 @@ impl GuiController {
     ) -> (CursorIcon, bool) {
         self.pointer_pos = (x, y);
         let mut changed = false;
-        if self.dragging_selection {
-            if let Some(EditorHitTarget::Text(offset)) = self.shaper.hit_test(x, y) {
-                if let Some(tab) = self.workbench.active_tab_mut() {
+        if self.dragging_selection
+            && let Some(EditorHitTarget::Text(offset)) = self.shaper.hit_test(x, y)
+                && let Some(tab) = self.workbench.active_tab_mut() {
                     let anchor = tab.session.buffer.snap_out_of_crlf(tab.view.selection.anchor);
                     let safe_offset = tab.session.buffer.snap_out_of_crlf(offset);
                     let _ = tab.edit(|ctx| ctx.set_selection(anchor, safe_offset));
                     changed = true;
                 }
-            }
-        }
         let icon = if let Some(zone) = self.ui_hit_zones.iter().rev().find(|z| z.rect.contains(x, y)) {
             if zone.pointer_cursor {
                 CursorIcon::Pointer
@@ -3234,14 +3374,13 @@ impl GuiController {
                     .cached_meta
                     .as_ref()
                     .and_then(|m| m.outline.get(idx).cloned());
-                if let Some(item) = item_opt {
-                    if let Some(tab) = self.workbench.active_tab_mut() {
+                if let Some(item) = item_opt
+                    && let Some(tab) = self.workbench.active_tab_mut() {
                         tab.jump_to_outline_item(&item);
                         self.pending_scroll_ensure_caret = true;
                         self.find_focused = false;
                         self.close_transient_prompts();
                     }
-                }
                 true
             }
             UiAction::OpenWorkspaceFile(path) => {
@@ -4257,7 +4396,11 @@ impl GuiController {
         }
 
         let local_raw: String = if let Some(scheme) = extract_uri_scheme(trimmed) {
-            if is_allowed_external_url(trimmed) {
+            if is_supported_external_scheme(scheme) {
+                if !is_allowed_external_url(trimmed) {
+                    self.set_notice("Blocked unsafe or malformed external URL");
+                    return;
+                }
                 match self.link_opener.open_url(trimmed) {
                     Ok(()) => self.set_notice(format!("Opened link: {trimmed}")),
                     Err(e) => self.set_notice(e),
@@ -4273,7 +4416,7 @@ impl GuiController {
                 };
                 local_path
             } else {
-                self.set_notice(format!("Unsupported link scheme: {scheme}:"));
+                self.set_notice(format!("Unsupported link scheme: {scheme}"));
                 return;
             }
         } else {
@@ -4388,12 +4531,11 @@ impl GuiController {
         }
         let query = self.find_query.clone();
         let opts = self.find_options;
-        if let Some(tab) = self.workbench.active_tab_mut() {
-            if let Ok(Some(m)) = tab.find_prev(&query, true, opts) {
+        if let Some(tab) = self.workbench.active_tab_mut()
+            && let Ok(Some(m)) = tab.find_prev(&query, true, opts) {
                 self.active_find_range = Some(m.range);
                 self.pending_scroll_ensure_caret = true;
             }
-        }
     }
 }
 
@@ -4768,12 +4910,13 @@ fn decode_percent_spaces(input: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
-                out.push((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
+        let decoded = (bytes[i] == b'%' && i + 2 < bytes.len())
+            .then(|| hex_nibble(bytes[i + 1]).zip(hex_nibble(bytes[i + 2])))
+            .flatten();
+        if let Some((hi, lo)) = decoded {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -4857,13 +5000,15 @@ fn find_matching_outline_item(outline: &[OutlineItem], anchor: &str) -> Option<O
     }
 
     let slugified_target = heading_to_github_slug(&decoded);
-    if !slugified_target.is_empty() {
-        if let Some(item) = outline
-            .iter()
-            .find(|item| heading_to_github_slug(&item.title) == slugified_target)
-        {
-            return Some(item.clone());
-        }
+    if let Some(item) = (!slugified_target.is_empty())
+        .then(|| {
+            outline
+                .iter()
+                .find(|item| heading_to_github_slug(&item.title) == slugified_target)
+        })
+        .flatten()
+    {
+        return Some(item.clone());
     }
 
     outline
@@ -6323,35 +6468,111 @@ Second duplicate body\n";
 
     #[test]
     fn test_link_security_scheme_allowlist_and_escaped_link_roundtrip() {
-        // 1. `validate_native_open_target` enforces scheme allowlist, blocks control chars & executables,
-        // while keeping `&` and `%` intact in valid https/http/mailto URLs (no cmd.exe metachar injection).
+        // 1. `validate_native_open_target` enforces scheme allowlist, validates HTTP(S)/mailto
+        // authorities as defense-in-depth (`https://x&calc`), and keeps query `&` & `%` intact.
         assert!(validate_native_open_target("https://example.com/search?q=1&b=2%203").is_ok());
-        assert!(validate_native_open_target("http://evil.com&calc").is_ok());
+        assert!(
+            validate_native_open_target("https://en.wikipedia.org/wiki/Rust_(programming_language)")
+                .is_ok()
+        );
+        assert!(validate_native_open_target("https://[::1]:8080/docs?x=1&y=2").is_ok());
         assert!(validate_native_open_target("mailto:test@example.com").is_ok());
+        assert!(
+            validate_native_open_target("mailto:test@example.com?subject=hi&body=bye").is_ok()
+        );
+        assert!(validate_native_open_target("mailto:?subject=Hello&body=World").is_ok());
+        assert!(validate_native_open_target("mailto:?subject=").is_ok());
+        assert!(validate_native_open_target("mailto:o'connor@example.com").is_ok());
+        assert!(
+            validate_native_open_target(
+                "mailto:user+tag!name$1@example.com,second@example.com?subject=咨询"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_native_open_target("mailto:user%26tag@example.com?subject=100%25").is_ok()
+        );
+        assert!(validate_native_open_target("mailto:?subject=Hello World").is_ok());
+        assert!(validate_native_open_target("mailto:?subject=a=b").is_ok());
+        assert!(validate_native_open_target("mailto:?subject=How are you?").is_ok());
+        assert!(validate_native_open_target("mailto:?subject=Hello%23tag").is_ok());
         assert!(validate_native_open_target("/tmp/report.pdf").is_ok());
         assert!(validate_native_open_target(r"C:\docs\report.pdf").is_ok());
 
-        for blocked in [
-            "",
-            "https://example.com\ncalc",
-            "https://example.com\0",
-            "ftp://example.com/file",
-            "smb://attacker/share",
-            "search-ms:displayname=evil",
-            "ms-msdt:/id",
-            "javascript:alert(1)//http://example.com",
-            "file:///tmp/secret.txt",
-            r"C:\notes\payload.bat",
-            "/tmp/setup.exe",
+        for (blocked, expected_err) in [
+            ("", "Invalid link target"),
+            ("https://example.com\ncalc", "Invalid link target"),
+            ("https://example.com\0", "Invalid link target"),
+            ("https://x&calc", "Blocked unsafe or malformed external URL"),
+            ("http://evil.com&calc", "Blocked unsafe or malformed external URL"),
+            ("https://evil.com|calc", "Blocked unsafe or malformed external URL"),
+            ("https://example.com/a|b", "Blocked unsafe or malformed external URL"),
+            ("https://:8080/path", "Blocked unsafe or malformed external URL"),
+            ("https://", "Blocked unsafe or malformed external URL"),
+            ("http:foo", "Blocked unsafe or malformed external URL"),
+            ("mailto:", "Blocked unsafe or malformed external URL"),
+            ("mailto:?", "Blocked unsafe or malformed external URL"),
+            ("mailto:?abc", "Blocked unsafe or malformed external URL"),
+            ("mailto:?&", "Blocked unsafe or malformed external URL"),
+            ("mailto:?=foo", "Blocked unsafe or malformed external URL"),
+            ("mailto:?subject=100%", "Blocked unsafe or malformed external URL"),
+            (
+                "mailto:?subject=Hello#fragment",
+                "Blocked unsafe or malformed external URL",
+            ),
+            (
+                "mailto:?sub?ject=Hello",
+                "Blocked unsafe or malformed external URL",
+            ),
+            (
+                "mailto:evil@example.com&calc",
+                "Blocked unsafe or malformed external URL",
+            ),
+            (
+                "mailto:evil@example.com;calc",
+                "Blocked unsafe or malformed external URL",
+            ),
+            (
+                "mailto:evil@example.com=1",
+                "Blocked unsafe or malformed external URL",
+            ),
+            (
+                "mailto:evil@example.com/path",
+                "Blocked unsafe or malformed external URL",
+            ),
+            (
+                "mailto:evil@example.com#frag",
+                "Blocked unsafe or malformed external URL",
+            ),
+            (
+                "mailto:evil@[127.0.0.1]",
+                "Blocked unsafe or malformed external URL",
+            ),
+            (
+                "mailto:evil%2@example.com",
+                "Blocked unsafe or malformed external URL",
+            ),
+            ("ftp://example.com/file", "Blocked unsupported URL scheme: ftp"),
+            ("smb://attacker/share", "Blocked unsupported URL scheme: smb"),
+            ("search-ms:displayname=evil", "Blocked unsupported URL scheme: search-ms"),
+            ("ms-msdt:/id", "Blocked unsupported URL scheme: ms-msdt"),
+            (
+                "javascript:alert(1)//http://example.com",
+                "Blocked unsupported URL scheme: javascript",
+            ),
+            ("file:///tmp/secret.txt", "Blocked unsupported URL scheme: file"),
+            (r"C:\notes\payload.bat", "Blocked opening executable file directly"),
+            ("/tmp/setup.exe", "Blocked opening executable file directly"),
         ] {
-            assert!(
-                validate_native_open_target(blocked).is_err(),
-                "expected `{blocked}` to be rejected by validate_native_open_target"
+            assert_eq!(
+                validate_native_open_target(blocked),
+                Err(expected_err.to_string()),
+                "unexpected validate_native_open_target result for `{blocked}`"
             );
         }
 
-        // 2. `open_resolved_link_destination` blocks arbitrary URI schemes, remote `file://host/...` SMB/UNC,
-        // and executable local files while allowing case-insensitive `FILE:///...` local notes.
+        // 2. `open_resolved_link_destination` blocks arbitrary URI schemes, malformed external URLs,
+        // remote `file://host/...` SMB/UNC, and executable local files while allowing `FILE:///...`.
         let dir = unique_test_dir("vellmark-gui-link-sec");
         let ws = dir.join("ws");
         fs::create_dir_all(&ws).unwrap();
@@ -6372,20 +6593,47 @@ Second duplicate body\n";
         let mut gui = GuiController::with_clipboard(wb, Box::new(MemoryClipboard::default()));
         gui.set_link_opener(Box::new(SharedOpener(opener.clone())));
 
-        for disallowed in [
-            "ftp://example.com/a",
-            "smb://evil.example/share",
-            "ms-msdt:/id",
-            "javascript:alert(1)//http://x",
-            "file://attacker/share/secret.md",
-            "run.bat",
+        for (disallowed, expected_notice) in [
+            ("ftp://example.com/a", "Unsupported link scheme: ftp"),
+            ("smb://evil.example/share", "Unsupported link scheme: smb"),
+            ("ms-msdt:/id", "Unsupported link scheme: ms-msdt"),
+            (
+                "javascript:alert(1)//http://x",
+                "Unsupported link scheme: javascript",
+            ),
+            (
+                "https://x&calc",
+                "Blocked unsafe or malformed external URL",
+            ),
+            ("mailto:?abc", "Blocked unsafe or malformed external URL"),
+            ("file://attacker/share/secret.md", "Blocked non-local file URI"),
+            ("run.bat", "Blocked opening executable file: run.bat"),
         ] {
             gui.open_resolved_link_destination(disallowed);
             assert!(
                 opener.opened_urls().is_empty(),
                 "`{disallowed}` must never reach LinkOpenerBackend"
             );
+            assert_eq!(
+                gui.active_status_notice().as_deref(),
+                Some(expected_notice),
+                "unexpected notice for `{disallowed}`"
+            );
         }
+
+        for allowed_mailto in [
+            "mailto:?subject=Hello&body=World",
+            "mailto:o'connor@example.com",
+        ] {
+            gui.open_resolved_link_destination(allowed_mailto);
+        }
+        assert_eq!(
+            opener.opened_urls(),
+            vec![
+                "mailto:?subject=Hello&body=World".to_string(),
+                "mailto:o'connor@example.com".to_string(),
+            ]
+        );
 
         // Case-insensitive `FILE:///...` resolves local note cleanly inside Vellmark.
         let note_display = note.to_string_lossy().replace('\\', "/");

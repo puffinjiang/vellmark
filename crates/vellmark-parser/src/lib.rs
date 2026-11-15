@@ -454,9 +454,9 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
 
         // Strong `**...**` (CommonMark left-flanking: content after `**` cannot be empty or start with whitespace)
         if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'*' {
-            if i + 2 < bytes.len() && !bytes[i + 2].is_ascii_whitespace() {
-                if let Some(rel_close) = find_closing_double(&bytes[i + 2..], b'*') {
-                    if rel_close > 0 && !bytes[i + 2 + rel_close - 1].is_ascii_whitespace() {
+            if i + 2 < bytes.len() && !bytes[i + 2].is_ascii_whitespace()
+                && let Some(rel_close) = find_closing_double(&bytes[i + 2..], b'*')
+                    && rel_close > 0 && !bytes[i + 2 + rel_close - 1].is_ascii_whitespace() {
                         let close_idx = i + 2 + rel_close;
                         spans.push(InlineSpan {
                             kind: InlineKind::Strong,
@@ -470,8 +470,6 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
                         i = close_idx + 2;
                         continue;
                     }
-                }
-            }
             // Skip the entire run of consecutive `*` so `**` is not re-parsed as empty `*` + `*`
             while i < bytes.len() && bytes[i] == b'*' {
                 i += 1;
@@ -481,9 +479,9 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
 
         // Strikethrough `~~...~~`
         if i + 1 < bytes.len() && bytes[i] == b'~' && bytes[i + 1] == b'~' {
-            if i + 2 < bytes.len() && !bytes[i + 2].is_ascii_whitespace() {
-                if let Some(rel_close) = find_closing_double(&bytes[i + 2..], b'~') {
-                    if rel_close > 0 && !bytes[i + 2 + rel_close - 1].is_ascii_whitespace() {
+            if i + 2 < bytes.len() && !bytes[i + 2].is_ascii_whitespace()
+                && let Some(rel_close) = find_closing_double(&bytes[i + 2..], b'~')
+                    && rel_close > 0 && !bytes[i + 2 + rel_close - 1].is_ascii_whitespace() {
                         let close_idx = i + 2 + rel_close;
                         spans.push(InlineSpan {
                             kind: InlineKind::Strikethrough,
@@ -494,8 +492,6 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
                         i = close_idx + 2;
                         continue;
                     }
-                }
-            }
             while i < bytes.len() && bytes[i] == b'~' {
                 i += 1;
             }
@@ -503,10 +499,10 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
         }
 
         // Emphasis `*...*` (cannot be empty or start/end with whitespace)
-        if bytes[i] == b'*' {
-            if i + 1 < bytes.len() && bytes[i + 1] != b'*' && !bytes[i + 1].is_ascii_whitespace() {
-                if let Some(rel_close) = find_closing_single(&bytes[i + 1..], b'*') {
-                    if rel_close > 0 && !bytes[i + 1 + rel_close - 1].is_ascii_whitespace() {
+        if bytes[i] == b'*'
+            && i + 1 < bytes.len() && bytes[i + 1] != b'*' && !bytes[i + 1].is_ascii_whitespace()
+                && let Some(rel_close) = find_closing_single(&bytes[i + 1..], b'*')
+                    && rel_close > 0 && !bytes[i + 1 + rel_close - 1].is_ascii_whitespace() {
                         let close_idx = i + 1 + rel_close;
                         spans.push(InlineSpan {
                             kind: InlineKind::Emphasis,
@@ -517,9 +513,6 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
                         i = close_idx + 1;
                         continue;
                     }
-                }
-            }
-        }
 
         // Image `![alt](url)` and Link `[text](url)`
         let link_open_len = if bytes[i] == b'!' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
@@ -529,11 +522,11 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
         } else {
             None
         };
-        if let Some((kind, open_len)) = link_open_len {
-            if let Some(rel_bracket) = find_closing_single(&bytes[i + open_len..], b']') {
+        if let Some((kind, open_len)) = link_open_len
+            && let Some(rel_bracket) = find_closing_single(&bytes[i + open_len..], b']') {
                 let close_bracket = i + open_len + rel_bracket;
-                if close_bracket + 1 < bytes.len() && bytes[close_bracket + 1] == b'(' {
-                    if let Some(close_paren) = find_matching_paren(&bytes[close_bracket + 2..]) {
+                if close_bracket + 1 < bytes.len() && bytes[close_bracket + 1] == b'('
+                    && let Some(close_paren) = find_matching_paren(&bytes[close_bracket + 2..]) {
                         let inner = &source
                             [start + close_bracket + 2..start + close_bracket + 2 + close_paren];
                         if extract_link_destination(inner).is_some() {
@@ -556,9 +549,7 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
                             continue;
                         }
                     }
-                }
             }
-        }
 
         i += 1;
     }
@@ -1171,7 +1162,7 @@ fn has_frontmatter_marker_line(window: &str) -> bool {
 }
 
 fn preceded_by_blank_line(src: &str, block_start: ByteOffset) -> bool {
-    let prefix = src[..block_start.min(src.len())].as_bytes();
+    let prefix = &src.as_bytes()[..block_start.min(src.len())];
     prefix.ends_with(b"\n\n") || prefix.ends_with(b"\r\n\r\n")
 }
 

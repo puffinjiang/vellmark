@@ -196,39 +196,41 @@ fn sanitize_reason_slug(reason: &str) -> String {
     }
 }
 
-fn compute_history_header_crc(
-    doc_key: &str,
+struct HistoryHeaderCrcInput<'a> {
+    doc_key: &'a str,
     created_unix_secs: u64,
     created_seq: u64,
     doc_state: DocState,
-    reason_slug: &str,
-    source_path: Option<&Path>,
+    reason_slug: &'a str,
+    source_path: Option<&'a Path>,
     base_same_as_payload: bool,
     base_len: usize,
     payload_len: usize,
     base_crc32: u32,
     payload_crc32: u32,
-) -> u32 {
+}
+
+fn compute_history_header_crc(input: &HistoryHeaderCrcInput<'_>) -> u32 {
     let mut h = crc32fast::Hasher::new();
     h.update(HIST_MAGIC.as_bytes());
     h.update(b"\0");
-    h.update(doc_key.as_bytes());
+    h.update(input.doc_key.as_bytes());
     h.update(b"\0");
-    h.update(&created_unix_secs.to_le_bytes());
-    h.update(&created_seq.to_le_bytes());
-    h.update(doc_state_to_tag(doc_state).as_bytes());
+    h.update(&input.created_unix_secs.to_le_bytes());
+    h.update(&input.created_seq.to_le_bytes());
+    h.update(doc_state_to_tag(input.doc_state).as_bytes());
     h.update(b"\0");
-    h.update(reason_slug.as_bytes());
+    h.update(input.reason_slug.as_bytes());
     h.update(b"\0");
-    if let Some(p) = source_path {
+    if let Some(p) = input.source_path {
         h.update(p.to_string_lossy().as_bytes());
     }
     h.update(b"\0");
-    h.update(&[u8::from(base_same_as_payload)]);
-    h.update(&(base_len as u64).to_le_bytes());
-    h.update(&(payload_len as u64).to_le_bytes());
-    h.update(&base_crc32.to_le_bytes());
-    h.update(&payload_crc32.to_le_bytes());
+    h.update(&[u8::from(input.base_same_as_payload)]);
+    h.update(&(input.base_len as u64).to_le_bytes());
+    h.update(&(input.payload_len as u64).to_le_bytes());
+    h.update(&input.base_crc32.to_le_bytes());
+    h.update(&input.payload_crc32.to_le_bytes());
     h.finalize()
 }
 
@@ -271,19 +273,19 @@ pub(crate) fn write_historical_backup_entry(
     };
     let base_len = stored_base_bytes.len();
     let payload_len = req.payload.len();
-    let header_crc32 = compute_history_header_crc(
-        &doc_key,
-        req.now_unix_secs,
+    let header_crc32 = compute_history_header_crc(&HistoryHeaderCrcInput {
+        doc_key: &doc_key,
+        created_unix_secs: req.now_unix_secs,
         created_seq,
-        req.doc_state,
-        &reason_slug,
-        canonical_source.as_deref(),
+        doc_state: req.doc_state,
+        reason_slug: &reason_slug,
+        source_path: canonical_source.as_deref(),
         base_same_as_payload,
         base_len,
         payload_len,
         base_crc32,
         payload_crc32,
-    );
+    });
     let source_path_json = match &canonical_source {
         Some(p) => json_escape_str(&p.to_string_lossy()),
         None => "null".to_string(),
@@ -415,19 +417,19 @@ fn parse_historical_header_fields(
         return None;
     }
 
-    let expected_hdr_crc = compute_history_header_crc(
-        &doc_key,
+    let expected_hdr_crc = compute_history_header_crc(&HistoryHeaderCrcInput {
+        doc_key: &doc_key,
         created_unix_secs,
         created_seq,
         doc_state,
-        &reason_slug,
-        source_path.as_deref(),
+        reason_slug: &reason_slug,
+        source_path: source_path.as_deref(),
         base_same_as_payload,
         base_len,
         payload_len,
         base_crc32,
         payload_crc32,
-    );
+    });
     if expected_hdr_crc != header_crc32 {
         return None;
     }
@@ -512,7 +514,7 @@ fn entry_mtime_age_secs(path: &Path, now_unix_secs: u64) -> Option<u64> {
 pub fn list_historical_backups(history_root: impl AsRef<Path>) -> Vec<HistoricalBackupEntry> {
     let mut entries = Vec::new();
     collect_history_entries(history_root.as_ref(), &mut entries, None);
-    entries.sort_by(|a, b| compare_newest_first(a, b));
+    entries.sort_by(compare_newest_first);
     entries
 }
 
@@ -531,7 +533,7 @@ pub fn list_historical_backups_for_path(
         collect_history_entries(root, &mut entries, None);
         entries.retain(|entry| entry.source_path.is_none());
     }
-    entries.sort_by(|a, b| compare_newest_first(a, b));
+    entries.sort_by(compare_newest_first);
     entries
 }
 
@@ -664,7 +666,7 @@ pub fn prune_historical_backups_at(
 
     let mut live_after_per_file = Vec::new();
     for (_key, mut group) in by_doc {
-        group.sort_by(|a, b| compare_newest_first(a, b));
+        group.sort_by(compare_newest_first);
         let keep_limit = if protected_just_written.is_some() {
             policy.max_backups_per_file.max(1)
         } else {
@@ -686,13 +688,12 @@ pub fn prune_historical_backups_at(
     let mut kept = Vec::with_capacity(live_after_per_file.len());
     for entry in live_after_per_file {
         let is_protected_new = protected_just_written.is_some_and(|p| p == entry.path);
-        if total_bytes > policy.max_total_bytes && !is_protected_new {
-            if fs::remove_file(&entry.path).is_ok() {
+        if total_bytes > policy.max_total_bytes && !is_protected_new
+            && fs::remove_file(&entry.path).is_ok() {
                 total_bytes = total_bytes.saturating_sub(entry.file_size_bytes);
                 report.removed_global_cap += 1;
                 continue;
             }
-        }
         kept.push(entry);
     }
 
@@ -737,11 +738,10 @@ pub fn measure_protected_snapshots_bytes(recovery_root: impl AsRef<Path>) -> u64
                     continue;
                 }
                 sum_dir_recursive(&path, depth + 1, total);
-            } else if ft.is_file() {
-                if let Ok(meta) = fs::symlink_metadata(&path) {
+            } else if ft.is_file()
+                && let Ok(meta) = fs::symlink_metadata(&path) {
                     *total = total.saturating_add(meta.len());
                 }
-            }
         }
     }
 
@@ -832,11 +832,10 @@ pub fn delete_historical_backup(
         ));
     }
     fs::remove_file(&canon_target)?;
-    if let Some(parent) = canon_target.parent() {
-        if parent != canon_root {
+    if let Some(parent) = canon_target.parent()
+        && parent != canon_root {
             let _ = fs::remove_dir(parent);
         }
-    }
     Ok(true)
 }
 
@@ -854,11 +853,10 @@ fn clear_historical_backups_filtered(
         if only_conflict && !entry.reason.is_conflict_backup() {
             continue;
         }
-        if let Some(parent) = entry.path.parent() {
-            if parent != history_root {
+        if let Some(parent) = entry.path.parent()
+            && parent != history_root {
                 candidate_dirs.insert(parent.to_path_buf());
             }
-        }
         if fs::remove_file(&entry.path).is_ok() {
             removed += 1;
         }
@@ -1241,7 +1239,7 @@ mod tests {
                 draft_id: None,
                 reason: HistoricalBackupReason::ClosedUnsaved,
                 base_content: None,
-                payload: &vec![b'x'; 200],
+                payload: &[b'x'; 200],
                 policy,
                 now_unix_secs: 10_000_100 + i * 200_000, // 10_000_100 and 10_200_100
             })
@@ -1277,7 +1275,7 @@ mod tests {
                 draft_id: None,
                 reason: HistoricalBackupReason::ClosedUnsaved,
                 base_content: None,
-                payload: &vec![b'a'; 150],
+                payload: &[b'a'; 150],
                 policy,
                 now_unix_secs: check_now + i,
             })
@@ -1811,7 +1809,7 @@ mod tests {
         let started = std::time::Instant::now();
         let report = maintain_recovery_root(
             &rec_root,
-            &[active_dir.clone()],
+            std::slice::from_ref(&active_dir),
             policy,
             0,
             current_unix_secs(),

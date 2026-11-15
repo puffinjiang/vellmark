@@ -122,8 +122,8 @@ pub fn detect_and_decode(raw: &[u8]) -> Result<(String, FileFormatMeta), Encodin
         }
     }
 
-    if raw.starts_with(&[0xFF, 0xFE]) && raw.len() % 2 == 0 {
-        if let Some(text) = decode_utf16(&raw[2..], true) {
+    if raw.starts_with(&[0xFF, 0xFE]) && raw.len().is_multiple_of(2)
+        && let Some(text) = decode_utf16(&raw[2..], true) {
             if text.contains('\0') {
                 return Err(EncodingError::BinaryFile);
             }
@@ -137,10 +137,9 @@ pub fn detect_and_decode(raw: &[u8]) -> Result<(String, FileFormatMeta), Encodin
             };
             return Ok((text, meta));
         }
-    }
 
-    if raw.starts_with(&[0xFE, 0xFF]) && raw.len() % 2 == 0 {
-        if let Some(text) = decode_utf16(&raw[2..], false) {
+    if raw.starts_with(&[0xFE, 0xFF]) && raw.len().is_multiple_of(2)
+        && let Some(text) = decode_utf16(&raw[2..], false) {
             if text.contains('\0') {
                 return Err(EncodingError::BinaryFile);
             }
@@ -153,14 +152,13 @@ pub fn detect_and_decode(raw: &[u8]) -> Result<(String, FileFormatMeta), Encodin
             };
             return Ok((text, meta));
         }
-    }
 
     // Step 2: BOM-less UTF-16 pattern check BEFORE raw NUL binary rejection
-    if raw.len() >= 4 && raw.len() % 2 == 0 {
+    if raw.len() >= 4 && raw.len().is_multiple_of(2) {
         let pairs = raw.len() / 2;
         let mut even_zeros = 0usize;
         let mut odd_zeros = 0usize;
-        for chunk in raw.chunks_exact(2) {
+        for chunk in raw.as_chunks::<2>().0 {
             if chunk[0] == 0 {
                 even_zeros += 1;
             }
@@ -169,9 +167,9 @@ pub fn detect_and_decode(raw: &[u8]) -> Result<(String, FileFormatMeta), Encodin
             }
         }
         // >= 30% zero bytes on odd indices -> BOM-less UTF-16 LE candidate
-        if odd_zeros * 100 / pairs >= 30 && even_zeros == 0 {
-            if let Some(text) = decode_utf16(raw, true) {
-                if !text.contains('\0') {
+        if odd_zeros * 100 / pairs >= 30 && even_zeros == 0
+            && let Some(text) = decode_utf16(raw, true)
+                && !text.contains('\0') {
                     let meta = FileFormatMeta {
                         decision: EncodingDecision::ReadOnly {
                             candidate: DetectedEncoding::Utf16LeNoBom,
@@ -181,12 +179,10 @@ pub fn detect_and_decode(raw: &[u8]) -> Result<(String, FileFormatMeta), Encodin
                     };
                     return Ok((text, meta));
                 }
-            }
-        }
         // >= 30% zero bytes on even indices -> BOM-less UTF-16 BE candidate
-        if even_zeros * 100 / pairs >= 30 && odd_zeros == 0 {
-            if let Some(text) = decode_utf16(raw, false) {
-                if !text.contains('\0') {
+        if even_zeros * 100 / pairs >= 30 && odd_zeros == 0
+            && let Some(text) = decode_utf16(raw, false)
+                && !text.contains('\0') {
                     let meta = FileFormatMeta {
                         decision: EncodingDecision::ReadOnly {
                             candidate: DetectedEncoding::Utf16BeNoBom,
@@ -196,8 +192,6 @@ pub fn detect_and_decode(raw: &[u8]) -> Result<(String, FileFormatMeta), Encodin
                     };
                     return Ok((text, meta));
                 }
-            }
-        }
     }
 
     // Binary check on first 8 KB if not UTF-16
@@ -266,16 +260,18 @@ pub fn encode_for_save(text: &str, meta: &FileFormatMeta) -> Result<Vec<u8>, Enc
 }
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> Option<String> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let u16s: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| {
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&c| {
             if little_endian {
-                u16::from_le_bytes([c[0], c[1]])
+                u16::from_le_bytes(c)
             } else {
-                u16::from_be_bytes([c[0], c[1]])
+                u16::from_be_bytes(c)
             }
         })
         .collect();

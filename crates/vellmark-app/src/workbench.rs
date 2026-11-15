@@ -243,11 +243,10 @@ impl DocumentTab {
         let rev = self.session.buffer.revision();
         let sel_range = self.view.selection.range();
         let mut from = sel_range.end;
-        if sel_range.is_empty() {
-            if let Some((saved_rev, saved_pos, saved_query, saved_opts)) =
+        if sel_range.is_empty()
+            && let Some((saved_rev, saved_pos, saved_query, saved_opts)) =
                 &self.last_zero_width_find
-            {
-                if *saved_rev == rev
+                && *saved_rev == rev
                     && *saved_pos == from
                     && saved_query == query
                     && *saved_opts == options
@@ -258,8 +257,6 @@ impl DocumentTab {
                         from = text.len().saturating_add(1);
                     }
                 }
-            }
-        }
         let found = vellmark_core::find_next_match(&text, query, from, wrap, options)?;
         if let Some(m) = &found {
             self.view.selection = vellmark_core::Selection::new(m.range.start, m.range.end);
@@ -1003,8 +1000,8 @@ impl AppWorkbench {
                 .as_ref()
                 .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
 
-            if let Some(target_canon) = &entry_canonical {
-                if let Some((existing_idx, tab)) = self.tabs.iter_mut().enumerate().find(|(_, t)| {
+            if let Some(target_canon) = &entry_canonical
+                && let Some((existing_idx, tab)) = self.tabs.iter_mut().enumerate().find(|(_, t)| {
                     t.session
                         .path
                         .as_ref()
@@ -1030,7 +1027,6 @@ impl AppWorkbench {
                     }
                     continue;
                 }
-            }
 
             let id = self.next_tab_id;
             self.next_tab_id += 1;
@@ -1104,11 +1100,10 @@ impl AppWorkbench {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if let Some(last) = self.last_maintenance_unix_secs {
-            if now.saturating_sub(last) < DEFAULT_MAINTENANCE_INTERVAL_SECS {
+        if let Some(last) = self.last_maintenance_unix_secs
+            && now.saturating_sub(last) < DEFAULT_MAINTENANCE_INTERVAL_SECS {
                 return None;
             }
-        }
         self.maintain_recovery_storage()
     }
 
@@ -1123,11 +1118,10 @@ impl AppWorkbench {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if let Some(last) = self.last_maintenance_unix_secs {
-            if now.saturating_sub(last) < DEFAULT_MAINTENANCE_INTERVAL_SECS {
+        if let Some(last) = self.last_maintenance_unix_secs
+            && now.saturating_sub(last) < DEFAULT_MAINTENANCE_INTERVAL_SECS {
                 return false;
             }
-        }
         self.maintain_recovery_storage_async()
     }
 
@@ -1181,17 +1175,13 @@ impl AppWorkbench {
 
     /// Poll a background recovery maintenance task without blocking the GUI event loop.
     pub fn poll_recovery_maintenance(&mut self) -> Option<RecoveryMaintenanceReport> {
-        let recv_result = match self.pending_maintenance.as_ref() {
-            Some(job) => job.rx.try_recv(),
-            None => return None,
-        };
+        let recv_result = self.pending_maintenance.as_ref()?.rx.try_recv();
         match recv_result {
             Ok((ts, report)) => {
-                if let Some(mut job) = self.pending_maintenance.take() {
-                    if let Some(h) = job.handle.take() {
+                if let Some(mut job) = self.pending_maintenance.take()
+                    && let Some(h) = job.handle.take() {
                         let _ = h.join();
                     }
-                }
                 self.last_maintenance_unix_secs = Some(ts);
                 self.last_recovery_maintenance = Some(report.clone());
                 self.refresh_all_conflict_backup_counts();
@@ -1199,11 +1189,10 @@ impl AppWorkbench {
             }
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => {
-                if let Some(mut job) = self.pending_maintenance.take() {
-                    if let Some(h) = job.handle.take() {
+                if let Some(mut job) = self.pending_maintenance.take()
+                    && let Some(h) = job.handle.take() {
                         let _ = h.join();
                     }
-                }
                 None
             }
         }
@@ -1310,11 +1299,9 @@ impl AppWorkbench {
             tab.sync_edit_activity_at(now);
             if let Some(deadline) =
                 tab.next_auto_save_deadline(self.config.auto_save_enabled, idle_delay)
-            {
-                if now >= deadline {
+                && now >= deadline {
                     tab.session.schedule_async_save();
                 }
-            }
         }
         events.extend(self.poll_async_saves_at(now));
         events

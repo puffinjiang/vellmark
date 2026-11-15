@@ -74,6 +74,8 @@ impl DiskSnapshot {
         }
     }
 
+    /// Infallible convenience constructor matching `Rope::from_str`.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> Self {
         Self::from_rope(Rope::from_str(text))
     }
@@ -182,11 +184,10 @@ fn find_renamed_sibling_by_inode(old_path: &Path, expected_dev_ino: (u64, u64)) 
         {
             continue;
         }
-        if let Ok(meta) = fs::metadata(&cand) {
-            if meta.is_file() && DiskFileStat::from_metadata(&meta).dev_ino == expected_dev_ino {
+        if let Ok(meta) = fs::metadata(&cand)
+            && meta.is_file() && DiskFileStat::from_metadata(&meta).dev_ino == expected_dev_ino {
                 return Some(cand);
             }
-        }
     }
     None
 }
@@ -263,11 +264,10 @@ impl SaveWorker {
                         let write_id = guard.next_write_id;
                         // Retain written_base across idle gaps until DocumentSession applies `write_id`
                         // so subsequent auto-saves before UI reconciliation never compare against stale base.
-                        if let Some((wid, ref prev_path, ref prev_base)) = guard.unreconciled_base {
-                            if *prev_path == req.path && wid > req.known_applied_write_id {
+                        if let Some((wid, ref prev_path, ref prev_base)) = guard.unreconciled_base
+                            && *prev_path == req.path && wid > req.known_applied_write_id {
                                 req.expected_base = prev_base.clone();
                             }
-                        }
                         break (req, write_id);
                     }
                     guard.in_flight = false;
@@ -412,15 +412,13 @@ fn perform_versioned_disk_write(req: &SaveRequest) -> DiskWriteResult {
             if !matches!(req.current_state, DocState::Missing { .. }) {
                 return DiskWriteResult::MissingTarget;
             }
-            if let Some(parent) = req.path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    if let Err(dir_err) = fs::create_dir_all(parent) {
+            if let Some(parent) = req.path.parent()
+                && !parent.as_os_str().is_empty()
+                    && let Err(dir_err) = fs::create_dir_all(parent) {
                         return DiskWriteResult::WriteFailed {
                             error: dir_err.to_string(),
                         };
                     }
-                }
-            }
         }
         Err(e) => {
             return DiskWriteResult::WriteFailed {
@@ -1181,8 +1179,8 @@ impl DocumentSession {
         let _ = self.drain_pending_async_save();
         let target = new_path.as_ref().to_path_buf();
 
-        if let Some(current_path) = &self.path {
-            if paths_refer_to_same_file(current_path, &target) {
+        if let Some(current_path) = &self.path
+            && paths_refer_to_same_file(current_path, &target) {
                 if self.state == DocState::Conflict {
                     match fs::read(&target) {
                         Ok(disk_bytes) => {
@@ -1215,7 +1213,6 @@ impl DocumentSession {
                     return self.save();
                 }
             }
-        }
 
         let written_revision = self.buffer.revision();
         let written_rope = self.buffer.snapshot_rope();
@@ -1225,13 +1222,11 @@ impl DocumentSession {
             Err(e) => return SaveOutcome::WriteFailed(e.to_string()),
         };
 
-        if let Some(parent) = target.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(e) = fs::create_dir_all(parent) {
+        if let Some(parent) = target.parent()
+            && !parent.as_os_str().is_empty()
+                && let Err(e) = fs::create_dir_all(parent) {
                     return SaveOutcome::WriteFailed(e.to_string());
                 }
-            }
-        }
         if let Err(e) = atomic_write_file(&target, &bytes) {
             return SaveOutcome::WriteFailed(e.to_string());
         }
@@ -1488,9 +1483,9 @@ impl DocumentSession {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 #[cfg(unix)]
-                if !matches!(self.state, DocState::Missing { .. }) {
-                    if let Some(prev_stat) = self.disk_stat {
-                        if let Some(new_cand) =
+                if !matches!(self.state, DocState::Missing { .. })
+                    && let Some(prev_stat) = self.disk_stat
+                        && let Some(new_cand) =
                             find_renamed_sibling_by_inode(&path, prev_stat.dev_ino)
                         {
                             let new_path = normalize_session_path(&new_cand);
@@ -1506,8 +1501,6 @@ impl DocumentSession {
                                 new_path,
                             };
                         }
-                    }
-                }
                 self.disk_stat = None;
                 if matches!(self.state, DocState::Missing { .. }) {
                     return ExternalSyncResult::NoChange;
@@ -1989,13 +1982,12 @@ impl DocumentSession {
                 candidates.push((summary.sequence.unwrap_or(0), summary.revision, p));
             }
         }
-        candidates.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+        candidates.sort_by_key(|a| std::cmp::Reverse((a.0, a.1)));
         for (_, _, p) in candidates {
-            if let Ok(raw) = fs::read_to_string(&p) {
-                if let Some(rep) = deserialize_and_verify_slot_report(&raw) {
+            if let Ok(raw) = fs::read_to_string(&p)
+                && let Some(rep) = deserialize_and_verify_slot_report(&raw) {
                     return Some(rep);
                 }
-            }
         }
         None
     }
@@ -2650,13 +2642,10 @@ pub(crate) fn slot_content_equals_base_streaming(
 }
 
 fn deserialize_and_verify_slot_report(raw: &str) -> Option<RecoverySlotReport> {
-    let sep = if raw.starts_with("---\n") {
+    if raw.starts_with("---\n") {
         return None;
-    } else if let Some(idx) = raw.find("\n---\n") {
-        idx + 1
-    } else {
-        return None;
-    };
+    }
+    let sep = raw.find("\n---\n")? + 1;
     if sep + 4 > MAX_RECOVERY_HEADER_BYTES {
         return None;
     }
@@ -3588,20 +3577,18 @@ fn three_way_merge_lines(
                     ti += 1;
                     loop {
                         let mut extended = false;
-                        if let Some(&next_o) = ours_hunks.get(oi) {
-                            if next_o.base_start < c_end {
+                        if let Some(&next_o) = ours_hunks.get(oi)
+                            && next_o.base_start < c_end {
                                 c_end = c_end.max(next_o.base_end);
                                 oi += 1;
                                 extended = true;
                             }
-                        }
-                        if let Some(&next_t) = theirs_hunks.get(ti) {
-                            if next_t.base_start < c_end {
+                        if let Some(&next_t) = theirs_hunks.get(ti)
+                            && next_t.base_start < c_end {
                                 c_end = c_end.max(next_t.base_end);
                                 ti += 1;
                                 extended = true;
                             }
-                        }
                         if !extended {
                             break;
                         }
@@ -4188,8 +4175,10 @@ mod tests {
         fs::write(&file_path, &initial).unwrap();
 
         let mut session = DocumentSession::open_file(&file_path, Some(rec_dir)).unwrap();
-        let mut view = EditorViewState::default();
-        view.selection = Selection::caret(initial.len());
+        let mut view = EditorViewState {
+            selection: Selection::caret(initial.len()),
+            ..Default::default()
+        };
 
         // Edit near offset 405, then save cleanly
         session
@@ -4225,8 +4214,10 @@ mod tests {
         fs::write(&file_path, "Hello").unwrap();
 
         let mut session = DocumentSession::open_file(&file_path, Some(rec_dir)).unwrap();
-        let mut view = EditorViewState::default();
-        view.selection = Selection::caret(5);
+        let mut view = EditorViewState {
+            selection: Selection::caret(5),
+            ..Default::default()
+        };
 
         // User is composing `"ni"` in IME (not yet committed)
         session
