@@ -44,33 +44,14 @@ pub enum BlockKind {
     YamlFrontMatter,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum TableAlign {
-    #[default]
-    Left,
-    Center,
-    Right,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableCellSpan {
-    /// Byte range in `source` of the raw cell slice between surrounding unescaped `|` pipes.
-    pub raw_range: ByteRange,
-    /// Trimmed content byte range in `source` (or insertion point after `"| "` for empty space cells).
-    pub content_range: ByteRange,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableRowParsed {
-    /// Full line byte range in `source` (excluding trailing `\r`/`\n`).
-    pub line_range: ByteRange,
-    /// Whether this row is a valid GFM delimiter row (`| --- | :---: | ---: |`).
-    pub is_delimiter: bool,
-    /// Per-column alignments parsed when `is_delimiter` is true.
-    pub alignments: Vec<TableAlign>,
-    /// Parsed cell slices between unescaped pipes.
-    pub cells: Vec<TableCellSpan>,
-}
+pub use vellmark_core::table::{
+    TableAlign, TableCellSpan, TableRowParsed, is_pipe_table_line, parse_table_block,
+    parse_table_cell_rel_ranges, parse_table_delimiter_alignments, unescaped_pipe_offsets,
+};
+use vellmark_core::table::{
+    is_closing_fence_line, parse_atx_heading_prefix, parse_list_item_kind,
+    parse_opening_fence_line, try_scan_gfm_table_from_line,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InlineKind {
@@ -270,47 +251,28 @@ pub fn parse_blocks(source: &str) -> Vec<BlockNode> {
 
         // GFM table block: non-delimiter header row followed immediately by a matching-column
         // delimiter row (`| --- | :---: | ---: |`, outer pipes optional), then 0+ body rows.
-        if let Some((delim_end, delim_next_pos)) =
-            parse_table_header_and_delim(source, bytes, line_start, line_end, next_pos)
+        if let Some(table) =
+            try_scan_gfm_table_from_line(source, bytes, line_start, line_end, next_pos)
         {
-            let table_start = line_start;
-            let mut table_end = delim_end;
-            let mut table_next_pos = delim_next_pos;
             let mut inlines = Vec::new();
-
-            if let Some(header_cells) = parse_table_cell_rel_ranges(line_trimmed) {
-                for (c_start, c_end) in header_cells {
-                    inlines.extend(parse_inlines(
-                        source,
-                        line_start + c_start,
-                        line_start + c_end,
-                    ));
-                }
-            }
-
-            let mut table_pos = delim_next_pos;
-            while table_pos < bytes.len() {
-                let (b_start, b_end, b_next) = scan_line_bounds(bytes, table_pos);
-                let raw_line = source[b_start..b_end].trim_end_matches('\r');
-                if !is_table_body_row_candidate(raw_line) {
-                    break;
-                }
-                if let Some(cells) = parse_table_cell_rel_ranges(raw_line) {
-                    for (c_start, c_end) in cells {
-                        inlines.extend(parse_inlines(source, b_start + c_start, b_start + c_end));
+            for row in &table.rows {
+                if !row.is_delimiter {
+                    for cell in &row.cells {
+                        inlines.extend(parse_inlines(
+                            source,
+                            cell.raw_range.start,
+                            cell.raw_range.end,
+                        ));
                     }
                 }
-                table_end = b_end;
-                table_next_pos = b_next;
-                table_pos = b_next;
             }
 
             blocks.push(BlockNode {
                 kind: BlockKind::Table,
-                range: ByteRange::new(table_start, table_end),
+                range: table.range,
                 inlines,
             });
-            pos = table_next_pos;
+            pos = table.next_pos;
             continue;
         }
 
@@ -326,319 +288,6 @@ pub fn parse_blocks(source: &str) -> Vec<BlockNode> {
     }
 
     blocks
-}
-
-/// Byte offsets of all unescaped `|` characters in a single table row string.
-pub fn unescaped_pipe_offsets(line: &str) -> Vec<usize> {
-    let bytes = line.as_bytes();
-    let mut pipes = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            i += 2;
-            continue;
-        }
-        if bytes[i] == b'|' {
-            pipes.push(i);
-        }
-        i += 1;
-    }
-    pipes
-}
-
-fn scan_line_bounds(bytes: &[u8], start: usize) -> (usize, usize, usize) {
-    let mut end = start;
-    while end < bytes.len() && bytes[end] != b'\n' {
-        end += 1;
-    }
-    let next = if end < bytes.len() { end + 1 } else { end };
-    (start, end, next)
-}
-
-fn is_table_interrupting_block_opener(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.is_empty()
-        || trimmed.starts_with('>')
-        || parse_atx_heading_prefix(line).is_some()
-        || parse_opening_fence_line(line).is_some()
-        || parse_list_item_kind(line).is_some()
-}
-
-/// Split a single table row line (without trailing `\r`/`\n`) into cell `(start, end)`
-/// byte offsets relative to `line`, following GFM 0.29-gfm pipe-table rules (outer pipes optional).
-pub fn parse_table_cell_rel_ranges(line: &str) -> Option<Vec<(usize, usize)>> {
-    let bytes = line.as_bytes();
-    let ws_lead = bytes
-        .iter()
-        .take_while(|&&b| b == b' ' || b == b'\t')
-        .count();
-    let ws_tail = bytes.len()
-        - bytes[ws_lead..]
-            .iter()
-            .rev()
-            .take_while(|&&b| b == b' ' || b == b'\t')
-            .count();
-    if ws_lead >= ws_tail {
-        return None;
-    }
-
-    let pipes = unescaped_pipe_offsets(line);
-    if pipes.is_empty() {
-        return None;
-    }
-
-    let has_leading_pipe = pipes[0] == ws_lead;
-    // A standalone pipe (`|` with optional surrounding whitespace) defines zero cells.
-    if pipes.len() == 1 && has_leading_pipe && ws_tail == pipes[0] + 1 {
-        return None;
-    }
-
-    let has_trailing_pipe =
-        pipes.last().copied() == Some(ws_tail - 1) && (pipes.len() >= 2 || !has_leading_pipe);
-
-    let mut cells = Vec::with_capacity(pipes.len() + 1);
-    let mut cursor = if has_leading_pipe {
-        pipes[0] + 1
-    } else {
-        ws_lead
-    };
-    let pipe_slice = if has_leading_pipe {
-        &pipes[1..]
-    } else {
-        &pipes[..]
-    };
-    for &p in pipe_slice {
-        cells.push((cursor, p));
-        cursor = p + 1;
-    }
-    if !has_trailing_pipe {
-        cells.push((cursor, ws_tail));
-    }
-
-    if cells.is_empty() {
-        None
-    } else {
-        Some(cells)
-    }
-}
-
-fn parse_table_delimiter_alignments_for_cells(
-    line: &str,
-    cell_ranges: &[(usize, usize)],
-) -> Option<Vec<TableAlign>> {
-    if cell_ranges.is_empty() {
-        return None;
-    }
-    let mut alignments = Vec::with_capacity(cell_ranges.len());
-    for &(start, end) in cell_ranges {
-        let cell = line[start..end].trim();
-        let (left_colon, s) = match cell.strip_prefix(':') {
-            Some(rest) => (true, rest),
-            None => (false, cell),
-        };
-        let (right_colon, dashes) = match s.strip_suffix(':') {
-            Some(rest) => (true, rest),
-            None => (false, s),
-        };
-        if dashes.is_empty() || !dashes.bytes().all(|b| b == b'-') {
-            return None;
-        }
-        let align = match (left_colon, right_colon) {
-            (true, true) => TableAlign::Center,
-            (false, true) => TableAlign::Right,
-            _ => TableAlign::Left,
-        };
-        alignments.push(align);
-    }
-    Some(alignments)
-}
-
-fn is_table_body_row_candidate(line: &str) -> bool {
-    !is_table_interrupting_block_opener(line) && parse_table_cell_rel_ranges(line).is_some()
-}
-
-fn parse_table_header_and_delim(
-    source: &str,
-    bytes: &[u8],
-    header_start: usize,
-    header_end: usize,
-    delim_scan_start: usize,
-) -> Option<(usize, usize)> {
-    let header_raw = source[header_start..header_end].trim_end_matches('\r');
-    if is_table_interrupting_block_opener(header_raw) {
-        return None;
-    }
-    let header_cells = parse_table_cell_rel_ranges(header_raw)?;
-    if parse_table_delimiter_alignments_for_cells(header_raw, &header_cells).is_some() {
-        return None;
-    }
-    if delim_scan_start >= bytes.len() {
-        return None;
-    }
-    let (delim_start, delim_end, delim_next_pos) = scan_line_bounds(bytes, delim_scan_start);
-    let delim_raw = source[delim_start..delim_end].trim_end_matches('\r');
-    if is_table_interrupting_block_opener(delim_raw) {
-        return None;
-    }
-    let delim_cells = parse_table_cell_rel_ranges(delim_raw)?;
-    let delim_aligns = parse_table_delimiter_alignments_for_cells(delim_raw, &delim_cells)?;
-    if delim_aligns.len() != header_cells.len() {
-        return None;
-    }
-    Some((delim_end, delim_next_pos))
-}
-
-/// Whether a single line (without trailing `\r`/`\n`) is a Markdown pipe-table row candidate.
-pub fn is_pipe_table_line(line: &str) -> bool {
-    parse_table_cell_rel_ranges(line).is_some()
-}
-
-/// Parse per-column alignment markers from a delimiter row (`| --- | :---: | ---: |`, outer pipes optional).
-pub fn parse_table_delimiter_alignments(line: &str, _pipes: &[usize]) -> Option<Vec<TableAlign>> {
-    let cells = parse_table_cell_rel_ranges(line)?;
-    parse_table_delimiter_alignments_for_cells(line, &cells)
-}
-
-/// Parse all rows and cell byte ranges inside a `BlockKind::Table` block range.
-pub fn parse_table_block(source: &str, block_range: ByteRange) -> Vec<TableRowParsed> {
-    let end = block_range.end.min(source.len());
-    let mut pos = block_range.start.min(end);
-    let bytes = source.as_bytes();
-    let mut rows = Vec::new();
-
-    while pos < end {
-        let l_start = pos;
-        let mut l_end = pos;
-        while l_end < end && bytes[l_end] != b'\n' {
-            l_end += 1;
-        }
-        let next_pos = if l_end < end { l_end + 1 } else { l_end };
-        let content_end = if l_end > l_start && bytes[l_end - 1] == b'\r' {
-            l_end - 1
-        } else {
-            l_end
-        };
-
-        let line = &source[l_start..content_end];
-        let cell_ranges = parse_table_cell_rel_ranges(line).unwrap_or_default();
-        // Per GFM 0.29-gfm, only row index 1 (immediately beneath header row 0) is the delimiter row.
-        let alignments = if rows.len() == 1 {
-            parse_table_delimiter_alignments_for_cells(line, &cell_ranges)
-        } else {
-            None
-        };
-        let is_delimiter = alignments.is_some();
-        let mut cells = Vec::with_capacity(cell_ranges.len());
-        for (rel_start, rel_end) in cell_ranges {
-            let raw_start = l_start + rel_start;
-            let raw_end = l_start + rel_end;
-            let raw = &source[raw_start..raw_end];
-            let lead_ws = raw.bytes().take_while(|&b| b == b' ' || b == b'\t').count();
-            let content_range = if raw_start + lead_ws >= raw_end {
-                let caret_pos = if raw.is_empty() {
-                    raw_start
-                } else {
-                    (raw_start + 1).min(raw_end)
-                };
-                ByteRange::empty(caret_pos)
-            } else {
-                let tail_ws = raw[lead_ws..]
-                    .bytes()
-                    .rev()
-                    .take_while(|&b| b == b' ' || b == b'\t')
-                    .count();
-                ByteRange::new(raw_start + lead_ws, raw_end - tail_ws)
-            };
-            cells.push(TableCellSpan {
-                raw_range: ByteRange::new(raw_start, raw_end),
-                content_range,
-            });
-        }
-        rows.push(TableRowParsed {
-            line_range: ByteRange::new(l_start, content_end),
-            is_delimiter,
-            alignments: alignments.unwrap_or_default(),
-            cells,
-        });
-
-        pos = next_pos;
-    }
-
-    rows
-}
-
-fn parse_opening_fence_line(line: &str) -> Option<(u8, usize, String)> {
-    let bytes = line.as_bytes();
-    let mut indent = 0usize;
-    while indent < bytes.len() && bytes[indent] == b' ' && indent < 4 {
-        indent += 1;
-    }
-    if indent >= 4 || indent >= bytes.len() {
-        return None;
-    }
-    let ch = bytes[indent];
-    if ch != b'`' && ch != b'~' {
-        return None;
-    }
-    let mut run = 0usize;
-    while indent + run < bytes.len() && bytes[indent + run] == ch {
-        run += 1;
-    }
-    if run < 3 {
-        return None;
-    }
-    let info = &line[indent + run..];
-    if ch == b'`' && info.contains('`') {
-        return None;
-    }
-    Some((ch, run, info.trim().to_string()))
-}
-
-fn is_closing_fence_line(line: &str, fence_char: u8, min_len: usize) -> bool {
-    let bytes = line.as_bytes();
-    let mut indent = 0usize;
-    while indent < bytes.len() && bytes[indent] == b' ' && indent < 4 {
-        indent += 1;
-    }
-    if indent >= 4 || indent >= bytes.len() {
-        return false;
-    }
-    let mut run = 0usize;
-    while indent + run < bytes.len() && bytes[indent + run] == fence_char {
-        run += 1;
-    }
-    if run < min_len {
-        return false;
-    }
-    line[indent + run..].trim().is_empty()
-}
-
-fn parse_list_item_kind(line: &str) -> Option<(bool, usize, Option<bool>)> {
-    let bytes = line.as_bytes();
-    let mut indent = 0usize;
-    while indent < bytes.len() && bytes[indent] == b' ' {
-        indent += 1;
-    }
-    let rest = &line[indent..];
-    if rest.starts_with("- [ ] ") {
-        return Some((false, indent, Some(false)));
-    }
-    if rest.starts_with("- [x] ") || rest.starts_with("- [X] ") {
-        return Some((false, indent, Some(true)));
-    }
-    for m in ["- ", "* ", "+ "] {
-        if rest.starts_with(m) {
-            return Some((false, indent, None));
-        }
-    }
-    let mut digits = 0usize;
-    while digits < rest.len() && rest.as_bytes()[digits].is_ascii_digit() {
-        digits += 1;
-    }
-    if digits > 0 && rest[digits..].starts_with(". ") {
-        return Some((true, indent, None));
-    }
-    None
 }
 
 /// Sidebar Outline item extracted from document headings (PRD 4.5 F-04).
@@ -768,19 +417,6 @@ pub fn copy_selection(source: &str, selection: Selection) -> CopyPayload {
     CopyPayload { markdown, html }
 }
 
-fn parse_atx_heading_prefix(line: &str) -> Option<(u8, usize)> {
-    let bytes = line.as_bytes();
-    let mut hashes = 0usize;
-    while hashes < bytes.len() && bytes[hashes] == b'#' && hashes < 6 {
-        hashes += 1;
-    }
-    if hashes > 0 && hashes < bytes.len() && bytes[hashes] == b' ' {
-        Some((hashes as u8, hashes + 1))
-    } else {
-        None
-    }
-}
-
 /// Scan a line range `[start, end)` for paired inline markers (`**...**`, `*...*`, `` `...` ``, `~~...~~`).
 pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<InlineSpan> {
     let slice = &source[start..end];
@@ -898,19 +534,27 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
                 let close_bracket = i + open_len + rel_bracket;
                 if close_bracket + 1 < bytes.len() && bytes[close_bracket + 1] == b'(' {
                     if let Some(close_paren) = find_matching_paren(&bytes[close_bracket + 2..]) {
-                        let span_end = close_bracket + 2 + close_paren + 1;
-                        spans.push(InlineSpan {
-                            kind,
-                            full_range: ByteRange::new(start + i, start + span_end),
-                            open_marker: ByteRange::new(start + i, start + i + open_len),
-                            close_marker: ByteRange::new(start + close_bracket, start + span_end),
-                        });
-                        if kind == InlineKind::Link && close_bracket > i + open_len {
-                            let nested = parse_inlines(source, start + i + open_len, start + close_bracket);
-                            spans.extend(nested);
+                        let inner = &source
+                            [start + close_bracket + 2..start + close_bracket + 2 + close_paren];
+                        if extract_link_destination(inner).is_some() {
+                            let span_end = close_bracket + 2 + close_paren + 1;
+                            spans.push(InlineSpan {
+                                kind,
+                                full_range: ByteRange::new(start + i, start + span_end),
+                                open_marker: ByteRange::new(start + i, start + i + open_len),
+                                close_marker: ByteRange::new(start + close_bracket, start + span_end),
+                            });
+                            if kind == InlineKind::Link && close_bracket > i + open_len {
+                                let nested = parse_inlines(
+                                    source,
+                                    start + i + open_len,
+                                    start + close_bracket,
+                                );
+                                spans.extend(nested);
+                            }
+                            i = span_end;
+                            continue;
                         }
-                        i = span_end;
-                        continue;
                     }
                 }
             }
@@ -941,12 +585,186 @@ fn find_closing_backtick_run(bytes: &[u8], run_len: usize) -> Option<usize> {
     None
 }
 
-fn find_matching_paren(bytes: &[u8]) -> Option<usize> {
-    let mut depth = 0usize;
+/// Extract and validate a CommonMark link/image destination from the raw slice inside `](...)`.
+///
+/// Follows CommonMark §6.4 / §2.4: supports `<...>` angle-bracketed destinations (preserving spaces)
+/// and bare destinations (balanced parens only, no unescaped spaces), validates any trailing title,
+/// and unescapes CommonMark ASCII punctuation backslash escapes (`\(`, `\)`, `\\`, `\<`, `\>`, etc.).
+pub fn extract_link_destination(raw_inner: &str) -> Option<String> {
+    let rest = raw_inner.trim_start_matches([' ', '\t']);
+    if let Some(after_lt) = rest.strip_prefix('<') {
+        let bytes = after_lt.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_punctuation() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'<' || bytes[i] == b'\r' || bytes[i] == b'\n' {
+                return None;
+            }
+            if bytes[i] == b'>' {
+                let raw_dest = &after_lt[..i];
+                let after_dest = &after_lt[i + 1..];
+                if !validate_optional_link_title_tail(after_dest) {
+                    return None;
+                }
+                return Some(unescape_commonmark_str(raw_dest));
+            }
+            i += 1;
+        }
+        return None;
+    }
+
+    let bytes = rest.as_bytes();
+    let mut i = 0usize;
+    let mut paren_depth = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_punctuation() {
+            i += 2;
+            continue;
+        }
+        if b == b'(' {
+            paren_depth += 1;
+            i += 1;
+            continue;
+        }
+        if b == b')' {
+            if paren_depth == 0 {
+                return None;
+            }
+            paren_depth -= 1;
+            i += 1;
+            continue;
+        }
+        if b == b' ' || b == b'\t' {
+            break;
+        }
+        if b < 0x20 || b == 0x7f {
+            return None;
+        }
+        i += 1;
+    }
+
+    if paren_depth != 0 {
+        return None;
+    }
+    let raw_dest = &rest[..i];
+    let after_dest = &rest[i..];
+    if !validate_optional_link_title_tail(after_dest) {
+        return None;
+    }
+    Some(unescape_commonmark_str(raw_dest))
+}
+
+fn validate_optional_link_title_tail(after_dest: &str) -> bool {
+    let after_ws = after_dest.trim_start_matches([' ', '\t']);
+    if after_ws.is_empty() {
+        return true;
+    }
+    // A title or trailing spaces must be separated from the destination by whitespace.
+    if after_ws.len() == after_dest.len() {
+        return false;
+    }
+    let bytes = after_ws.as_bytes();
+    let (open, close) = match bytes[0] {
+        b'"' => (b'"', b'"'),
+        b'\'' => (b'\'', b'\''),
+        b'(' => (b'(', b')'),
+        _ => return false,
+    };
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_punctuation() {
+            i += 2;
+            continue;
+        }
+        if open == b'(' && bytes[i] == b'(' {
+            return false;
+        }
+        if bytes[i] == close {
+            return after_ws[i + 1..]
+                .bytes()
+                .all(|b| b == b' ' || b == b'\t');
+        }
+        if bytes[i] == b'\r' || bytes[i] == b'\n' {
+            return false;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn unescape_commonmark_str(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
     let mut i = 0usize;
     while i < bytes.len() {
-        if bytes[i] == b'\\' {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_punctuation() {
+            out.push(bytes[i + 1] as char);
             i += 2;
+            continue;
+        }
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn find_matching_paren(bytes: &[u8]) -> Option<usize> {
+    let mut i = 0usize;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'<' {
+        let mut j = i + 1;
+        let mut closed_angle = false;
+        while j < bytes.len() {
+            if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                j += 2;
+                continue;
+            }
+            if bytes[j] == b'<' || bytes[j] == b'\r' || bytes[j] == b'\n' {
+                break;
+            }
+            if bytes[j] == b'>' {
+                i = j + 1;
+                closed_angle = true;
+                break;
+            }
+            j += 1;
+        }
+        if !closed_angle {
+            i = 0;
+        }
+    }
+
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if depth == 0
+            && (bytes[i] == b'"' || bytes[i] == b'\'')
+            && i > 0
+            && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t')
+        {
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
             continue;
         }
         if bytes[i] == b'(' {
@@ -1788,5 +1606,98 @@ mod tests {
         apply_text_patch(&mut inc, end, end, "| --- | --- |");
         assert_eq!(inc.blocks(), parse_blocks(inc.source()).as_slice());
         assert!(inc.blocks().iter().any(|b| b.kind == BlockKind::Table));
+    }
+
+    #[test]
+    fn test_gfm_table_canonical_delimiter_column_count_and_html_export() {
+        let src = "| a | b |\n| - | - |\n| 1 | 2 | 3 |\n";
+        let blocks = parse_blocks(src);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::Table);
+
+        let rows = parse_table_block(src, blocks[0].range);
+        assert_eq!(rows.len(), 3);
+        assert!(rows[1].is_delimiter);
+        // Delimiter row fixes canonical GFM column count at 2 even though body row has 3 cells.
+        assert_eq!(rows[0].cells.len(), 2);
+        assert_eq!(rows[1].cells.len(), 2);
+        assert_eq!(rows[2].cells.len(), 3);
+
+        let html = render_markdown_to_html(src);
+        assert!(html.contains("<th>a</th>"));
+        assert!(html.contains("<th>b</th>"));
+        assert!(html.contains("<td>1</td>"));
+        assert!(html.contains("<td>2</td>"));
+        assert!(!html.contains("<td>3</td>"));
+
+        // Preceding prose containing `|` must not swallow the table in `find_enclosing_gfm_table_at`.
+        let with_prefix = "text | with pipe\n| a | b |\n| - | - |\n| 1 | 2 |";
+        let body_caret = with_prefix.len() - 3;
+        let ctx = vellmark_core::find_enclosing_gfm_table_at(with_prefix, body_caret)
+            .expect("table should still be found beneath non-table pipe line");
+        assert_eq!(ctx.delim_cols, 2);
+        assert_eq!(ctx.rows.len(), 3);
+        assert_eq!(ctx.row_idx, 2);
+        assert_eq!(&with_prefix[ctx.range.start..ctx.range.end], "| a | b |\n| - | - |\n| 1 | 2 |");
+    }
+
+    #[test]
+    fn test_commonmark_link_destination_parsing_and_unescape() {
+        // Bare unescaped or backslash-space destinations are NOT valid CommonMark links.
+        for bad in [
+            "[a](my file.md)",
+            "[a](my\\ file.md)",
+            "[a](http://example.com/a(b)",
+            "[a](<foo> extra)",
+            "[a](<unclosed)",
+        ] {
+            let spans = parse_inlines(bad, 0, bad.len());
+            assert!(
+                !spans.iter().any(|s| s.kind == InlineKind::Link),
+                "expected `{bad}` not to parse as Link, got {spans:?}"
+            );
+            let html = render_markdown_to_html(bad);
+            assert!(!html.contains("<a "), "pulldown-cmark unexpectedly linked `{bad}`: {html}");
+        }
+
+        // Valid CommonMark links with escapes, angle brackets, titles, and parens parse & extract losslessly.
+        let cases = [
+            (
+                "[t](https://example.com/a\\(b)",
+                "https://example.com/a(b",
+            ),
+            (
+                "[t](https://en.wikipedia.org/wiki/Rust_(programming_language))",
+                "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+            ),
+            (
+                "[t](<my file (1).md> \"Doc ) Title\")",
+                "my file (1).md",
+            ),
+            (
+                "[t](<http://example.com/a\\>b\\>> \"t\")",
+                "http://example.com/a>b>",
+            ),
+            (
+                "[t](<my folder\\\\>)",
+                "my folder\\",
+            ),
+            (
+                "[t](http://example.com/a\\\\b)",
+                "http://example.com/a\\b",
+            ),
+        ];
+        for (md, expected_dest) in cases {
+            let spans = parse_inlines(md, 0, md.len());
+            let link = spans
+                .iter()
+                .find(|s| s.kind == InlineKind::Link)
+                .unwrap_or_else(|| panic!("expected Link span in `{md}`"));
+            let close = &md[link.close_marker.start..link.close_marker.end];
+            let inner = close.strip_prefix("](").unwrap().strip_suffix(')').unwrap();
+            assert_eq!(extract_link_destination(inner).as_deref(), Some(expected_dest));
+            let html = render_markdown_to_html(md);
+            assert!(html.contains("<a href="), "expected HTML link for `{md}`: {html}");
+        }
     }
 }

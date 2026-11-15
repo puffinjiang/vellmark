@@ -2307,12 +2307,7 @@ fn build_table_display(
     // PRD 4.1.1 A & GFM 4.10: The delimiter row defines column count/alignment only and
     // NEVER renders as a visible cell row in WYSIWYG mode.
     let visible_indices: Vec<usize> = (0..rows.len()).filter(|&i| i != 1).collect();
-    let num_cols = visible_indices
-        .iter()
-        .map(|&i| rows[i].cells.len())
-        .max()
-        .unwrap_or(1)
-        .max(1);
+    let num_cols = rows[1].cells.len().max(1);
 
     let active_caret_abs = if exp_sel.is_caret() {
         Some(exp_sel.head)
@@ -3662,5 +3657,83 @@ mod tests {
         };
         let _ = cache.build_editor_scene(&blocks, &style, &src_vp, |r| doc[r.start..r.end].to_string());
         assert!(!cache.last_hit_blocks[2].is_table);
+    }
+
+    #[test]
+    fn test_wysiwyg_table_uses_canonical_delimiter_column_count() {
+        let mut cache = ShapedDocumentCache::new();
+        let style = ResolvedThemeStyle::default();
+
+        // Body row has 3 cells while delimiter row defines 2 columns: WYSIWYG renders 2 columns.
+        let wide_body_doc = "| a | b |\n| - | - |\n| 1 | 2 | 3 |\n";
+        let blocks = parse_blocks(wide_body_doc);
+        let wide_caret = wide_body_doc.find('3').unwrap();
+        let view = EditorViewState {
+            mode: ViewMode::Wysiwyg,
+            selection: Selection::caret(wide_caret),
+            ..Default::default()
+        };
+        let vp = EditorViewport {
+            doc_rect: Rect::new(0.0, 0.0, 900.0, 720.0),
+            content_left_x: 60.0,
+            content_width_px: 780.0,
+            scroll_y: 0.0,
+            overscan_px: 120.0,
+            scale_factor: 1.0,
+            source_rev: 1,
+            source_len: wide_body_doc.len(),
+            view: &view,
+            focus_mode: false,
+            show_caret: true,
+            find_matches: &[],
+            active_find: None,
+        };
+        let scene = cache.build_editor_scene(&blocks, &style, &vp, |r| {
+            wide_body_doc[r.start..r.end].to_string()
+        });
+        assert!(
+            scene.draw.rects.iter().any(|r| r.color == style.caret_color),
+            "caret rect must still be emitted safely when caret sits in unrendered col 3"
+        );
+        let tbl = cache.table_lru.get(&cache.last_hit_blocks[0].shape_hash).unwrap();
+        assert_eq!(tbl.rows.len(), 2);
+        assert_eq!(tbl.rows[0].cells.len(), 2);
+        assert_eq!(tbl.rows[1].cells.len(), 2);
+        let hdr_texts: Vec<&str> = tbl.rows[0].cells.iter().map(|c| c.map.display_text.as_str()).collect();
+        let body_texts: Vec<&str> = tbl.rows[1].cells.iter().map(|c| c.map.display_text.as_str()).collect();
+        assert_eq!(hdr_texts, vec!["a", "b"]);
+        assert_eq!(body_texts, vec!["1", "2"]);
+
+        let html = vellmark_parser::render_markdown_to_html(wide_body_doc);
+        assert!(html.contains("<td>1</td>"));
+        assert!(html.contains("<td>2</td>"));
+        assert!(!html.contains("<td>3</td>"));
+
+        // Short body row still renders canonical 2 columns (with empty placeholder in col 2).
+        let short_body_doc = "| a | b |\n| - | - |\n| 1 |\n";
+        let short_blocks = parse_blocks(short_body_doc);
+        let short_view = EditorViewState {
+            mode: ViewMode::Wysiwyg,
+            selection: Selection::caret(0),
+            ..Default::default()
+        };
+        let short_vp = EditorViewport {
+            source_rev: 2,
+            source_len: short_body_doc.len(),
+            view: &short_view,
+            ..vp
+        };
+        let _ = cache.build_editor_scene(&short_blocks, &style, &short_vp, |r| {
+            short_body_doc[r.start..r.end].to_string()
+        });
+        let short_tbl = cache
+            .table_lru
+            .get(&cache.last_hit_blocks[0].shape_hash)
+            .unwrap();
+        assert_eq!(short_tbl.rows.len(), 2);
+        assert_eq!(short_tbl.rows[0].cells.len(), 2);
+        assert_eq!(short_tbl.rows[1].cells.len(), 2);
+        assert_eq!(short_tbl.rows[1].cells[0].map.display_text, "1");
+        assert_eq!(short_tbl.rows[1].cells[1].map.display_text, "");
     }
 }

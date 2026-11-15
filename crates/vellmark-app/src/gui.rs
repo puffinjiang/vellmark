@@ -14,7 +14,10 @@ use vellmark_core::{
     EditorAction, EncodingDecision, ExternalSyncResult, FindMatch, FindOptions, SaveOutcome,
     Selection, ViewMode,
 };
-use vellmark_parser::{BlockKind, OutlineItem, active_outline_index, parse_table_block};
+use vellmark_parser::{
+    BlockKind, InlineKind, OutlineItem, active_outline_index, extract_link_destination,
+    parse_table_block,
+};
 use vellmark_render::{
     DrawList, EditorHitTarget, EditorSceneResult, EditorViewport, Rect, ResolvedThemeStyle,
     SceneRect, ShapedDocumentCache, shape_ui_text_into,
@@ -29,6 +32,7 @@ use winit::window::{CursorIcon, Theme as WindowTheme, Window, WindowAttributes, 
 
 use crate::clipboard::{ClipboardBackend, NativeClipboard};
 use crate::gpu::WgpuRenderer;
+use crate::search::QuickOpenMatch;
 use crate::workbench::{AppWorkbench, DocumentTab, WorkbenchRuntimeEvent};
 
 const TAB_BAR_H: f32 = 36.0;
@@ -44,9 +48,19 @@ const EXTERNAL_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 pub const RECOVERY_DEGRADED_NOTICE: &str =
     "Crash recovery unavailable (dir unwritable) — 3s recovery target degraded";
 
-/// Abstract Save-As file picker backend (`osascript`/native dialog at runtime; deterministic mock in tests).
+/// Abstract native file/folder dialog backend (`osascript`/native dialog at runtime; deterministic mock in tests).
 pub trait SaveDialogBackend: Send + Sync {
     fn pick_save_as_path(&self, current_path: Option<&Path>, default_name: &str) -> Option<PathBuf>;
+
+    /// Pick an existing Markdown/text document to open (`Cmd/Ctrl + O`).
+    fn pick_open_path(&self, _current_dir: Option<&Path>) -> Option<PathBuf> {
+        None
+    }
+
+    /// Pick a workspace folder to open (`Cmd/Ctrl + Shift + O`).
+    fn pick_open_folder(&self, _current_dir: Option<&Path>) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// Non-interactive Save-As backend for headless tests (`with_clipboard` default).
@@ -59,16 +73,20 @@ impl SaveDialogBackend for NoopSaveDialog {
     }
 }
 
-/// Deterministic in-memory Save-As dialog backend for unit tests.
+/// Deterministic in-memory file/folder dialog backend for unit tests.
 #[derive(Debug, Default)]
 pub struct MemorySaveDialog {
     next_path: Mutex<Option<PathBuf>>,
+    next_open_path: Mutex<Option<PathBuf>>,
+    next_open_folder: Mutex<Option<PathBuf>>,
 }
 
 impl MemorySaveDialog {
     pub fn new(path: Option<PathBuf>) -> Self {
         Self {
             next_path: Mutex::new(path),
+            next_open_path: Mutex::new(None),
+            next_open_folder: Mutex::new(None),
         }
     }
 
@@ -77,11 +95,33 @@ impl MemorySaveDialog {
             *g = path;
         }
     }
+
+    /// Configure the path returned by the next `pick_open_path` call.
+    pub fn set_next_open_path(&self, path: Option<PathBuf>) {
+        if let Ok(mut g) = self.next_open_path.lock() {
+            *g = path;
+        }
+    }
+
+    /// Configure the folder returned by the next `pick_open_folder` call.
+    pub fn set_next_open_folder(&self, path: Option<PathBuf>) {
+        if let Ok(mut g) = self.next_open_folder.lock() {
+            *g = path;
+        }
+    }
 }
 
 impl SaveDialogBackend for MemorySaveDialog {
     fn pick_save_as_path(&self, _current_path: Option<&Path>, _default_name: &str) -> Option<PathBuf> {
         self.next_path.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn pick_open_path(&self, _current_dir: Option<&Path>) -> Option<PathBuf> {
+        self.next_open_path.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn pick_open_folder(&self, _current_dir: Option<&Path>) -> Option<PathBuf> {
+        self.next_open_folder.lock().ok().and_then(|g| g.clone())
     }
 }
 
@@ -107,13 +147,54 @@ fn parse_dialog_stdout_path(stdout: &[u8]) -> Option<PathBuf> {
 }
 
 fn existing_default_dialog_dir(current_path: Option<&Path>) -> Option<&Path> {
-    let start = current_path.and_then(|p| p.parent())?;
+    existing_dir_or_ancestor(current_path, true)
+}
+
+fn existing_dir_or_ancestor(path: Option<&Path>, start_from_parent: bool) -> Option<&Path> {
+    let start = if start_from_parent {
+        path.and_then(|p| p.parent())?
+    } else {
+        path?
+    };
     start
         .ancestors()
         .find(|p| !p.as_os_str().is_empty() && p.is_dir())
 }
 
-/// Native desktop Save-As dialog adapter.
+#[cfg(target_os = "macos")]
+fn run_osascript_pick(script: &str, args: &[&str]) -> Option<PathBuf> {
+    let mut cmd = Command::new("osascript");
+    cmd.arg("-e").arg(script);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_dialog_stdout_path(&out.stdout)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_zenity_pick(extra_args: &[&str], current_path: Option<&Path>, fallback_name: Option<&str>) -> Option<PathBuf> {
+    let mut cmd = Command::new("zenity");
+    cmd.arg("--file-selection");
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    if let Some(cur) = current_path {
+        cmd.arg("--filename").arg(cur);
+    } else if let Some(name) = fallback_name {
+        cmd.arg("--filename").arg(name);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_dialog_stdout_path(&out.stdout)
+}
+
+/// Native desktop file & folder picker adapter.
 #[derive(Debug, Default)]
 pub struct NativeSaveDialog;
 
@@ -134,40 +215,281 @@ impl SaveDialogBackend for NativeSaveDialog {
                 end if\n\
                 return POSIX path of chosen\n\
             end run";
-            let out = Command::new("osascript")
-                .arg("-e")
-                .arg(script)
-                .arg(default_name)
-                .arg(dir_arg)
-                .output()
-                .ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            parse_dialog_stdout_path(&out.stdout)
+            run_osascript_pick(script, &[default_name, &dir_arg])
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            let mut cmd = Command::new("zenity");
-            cmd.arg("--file-selection")
-                .arg("--save")
-                .arg("--confirm-overwrite");
-            if let Some(cur) = current_path {
-                cmd.arg("--filename").arg(cur);
-            } else {
-                cmd.arg("--filename").arg(default_name);
-            }
-            let out = cmd.output().ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            parse_dialog_stdout_path(&out.stdout)
+            run_zenity_pick(&["--save", "--confirm-overwrite"], current_path, Some(default_name))
         }
         #[cfg(not(unix))]
         {
             let _ = (current_path, default_name);
             None
         }
+    }
+
+    fn pick_open_path(&self, current_dir: Option<&Path>) -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            let dir_arg = existing_dir_or_ancestor(current_dir, false)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let script = "on run argv\n\
+                set defDir to item 1 of argv\n\
+                if defDir is not \"\" then\n\
+                    set chosen to choose file of type {\"md\", \"markdown\", \"txt\", \"public.plain-text\"} with prompt \"Open Markdown File\" default location (POSIX file defDir)\n\
+                else\n\
+                    set chosen to choose file of type {\"md\", \"markdown\", \"txt\", \"public.plain-text\"} with prompt \"Open Markdown File\"\n\
+                end if\n\
+                return POSIX path of chosen\n\
+            end run";
+            run_osascript_pick(script, &[&dir_arg])
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let dir = existing_dir_or_ancestor(current_dir, false);
+            run_zenity_pick(
+                &["--file-filter=Markdown | *.md *.markdown *.txt"],
+                dir,
+                None,
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = current_dir;
+            None
+        }
+    }
+
+    fn pick_open_folder(&self, current_dir: Option<&Path>) -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            let dir_arg = existing_dir_or_ancestor(current_dir, false)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let script = "on run argv\n\
+                set defDir to item 1 of argv\n\
+                if defDir is not \"\" then\n\
+                    set chosen to choose folder with prompt \"Open Folder\" default location (POSIX file defDir)\n\
+                else\n\
+                    set chosen to choose folder with prompt \"Open Folder\"\n\
+                end if\n\
+                return POSIX path of chosen\n\
+            end run";
+            run_osascript_pick(script, &[&dir_arg])
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let dir = existing_dir_or_ancestor(current_dir, false);
+            run_zenity_pick(&["--directory"], dir, None)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = current_dir;
+            None
+        }
+    }
+}
+
+/// Abstract external URL/mailto opener (`open`/`xdg-open`/`start` natively; mock in tests).
+pub trait LinkOpenerBackend: Send + Sync {
+    fn open_url(&self, url: &str) -> Result<(), String>;
+}
+
+/// No-op link opener used as the default in headless tests.
+#[derive(Debug, Default)]
+pub struct NoopLinkOpener;
+
+impl LinkOpenerBackend for NoopLinkOpener {
+    fn open_url(&self, _url: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Deterministic in-memory link opener recording opened external URLs for unit tests.
+#[derive(Debug, Default)]
+pub struct MemoryLinkOpener {
+    opened: Mutex<Vec<String>>,
+    fail_with: Mutex<Option<String>>,
+}
+
+impl MemoryLinkOpener {
+    pub fn opened_urls(&self) -> Vec<String> {
+        self.opened.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    pub fn set_error(&self, err: Option<String>) {
+        if let Ok(mut g) = self.fail_with.lock() {
+            *g = err;
+        }
+    }
+}
+
+impl LinkOpenerBackend for MemoryLinkOpener {
+    fn open_url(&self, url: &str) -> Result<(), String> {
+        if let Ok(g) = self.fail_with.lock() {
+            if let Some(err) = &*g {
+                return Err(err.clone());
+            }
+        }
+        if let Ok(mut g) = self.opened.lock() {
+            g.push(url.to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Native OS external link launcher (`open` on macOS, `xdg-open` on Linux, `ShellExecuteW` on Windows).
+#[derive(Debug, Default)]
+pub struct NativeLinkOpener;
+
+impl LinkOpenerBackend for NativeLinkOpener {
+    fn open_url(&self, url: &str) -> Result<(), String> {
+        validate_native_open_target(url)?;
+        #[cfg(target_os = "macos")]
+        let spawn_res = Command::new("open").arg(url).spawn();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let spawn_res = Command::new("xdg-open").arg(url).spawn();
+        #[cfg(windows)]
+        return open_with_windows_shell_execute(url);
+        #[cfg(not(windows))]
+        spawn_res
+            .map(|_| ())
+            .map_err(|e| format!("Failed to open link: {e}"))
+    }
+}
+
+/// Extract an RFC 3986 URI scheme when `value` starts with `scheme:` (requiring >= 2 chars
+/// so single-letter Windows drive prefixes like `C:\...` are never misclassified as schemes).
+fn extract_uri_scheme(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    let colon = bytes.iter().position(|&b| b == b':')?;
+    if colon < 2 || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    if bytes[1..colon]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        Some(&value[..colon])
+    } else {
+        None
+    }
+}
+
+fn is_allowed_external_url(url: &str) -> bool {
+    if has_ascii_prefix_ignore_case(url, "http://") {
+        return url.len() > "http://".len();
+    }
+    if has_ascii_prefix_ignore_case(url, "https://") {
+        return url.len() > "https://".len();
+    }
+    if has_ascii_prefix_ignore_case(url, "mailto:") {
+        return url.len() > "mailto:".len();
+    }
+    false
+}
+
+fn is_blocked_executable_path(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "exe"
+            | "bat"
+            | "cmd"
+            | "com"
+            | "msi"
+            | "scr"
+            | "hta"
+            | "vbs"
+            | "vbe"
+            | "js"
+            | "jse"
+            | "wsf"
+            | "wsh"
+            | "ps1"
+            | "psm1"
+            | "pif"
+            | "lnk"
+            | "reg"
+    )
+}
+
+fn parse_local_file_uri_path(after_scheme: &str) -> Option<String> {
+    let local_slash = if after_scheme.starts_with('/') {
+        after_scheme
+    } else if has_ascii_prefix_ignore_case(after_scheme, "localhost/") {
+        &after_scheme["localhost".len()..]
+    } else {
+        return None;
+    };
+    if local_slash.len() <= 1 {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        let b = local_slash.as_bytes();
+        if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+            return Some(local_slash[1..].to_string());
+        }
+    }
+    Some(local_slash.to_string())
+}
+
+fn validate_native_open_target(target: &str) -> Result<(), String> {
+    if target.is_empty() || target.chars().any(char::is_control) {
+        return Err("Invalid link target".to_string());
+    }
+    if let Some(scheme) = extract_uri_scheme(target) {
+        if !is_allowed_external_url(target) {
+            return Err(format!("Blocked unsupported URL scheme: {scheme}:"));
+        }
+        return Ok(());
+    }
+    if is_blocked_executable_path(Path::new(target)) {
+        return Err("Blocked opening executable file directly".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_with_windows_shell_execute(target: &str) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut core::ffi::c_void,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> isize;
+    }
+
+    const SW_SHOWNORMAL: i32 = 1;
+    let verb: Vec<u16> = OsStr::new("open\0").encode_wide().collect();
+    let mut file_wide: Vec<u16> = OsStr::new(target).encode_wide().collect();
+    file_wide.push(0);
+
+    let res = unsafe {
+        ShellExecuteW(
+            core::ptr::null_mut(),
+            verb.as_ptr(),
+            file_wide.as_ptr(),
+            core::ptr::null(),
+            core::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if res > 32 {
+        Ok(())
+    } else {
+        Err(format!("Failed to open link (ShellExecuteW error {res})"))
     }
 }
 
@@ -243,6 +565,12 @@ enum UiAction {
     ClearConflictBackups,
     DismissConflictBackupNotice,
     SaveActiveNow,
+    CloseLinkPrompt,
+    ConfirmLinkPrompt,
+    FocusLinkInput,
+    CloseQuickOpen,
+    SelectQuickOpenMatch(usize),
+    FocusQuickOpenInput,
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +632,8 @@ enum ImeTarget {
     None,
     Tab(u64),
     FindBox,
+    LinkPromptBox,
+    QuickOpenBox,
 }
 
 /// Warning shown in the status bar whenever protected crash snapshots exceed the 500 MB budget.
@@ -311,7 +641,7 @@ pub const PROTECTED_SNAPSHOT_LIMIT_NOTICE: &str =
     "Protected recovery snapshots exceed 500 MB — please save or discard old drafts";
 
 /// Platform-independent GUI controller owning layout state, shortcuts, IME state,
-/// find overlay, and virtualized scene construction (fully testable headlessly).
+/// find/quick-open/link overlays, and virtualized scene construction (fully testable headlessly).
 pub struct GuiController {
     pub workbench: AppWorkbench,
     pub shaper: ShapedDocumentCache,
@@ -324,6 +654,12 @@ pub struct GuiController {
     pub find_query: String,
     pub find_options: FindOptions,
     pub active_find_range: Option<ByteRange>,
+    pub link_prompt_open: bool,
+    pub link_prompt_url: String,
+    pub quick_open_open: bool,
+    pub quick_open_query: String,
+    pub quick_open_matches: Vec<QuickOpenMatch>,
+    pub quick_open_selected: usize,
     pub preferred_caret_x: Option<f32>,
     pub dragging_selection: bool,
     pub pointer_pos: (f32, f32),
@@ -339,6 +675,7 @@ pub struct GuiController {
     pub conflict_diff_open: bool,
     clipboard: Box<dyn ClipboardBackend>,
     save_dialog: Box<dyn SaveDialogBackend>,
+    link_opener: Box<dyn LinkOpenerBackend>,
     ime_target: ImeTarget,
     cached_meta: Option<CachedTabMeta>,
     ui_hit_zones: Vec<UiHitZone>,
@@ -351,11 +688,13 @@ pub struct GuiController {
 
 impl GuiController {
     pub fn new(workbench: AppWorkbench) -> Self {
-        Self::with_backends(
+        let mut ctrl = Self::with_backends(
             workbench,
             Box::new(NativeClipboard::new()),
             Box::new(NativeSaveDialog),
-        )
+        );
+        ctrl.link_opener = Box::new(NativeLinkOpener);
+        ctrl
     }
 
     pub fn with_clipboard(workbench: AppWorkbench, clipboard: Box<dyn ClipboardBackend>) -> Self {
@@ -387,6 +726,12 @@ impl GuiController {
             find_query: String::new(),
             find_options: FindOptions::default(),
             active_find_range: None,
+            link_prompt_open: false,
+            link_prompt_url: String::new(),
+            quick_open_open: false,
+            quick_open_query: String::new(),
+            quick_open_matches: Vec::new(),
+            quick_open_selected: 0,
             preferred_caret_x: None,
             dragging_selection: false,
             pointer_pos: (0.0, 0.0),
@@ -402,6 +747,7 @@ impl GuiController {
             conflict_diff_open: false,
             clipboard,
             save_dialog,
+            link_opener: Box::new(NoopLinkOpener),
             ime_target: ImeTarget::None,
             cached_meta: None,
             ui_hit_zones: Vec::new(),
@@ -415,6 +761,11 @@ impl GuiController {
 
     pub fn set_save_dialog(&mut self, save_dialog: Box<dyn SaveDialogBackend>) {
         self.save_dialog = save_dialog;
+    }
+
+    /// Replace the external link opener backend (used by headless tests via `MemoryLinkOpener`).
+    pub fn set_link_opener(&mut self, link_opener: Box<dyn LinkOpenerBackend>) {
+        self.link_opener = link_opener;
     }
 
     pub fn refresh_style(&mut self) {
@@ -750,6 +1101,12 @@ impl GuiController {
         if self.find_open {
             self.build_find_bar(&mut chrome_layer, layout.editor);
         }
+        if self.link_prompt_open {
+            self.build_link_prompt(&mut chrome_layer, layout.editor);
+        }
+        if self.quick_open_open {
+            self.build_quick_open_modal(&mut chrome_layer, layout.editor);
+        }
         self.build_status_bar(&mut chrome_layer, layout.status_bar);
 
         (editor_layer, chrome_layer)
@@ -825,7 +1182,7 @@ impl GuiController {
         let focus_mode = self.workbench.config.focus_mode;
         let typewriter_mode = self.workbench.config.typewriter_mode;
         let scale_factor = self.scale_factor;
-        let show_caret = self.caret_visible && !self.find_focused;
+        let show_caret = self.caret_visible && !self.has_focused_text_input();
         let active_find = self.active_find_range;
 
         let find_ranges: Vec<ByteRange> = self
@@ -1344,6 +1701,61 @@ impl GuiController {
         }
     }
 
+    fn draw_overlay_text_input(
+        &mut self,
+        dl: &mut DrawList,
+        input_rect: Rect,
+        value: &str,
+        placeholder: &str,
+        focused: bool,
+        action: UiAction,
+    ) {
+        let chrome = self.style.chrome;
+        dl.rects.push(
+            SceneRect::rounded(input_rect, chrome.active_tab_bg, 4.0).with_border(
+                1.0,
+                if focused {
+                    chrome.accent
+                } else {
+                    chrome.border
+                },
+            ),
+        );
+        let display = if value.is_empty() { placeholder } else { value };
+        let text_w = self.push_ui_text(
+            dl,
+            display,
+            input_rect.x + 7.0,
+            input_rect.y + 5.0,
+            12.0,
+            400,
+            if value.is_empty() {
+                chrome.muted_text
+            } else {
+                chrome.text
+            },
+            Some((input_rect.w - 12.0).max(16.0)),
+            Some(input_rect),
+        );
+        if focused && self.caret_visible {
+            let cx = input_rect.x + 7.0 + if value.is_empty() { 0.0 } else { text_w };
+            dl.rects.push(SceneRect::solid(
+                Rect::new(
+                    cx.min(input_rect.x + input_rect.w - 4.0),
+                    input_rect.y + 5.0,
+                    1.5,
+                    16.0,
+                ),
+                chrome.accent,
+            ));
+        }
+        self.ui_hit_zones.push(UiHitZone {
+            rect: input_rect,
+            action,
+            pointer_cursor: false,
+        });
+    }
+
     fn build_find_bar(&mut self, dl: &mut DrawList, editor_rect: Rect) {
         let chrome = self.style.chrome;
         let bar_w = 420.0_f32.min((editor_rect.w - 24.0).max(240.0));
@@ -1360,48 +1772,15 @@ impl GuiController {
 
         let input_w = (bar.w - 210.0).max(90.0);
         let input_rect = Rect::new(bar.x + 8.0, bar.y + 6.0, input_w, 26.0);
-        dl.rects.push(
-            SceneRect::rounded(input_rect, chrome.active_tab_bg, 4.0).with_border(
-                1.0,
-                if self.find_focused {
-                    chrome.accent
-                } else {
-                    chrome.border
-                },
-            ),
-        );
-        let q_display = if self.find_query.is_empty() {
-            "Find...".to_string()
-        } else {
-            self.find_query.clone()
-        };
-        let q_w = self.push_ui_text(
+        let query = self.find_query.clone();
+        self.draw_overlay_text_input(
             dl,
-            &q_display,
-            input_rect.x + 7.0,
-            input_rect.y + 5.0,
-            12.0,
-            400,
-            if self.find_query.is_empty() {
-                chrome.muted_text
-            } else {
-                chrome.text
-            },
-            Some(input_w - 12.0),
-            Some(input_rect),
+            input_rect,
+            &query,
+            "Find...",
+            self.find_focused,
+            UiAction::FocusFindInput,
         );
-        if self.find_focused && self.caret_visible {
-            let cx = input_rect.x + 7.0 + if self.find_query.is_empty() { 0.0 } else { q_w };
-            dl.rects.push(SceneRect::solid(
-                Rect::new(cx.min(input_rect.x + input_rect.w - 4.0), input_rect.y + 5.0, 1.5, 16.0),
-                chrome.accent,
-            ));
-        }
-        self.ui_hit_zones.push(UiHitZone {
-            rect: input_rect,
-            action: UiAction::FocusFindInput,
-            pointer_cursor: false,
-        });
 
         let total_matches = self
             .cached_meta
@@ -1447,6 +1826,180 @@ impl GuiController {
                 pointer_cursor: true,
             });
             bx += bw + 4.0;
+        }
+    }
+
+    fn build_link_prompt(&mut self, dl: &mut DrawList, editor_rect: Rect) {
+        let chrome = self.style.chrome;
+        let bar_w = 430.0_f32.min((editor_rect.w - 24.0).max(240.0));
+        let top_offset = if self.find_open {
+            FIND_BAR_H + 14.0
+        } else {
+            8.0
+        };
+        let bar = Rect::new(
+            editor_rect.x + editor_rect.w - bar_w - 16.0,
+            editor_rect.y + top_offset,
+            bar_w,
+            FIND_BAR_H,
+        );
+        dl.rects.push(
+            SceneRect::rounded(bar, chrome.panel_bg, 7.0)
+                .with_border(1.0, chrome.accent),
+        );
+        self.ui_hit_zones.push(UiHitZone {
+            rect: bar,
+            action: UiAction::FocusLinkInput,
+            pointer_cursor: false,
+        });
+
+        let mut right_edge = bar.x + bar.w - 6.0;
+        right_edge = self.push_action_button(
+            dl,
+            right_edge,
+            bar.y + 7.0,
+            24.0,
+            "×",
+            chrome.tab_bar_bg,
+            chrome.border,
+            chrome.text,
+            UiAction::CloseLinkPrompt,
+            bar,
+        );
+        right_edge = self.push_action_button(
+            dl,
+            right_edge,
+            bar.y + 7.0,
+            24.0,
+            "Insert",
+            chrome.accent.with_alpha(48),
+            chrome.accent,
+            chrome.text,
+            UiAction::ConfirmLinkPrompt,
+            bar,
+        );
+        let input_w = (right_edge - (bar.x + 8.0)).max(90.0);
+        let input_rect = Rect::new(bar.x + 8.0, bar.y + 6.0, input_w, 26.0);
+        let url_val = self.link_prompt_url.clone();
+        self.draw_overlay_text_input(
+            dl,
+            input_rect,
+            &url_val,
+            "https://... or path.md or #heading",
+            true,
+            UiAction::FocusLinkInput,
+        );
+    }
+
+    fn build_quick_open_modal(&mut self, dl: &mut DrawList, editor_rect: Rect) {
+        let chrome = self.style.chrome;
+        let modal_w = 540.0_f32.min((editor_rect.w - 24.0).max(260.0));
+        let modal_x = editor_rect.x + ((editor_rect.w - modal_w) * 0.5).max(8.0);
+        let modal_y = editor_rect.y + 18.0;
+
+        let max_visible = 8usize;
+        let row_h = 28.0_f32;
+        let visible_rows = self.quick_open_matches.len().clamp(1, max_visible);
+        let list_top = modal_y + 42.0;
+        let modal_h = (48.0 + visible_rows as f32 * row_h).min((editor_rect.h - 24.0).max(80.0));
+        let modal = Rect::new(modal_x, modal_y, modal_w, modal_h);
+
+        dl.rects.push(
+            SceneRect::rounded(modal, chrome.panel_bg, 8.0)
+                .with_border(1.0, chrome.accent),
+        );
+        self.ui_hit_zones.push(UiHitZone {
+            rect: modal,
+            action: UiAction::FocusQuickOpenInput,
+            pointer_cursor: false,
+        });
+
+        let close_w = 24.0;
+        let close_rect = Rect::new(modal.x + modal.w - close_w - 8.0, modal.y + 8.0, close_w, 24.0);
+        dl.rects.push(
+            SceneRect::rounded(close_rect, chrome.tab_bar_bg, 4.0)
+                .with_border(1.0, chrome.border),
+        );
+        self.push_ui_text(dl, "×", close_rect.x + 7.0, close_rect.y + 4.0, 12.0, 600, chrome.text, None, Some(modal));
+        self.ui_hit_zones.push(UiHitZone {
+            rect: close_rect,
+            action: UiAction::CloseQuickOpen,
+            pointer_cursor: true,
+        });
+
+        let input_rect = Rect::new(
+            modal.x + 8.0,
+            modal.y + 7.0,
+            (modal.w - close_w - 22.0).max(120.0),
+            26.0,
+        );
+        let query = self.quick_open_query.clone();
+        self.draw_overlay_text_input(
+            dl,
+            input_rect,
+            &query,
+            "Quick Open — type file name or path...",
+            true,
+            UiAction::FocusQuickOpenInput,
+        );
+
+        if self.quick_open_matches.is_empty() {
+            let empty_msg = if self.workbench.workspace_root.is_none() {
+                "No workspace folder open — press Cmd/Ctrl+Shift+O to open a folder"
+            } else {
+                "No matching Markdown/text files"
+            };
+            self.push_ui_text(
+                dl,
+                empty_msg,
+                modal.x + 14.0,
+                list_top + 6.0,
+                12.0,
+                400,
+                chrome.muted_text,
+                Some(modal.w - 28.0),
+                Some(modal),
+            );
+            return;
+        }
+
+        let total = self.quick_open_matches.len();
+        let selected = self.quick_open_selected.min(total - 1);
+        let start_idx = selected.saturating_sub(max_visible - 1);
+        let end_idx = (start_idx + max_visible).min(total);
+        let rows: Vec<(usize, String)> = (start_idx..end_idx)
+            .map(|i| (i, self.quick_open_matches[i].relative_path.clone()))
+            .collect();
+
+        for (slot, (idx, rel_path)) in rows.into_iter().enumerate() {
+            let y = list_top + slot as f32 * row_h;
+            if y + row_h > modal.y + modal.h - 2.0 {
+                break;
+            }
+            let row_rect = Rect::new(modal.x + 6.0, y, modal.w - 12.0, row_h - 2.0);
+            let is_sel = idx == selected;
+            if is_sel {
+                dl.rects.push(
+                    SceneRect::rounded(row_rect, chrome.accent.with_alpha(40), 5.0)
+                        .with_border(1.0, chrome.accent.with_alpha(140)),
+                );
+            }
+            self.push_ui_text(
+                dl,
+                &rel_path,
+                row_rect.x + 10.0,
+                row_rect.y + 5.0,
+                12.0,
+                if is_sel { 600 } else { 400 },
+                if is_sel { chrome.text } else { chrome.muted_text },
+                Some(row_rect.w - 20.0),
+                Some(modal),
+            );
+            self.ui_hit_zones.push(UiHitZone {
+                rect: row_rect,
+                action: UiAction::SelectQuickOpenMatch(idx),
+                pointer_cursor: true,
+            });
         }
     }
 
@@ -1858,9 +2411,54 @@ impl GuiController {
         )
     }
 
+    fn focused_overlay_ime_target(&self) -> Option<ImeTarget> {
+        if self.quick_open_open {
+            Some(ImeTarget::QuickOpenBox)
+        } else if self.link_prompt_open {
+            Some(ImeTarget::LinkPromptBox)
+        } else if self.find_open && self.find_focused {
+            Some(ImeTarget::FindBox)
+        } else {
+            None
+        }
+    }
+
+    fn has_focused_text_input(&self) -> bool {
+        self.focused_overlay_ime_target().is_some()
+    }
+
+    fn overlay_target_still_open(&self, target: ImeTarget) -> bool {
+        match target {
+            ImeTarget::QuickOpenBox => self.quick_open_open,
+            ImeTarget::LinkPromptBox => self.link_prompt_open,
+            ImeTarget::FindBox => self.find_open,
+            _ => false,
+        }
+    }
+
+    fn commit_overlay_text(&mut self, target: ImeTarget, text: &str) -> bool {
+        match target {
+            ImeTarget::FindBox => {
+                self.find_query.push_str(text);
+                self.run_find_next(false);
+                true
+            }
+            ImeTarget::LinkPromptBox => {
+                self.link_prompt_url.push_str(text);
+                true
+            }
+            ImeTarget::QuickOpenBox => {
+                self.quick_open_query.push_str(text);
+                self.refresh_quick_open_matches();
+                true
+            }
+            ImeTarget::None | ImeTarget::Tab(_) => false,
+        }
+    }
+
     fn cancel_abandoned_tab_ime(&mut self, active_tab_id: Option<u64>) {
         if let ImeTarget::Tab(ime_tab_id) = self.ime_target {
-            if active_tab_id != Some(ime_tab_id) || (self.find_open && self.find_focused) {
+            if active_tab_id != Some(ime_tab_id) || self.has_focused_text_input() {
                 if let Some(tab) = self.workbench.tabs.iter_mut().find(|t| t.id == ime_tab_id) {
                     let _ = tab.edit(|ctx| ctx.ime_cancel());
                 }
@@ -1884,7 +2482,7 @@ impl GuiController {
                     // winit emits it immediately before `Ime::Commit` (especially on Cocoa insertText).
                     // Clearing only the visible preedit preserves `ime_composition_selection` and `ime_target`.
                     match self.ime_target {
-                        ImeTarget::FindBox => {}
+                        ImeTarget::FindBox | ImeTarget::LinkPromptBox | ImeTarget::QuickOpenBox => {}
                         ImeTarget::Tab(target_id) => {
                             if let Some(tab) =
                                 self.workbench.tabs.iter_mut().find(|t| t.id == target_id)
@@ -1893,7 +2491,7 @@ impl GuiController {
                             }
                         }
                         ImeTarget::None => {
-                            if !(self.find_open && self.find_focused) {
+                            if !self.has_focused_text_input() {
                                 if let Some(tab) = self.workbench.active_tab_mut() {
                                     let _ = tab.edit(|ctx| ctx.ime_clear_preedit());
                                 }
@@ -1909,12 +2507,13 @@ impl GuiController {
                     {
                         ImeTarget::Tab(id)
                     }
-                    ImeTarget::FindBox if self.find_open => ImeTarget::FindBox,
-                    _ if self.find_open && self.find_focused => ImeTarget::FindBox,
-                    _ => match self.workbench.active_tab() {
-                        Some(tab) => ImeTarget::Tab(tab.id),
-                        None => ImeTarget::None,
-                    },
+                    t if self.overlay_target_still_open(t) => t,
+                    _ => self.focused_overlay_ime_target().unwrap_or_else(|| {
+                        match self.workbench.active_tab() {
+                            Some(tab) => ImeTarget::Tab(tab.id),
+                            None => ImeTarget::None,
+                        }
+                    }),
                 };
                 self.ime_target = target;
 
@@ -1933,9 +2532,8 @@ impl GuiController {
                 self.ime_target = ImeTarget::None;
 
                 match target {
-                    ImeTarget::FindBox => {
-                        self.find_query.push_str(committed);
-                        self.run_find_next(false);
+                    ImeTarget::FindBox | ImeTarget::LinkPromptBox | ImeTarget::QuickOpenBox => {
+                        self.commit_overlay_text(target, committed);
                     }
                     ImeTarget::Tab(target_id) => {
                         let active_id = self.workbench.active_tab().map(|t| t.id);
@@ -1950,9 +2548,8 @@ impl GuiController {
                         }
                     }
                     ImeTarget::None => {
-                        if self.find_open && self.find_focused {
-                            self.find_query.push_str(committed);
-                            self.run_find_next(false);
+                        if let Some(overlay) = self.focused_overlay_ime_target() {
+                            self.commit_overlay_text(overlay, committed);
                             return;
                         }
                         if let Some(tab) = self.workbench.active_tab_mut() {
@@ -2055,13 +2652,18 @@ impl GuiController {
         if event.state != ElementState::Pressed {
             return false;
         }
+        self.handle_key_input(&event.logical_key, event.text.as_deref(), mods)
+    }
+
+    pub(crate) fn handle_key_input(
+        &mut self,
+        logical_key: &Key,
+        text: Option<&str>,
+        mods: ModifiersState,
+    ) -> bool {
         self.reset_blink();
 
-        let primary = if cfg!(target_os = "macos") {
-            mods.super_key()
-        } else {
-            mods.control_key()
-        };
+        let primary = is_primary_mod(mods);
         let shift = mods.shift_key();
         let alt = mods.alt_key();
 
@@ -2071,7 +2673,7 @@ impl GuiController {
             .active_tab()
             .is_some_and(|t| t.view.ime_preedit.is_some());
         if ime_composing {
-            if event.logical_key == NamedKey::Escape {
+            if *logical_key == NamedKey::Escape {
                 if let Some(tab) = self.workbench.active_tab_mut() {
                     let _ = tab.edit(|ctx| ctx.ime_cancel());
                 }
@@ -2085,7 +2687,7 @@ impl GuiController {
 
         // Primary shortcuts
         if primary && !alt {
-            if let Key::Character(ch) = &event.logical_key {
+            if let Key::Character(ch) = logical_key {
                 let lower = ch.to_ascii_lowercase();
                 match lower.as_str() {
                     "s" if shift => {
@@ -2096,8 +2698,25 @@ impl GuiController {
                         self.save_active_tab();
                         return true;
                     }
+                    "o" if shift => {
+                        self.open_folder_dialog();
+                        return true;
+                    }
+                    "o" => {
+                        self.open_file_dialog();
+                        return true;
+                    }
+                    "p" => {
+                        self.open_quick_open();
+                        return true;
+                    }
+                    "k" => {
+                        self.open_link_prompt();
+                        return true;
+                    }
                     "n" => {
                         self.close_confirm_armed = false;
+                        self.close_transient_prompts();
                         self.flush_active_tab_before_switch();
                         self.workbench.new_document();
                         self.find_focused = false;
@@ -2154,7 +2773,7 @@ impl GuiController {
                         return true;
                     }
                     "a" => {
-                        if !self.find_focused {
+                        if !self.has_focused_text_input() {
                             self.dispatch_editor(EditorAction::SelectAll);
                         }
                         return true;
@@ -2166,6 +2785,7 @@ impl GuiController {
                         return true;
                     }
                     "f" => {
+                        self.close_transient_prompts();
                         self.find_open = true;
                         self.find_focused = true;
                         return true;
@@ -2208,44 +2828,13 @@ impl GuiController {
             }
         }
 
-        // Find overlay focused handling
-        if self.find_open && self.find_focused {
-            match &event.logical_key {
-                Key::Named(NamedKey::Escape) => {
-                    self.find_open = false;
-                    self.find_focused = false;
-                    self.active_find_range = None;
-                    return true;
-                }
-                Key::Named(NamedKey::Enter) => {
-                    if shift {
-                        self.run_find_prev();
-                    } else {
-                        self.run_find_next(true);
-                    }
-                    return true;
-                }
-                Key::Named(NamedKey::Backspace) => {
-                    self.find_query.pop();
-                    self.run_find_next(false);
-                    return true;
-                }
-                _ => {
-                    if !primary && !mods.control_key() {
-                        if let Some(txt) = &event.text {
-                            if !txt.chars().all(|c| c.is_control()) {
-                                self.find_query.push_str(txt);
-                                self.run_find_next(false);
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
+        // Focused overlay / modal input handling (Quick Open -> Link Prompt -> Find bar)
+        if self.handle_overlay_key_press(logical_key, text, primary, shift, mods.control_key()) {
+            return true;
         }
 
         // Standard editor keys
-        match &event.logical_key {
+        match logical_key {
             Key::Named(NamedKey::Escape) => {
                 if self.close_confirm_armed {
                     self.close_confirm_armed = false;
@@ -2327,7 +2916,7 @@ impl GuiController {
             }
             _ => {
                 if !primary && !mods.control_key() {
-                    if let Some(txt) = &event.text {
+                    if let Some(txt) = text {
                         let clean: String = txt.chars().filter(|c| !c.is_control()).collect();
                         if !clean.is_empty() {
                             self.preferred_caret_x = None;
@@ -2347,11 +2936,132 @@ impl GuiController {
         }
     }
 
+    fn handle_overlay_key_press(
+        &mut self,
+        logical_key: &Key,
+        text: Option<&str>,
+        primary: bool,
+        shift: bool,
+        ctrl: bool,
+    ) -> bool {
+        if self.quick_open_open {
+            match logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.close_quick_open();
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    if self.quick_open_selected > 0 {
+                        self.quick_open_selected -= 1;
+                    }
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    if !self.quick_open_matches.is_empty() {
+                        self.quick_open_selected =
+                            (self.quick_open_selected + 1).min(self.quick_open_matches.len() - 1);
+                    }
+                    return true;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.confirm_quick_open_match(self.quick_open_selected);
+                    return true;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.quick_open_query.pop();
+                    self.refresh_quick_open_matches();
+                    return true;
+                }
+                _ => {
+                    if !primary && !ctrl {
+                        if let Some(txt) = overlay_printable_key_text(logical_key, text) {
+                            self.quick_open_query.push_str(&txt);
+                            self.refresh_quick_open_matches();
+                            return true;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
+        if self.link_prompt_open {
+            match logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.close_link_prompt();
+                    return true;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.confirm_link_prompt();
+                    return true;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.link_prompt_url.pop();
+                    return true;
+                }
+                _ => {
+                    if !primary && !ctrl {
+                        if let Some(txt) = overlay_printable_key_text(logical_key, text) {
+                            self.link_prompt_url.push_str(&txt);
+                            return true;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
+        if self.find_open && self.find_focused {
+            match logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.find_open = false;
+                    self.find_focused = false;
+                    self.active_find_range = None;
+                    return true;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    if shift {
+                        self.run_find_prev();
+                    } else {
+                        self.run_find_next(true);
+                    }
+                    return true;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.find_query.pop();
+                    self.run_find_next(false);
+                    return true;
+                }
+                _ => {
+                    if !primary && !ctrl {
+                        if let Some(txt) = overlay_printable_key_text(logical_key, text) {
+                            self.find_query.push_str(&txt);
+                            self.run_find_next(false);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     pub fn handle_pointer_down(&mut self, x: f32, y: f32) -> bool {
+        self.handle_pointer_down_with_mods(x, y, ModifiersState::empty())
+    }
+
+    /// Handle left mouse press with keyboard modifier state (supports `Cmd/Ctrl + Click` link navigation, PRD V-06).
+    pub fn handle_pointer_down_with_mods(
+        &mut self,
+        x: f32,
+        y: f32,
+        mods: ModifiersState,
+    ) -> bool {
         self.reset_blink();
         self.pointer_pos = (x, y);
 
-        // 1. Check chrome buttons/tabs/sidebar/find bar first
+        // 1. Check chrome buttons/tabs/sidebar/overlays first
         if let Some(hit) = self
             .ui_hit_zones
             .iter()
@@ -2366,6 +3076,7 @@ impl GuiController {
         // 2. Check editor document viewport click
         if self.last_editor_rect.contains(x, y) {
             self.find_focused = false;
+            self.close_transient_prompts();
             self.close_confirm_armed = false;
             let active_id = self.workbench.active_tab().map(|t| t.id);
             self.cancel_abandoned_tab_ime(active_id);
@@ -2373,6 +3084,10 @@ impl GuiController {
                 self.preferred_caret_x = None;
                 match target {
                     EditorHitTarget::Text(offset) => {
+                        if is_primary_mod(mods) && self.try_open_link_at_offset(offset) {
+                            self.dragging_selection = false;
+                            return true;
+                        }
                         if let Some(tab) = self.workbench.active_tab_mut() {
                             let safe_offset = tab.session.buffer.snap_out_of_crlf(offset);
                             let _ = tab.edit(|ctx| ctx.set_caret(safe_offset));
@@ -2396,6 +3111,16 @@ impl GuiController {
     }
 
     pub fn handle_pointer_move(&mut self, x: f32, y: f32) -> (CursorIcon, bool) {
+        self.handle_pointer_move_with_mods(x, y, ModifiersState::empty())
+    }
+
+    /// Update pointer hover/drag state with modifier awareness (shows pointer cursor over links while `Cmd/Ctrl` is held).
+    pub fn handle_pointer_move_with_mods(
+        &mut self,
+        x: f32,
+        y: f32,
+        mods: ModifiersState,
+    ) -> (CursorIcon, bool) {
         self.pointer_pos = (x, y);
         let mut changed = false;
         if self.dragging_selection {
@@ -2415,7 +3140,18 @@ impl GuiController {
                 CursorIcon::Text
             }
         } else if self.last_editor_rect.contains(x, y) {
-            CursorIcon::Text
+            if is_primary_mod(mods)
+                && !self.quick_open_open
+                && !self.link_prompt_open
+                && matches!(
+                    self.shaper.hit_test(x, y),
+                    Some(EditorHitTarget::Text(offset)) if self.has_link_at_offset(offset)
+                )
+            {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Text
+            }
         } else {
             CursorIcon::Default
         };
@@ -2456,11 +3192,13 @@ impl GuiController {
                     }
                     self.workbench.active_tab_idx = Some(idx);
                     self.find_focused = false;
+                    self.close_transient_prompts();
                     self.preferred_caret_x = None;
                 }
                 true
             }
             UiAction::CloseTab(id) => {
+                self.close_transient_prompts();
                 self.close_tab_checked(id, "Unsaved changes — press Save first");
                 true
             }
@@ -2468,6 +3206,7 @@ impl GuiController {
                 self.flush_active_tab_before_switch();
                 self.workbench.new_document();
                 self.find_focused = false;
+                self.close_transient_prompts();
                 true
             }
             UiAction::ToggleMode => {
@@ -2500,6 +3239,7 @@ impl GuiController {
                         tab.jump_to_outline_item(&item);
                         self.pending_scroll_ensure_caret = true;
                         self.find_focused = false;
+                        self.close_transient_prompts();
                     }
                 }
                 true
@@ -2512,7 +3252,10 @@ impl GuiController {
                 } else {
                     self.flush_active_tab_before_switch();
                     match self.workbench.open_document(&path) {
-                        Ok(_) => self.find_focused = false,
+                        Ok(_) => {
+                            self.find_focused = false;
+                            self.close_transient_prompts();
+                        }
                         Err(e) => self.set_notice(format!("Open failed: {e}")),
                     }
                 }
@@ -2543,6 +3286,7 @@ impl GuiController {
                 true
             }
             UiAction::FocusFindInput => {
+                self.close_transient_prompts();
                 self.find_focused = true;
                 true
             }
@@ -2608,6 +3352,23 @@ impl GuiController {
                 if let Some(tab) = self.workbench.active_tab_mut() {
                     tab.conflict_backup_notice_dismissed = true;
                 }
+                true
+            }
+            UiAction::CloseLinkPrompt => {
+                self.close_link_prompt();
+                true
+            }
+            UiAction::ConfirmLinkPrompt => {
+                self.confirm_link_prompt();
+                true
+            }
+            UiAction::FocusLinkInput | UiAction::FocusQuickOpenInput => true,
+            UiAction::CloseQuickOpen => {
+                self.close_quick_open();
+                true
+            }
+            UiAction::SelectQuickOpenMatch(idx) => {
+                self.confirm_quick_open_match(idx);
                 true
             }
         }
@@ -2937,6 +3698,7 @@ impl GuiController {
 
     fn dispatch_editor(&mut self, action: EditorAction) {
         self.find_focused = false;
+        self.close_transient_prompts();
         self.close_confirm_armed = false;
         let active_id = self.workbench.active_tab().map(|t| t.id);
         self.cancel_abandoned_tab_ime(active_id);
@@ -3163,17 +3925,48 @@ impl GuiController {
         }
     }
 
+    fn on_overlay_input_changed(&mut self, target: ImeTarget) {
+        match target {
+            ImeTarget::FindBox => self.run_find_next(false),
+            ImeTarget::QuickOpenBox => self.refresh_quick_open_matches(),
+            ImeTarget::LinkPromptBox | ImeTarget::None | ImeTarget::Tab(_) => {}
+        }
+    }
+
+    fn overlay_input_text(&self, target: ImeTarget) -> &str {
+        match target {
+            ImeTarget::FindBox => &self.find_query,
+            ImeTarget::LinkPromptBox => &self.link_prompt_url,
+            ImeTarget::QuickOpenBox => &self.quick_open_query,
+            ImeTarget::None | ImeTarget::Tab(_) => "",
+        }
+    }
+
+    fn clear_overlay_input_text(&mut self, target: ImeTarget) {
+        match target {
+            ImeTarget::FindBox => self.find_query.clear(),
+            ImeTarget::LinkPromptBox => self.link_prompt_url.clear(),
+            ImeTarget::QuickOpenBox => self.quick_open_query.clear(),
+            ImeTarget::None | ImeTarget::Tab(_) => {}
+        }
+    }
+
     fn copy_selection(&mut self, cut: bool) {
-        if self.find_focused {
-            if !self.find_query.is_empty() {
-                let q = self.find_query.clone();
-                match self.clipboard.write(&q, None) {
+        if let Some(target) = self.focused_overlay_ime_target() {
+            let text = self.overlay_input_text(target).to_string();
+            if !text.is_empty() {
+                match self.clipboard.write(&text, None) {
                     Ok(()) => {
-                        self.clipboard_text = q;
-                        self.set_notice(if cut {
-                            "Cut search query"
+                        self.clipboard_text = text;
+                        let noun = if matches!(target, ImeTarget::FindBox) {
+                            "search query"
                         } else {
-                            "Copied search query"
+                            "text"
+                        };
+                        self.set_notice(if cut {
+                            format!("Cut {noun}")
+                        } else {
+                            format!("Copied {noun}")
                         });
                     }
                     Err(err) => {
@@ -3182,8 +3975,8 @@ impl GuiController {
                     }
                 }
                 if cut {
-                    self.find_query.clear();
-                    self.run_find_next(false);
+                    self.clear_overlay_input_text(target);
+                    self.on_overlay_input_changed(target);
                 }
             }
             return;
@@ -3229,10 +4022,16 @@ impl GuiController {
         if !plain.is_empty() {
             self.clipboard_text = plain.clone();
         }
-        if self.find_focused {
-            if !plain.is_empty() {
-                self.find_query.push_str(&plain);
-                self.run_find_next(false);
+        if let Some(target) = self.focused_overlay_ime_target() {
+            let clean = match target {
+                ImeTarget::FindBox => plain.as_str(),
+                ImeTarget::LinkPromptBox | ImeTarget::QuickOpenBox => {
+                    plain.trim_matches(&['\r', '\n'][..])
+                }
+                ImeTarget::None | ImeTarget::Tab(_) => "",
+            };
+            if !clean.is_empty() {
+                self.commit_overlay_text(target, clean);
             }
             return;
         }
@@ -3243,6 +4042,315 @@ impl GuiController {
             let _ = tab.paste_rich_clipboard(content.html.as_deref(), &plain);
             self.pending_scroll_ensure_caret = true;
         }
+    }
+
+    fn close_transient_prompts(&mut self) {
+        self.link_prompt_open = false;
+        self.quick_open_open = false;
+        if matches!(
+            self.ime_target,
+            ImeTarget::LinkPromptBox | ImeTarget::QuickOpenBox
+        ) {
+            self.ime_target = ImeTarget::None;
+        }
+    }
+
+    fn active_dialog_dir(&self) -> Option<PathBuf> {
+        self.workbench
+            .active_tab()
+            .and_then(|t| t.session.path.as_deref())
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf)
+            .or_else(|| self.untitled_save_dir.clone())
+            .or_else(|| self.workbench.workspace_root.clone())
+    }
+
+    /// Open a Markdown/text document picked via the configured dialog backend (`Cmd/Ctrl + O`).
+    pub fn open_file_dialog(&mut self) {
+        self.close_confirm_armed = false;
+        self.close_transient_prompts();
+        let dir = self.active_dialog_dir();
+        let Some(path) = self.save_dialog.pick_open_path(dir.as_deref()) else {
+            return;
+        };
+        self.flush_active_tab_before_switch();
+        match self.workbench.open_document(&path) {
+            Ok(_) => {
+                self.find_focused = false;
+                self.ime_target = ImeTarget::None;
+                self.preferred_caret_x = None;
+                self.pending_scroll_ensure_caret = true;
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file");
+                self.set_notice(format!("Opened {name}"));
+            }
+            Err(e) => self.set_notice(format!("Open failed: {e}")),
+        }
+    }
+
+    /// Open a workspace folder picked via the configured dialog backend (`Cmd/Ctrl + Shift + O`).
+    pub fn open_folder_dialog(&mut self) {
+        self.close_confirm_armed = false;
+        self.close_transient_prompts();
+        let dir = self.active_dialog_dir();
+        let Some(folder) = self.save_dialog.pick_open_folder(dir.as_deref()) else {
+            return;
+        };
+        let normalized: PathBuf = folder.components().collect();
+        match self.workbench.open_folder(&normalized) {
+            Ok(()) => {
+                self.workbench.config.sidebar_visible = true;
+                self.sidebar_section = SidebarSection::Files;
+                self.collapsed_dirs.clear();
+                self.find_focused = false;
+                let name = normalized
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("folder");
+                self.set_notice(format!("Opened folder: {name}"));
+            }
+            Err(e) => self.set_notice(format!("Open folder failed: {e}")),
+        }
+    }
+
+    /// Show Quick Open fuzzy file switcher (`Cmd/Ctrl + P`, PRD F-06).
+    pub fn open_quick_open(&mut self) {
+        self.close_confirm_armed = false;
+        self.close_transient_prompts();
+        self.find_focused = false;
+        let active_id = self.workbench.active_tab().map(|t| t.id);
+        self.cancel_abandoned_tab_ime(active_id);
+        self.quick_open_open = true;
+        self.quick_open_query.clear();
+        self.refresh_quick_open_matches();
+    }
+
+    fn close_quick_open(&mut self) {
+        self.quick_open_open = false;
+        if self.ime_target == ImeTarget::QuickOpenBox {
+            self.ime_target = ImeTarget::None;
+        }
+    }
+
+    fn refresh_quick_open_matches(&mut self) {
+        self.quick_open_matches = self.workbench.quick_open(&self.quick_open_query);
+        self.quick_open_selected = 0;
+    }
+
+    fn confirm_quick_open_match(&mut self, idx: usize) {
+        let Some(picked) = self.quick_open_matches.get(idx).cloned() else {
+            self.close_quick_open();
+            return;
+        };
+        self.close_quick_open();
+        self.find_focused = false;
+        self.flush_active_tab_before_switch();
+        match self.workbench.open_document(&picked.path) {
+            Ok(_) => {
+                self.ime_target = ImeTarget::None;
+                self.preferred_caret_x = None;
+                self.pending_scroll_ensure_caret = true;
+                self.set_notice(format!("Opened {}", picked.relative_path));
+            }
+            Err(e) => self.set_notice(format!("Open failed: {e}")),
+        }
+    }
+
+    /// Show hyperlink prompt (`Cmd/Ctrl + K`), pre-filling clipboard URL when applicable.
+    pub fn open_link_prompt(&mut self) {
+        if self.workbench.active_tab().is_none() {
+            self.set_notice("No active document");
+            return;
+        }
+        self.close_confirm_armed = false;
+        self.close_transient_prompts();
+        self.find_focused = false;
+        let active_id = self.workbench.active_tab().map(|t| t.id);
+        self.cancel_abandoned_tab_ime(active_id);
+
+        let prefill = self
+            .clipboard
+            .read()
+            .text
+            .map(|t| t.trim().to_string())
+            .filter(|t| {
+                !t.is_empty()
+                    && !t.contains(char::is_whitespace)
+                    && (has_ascii_prefix_ignore_case(t, "http://")
+                        || has_ascii_prefix_ignore_case(t, "https://")
+                        || has_ascii_prefix_ignore_case(t, "mailto:"))
+            })
+            .unwrap_or_default();
+
+        self.link_prompt_url = prefill;
+        self.link_prompt_open = true;
+    }
+
+    fn close_link_prompt(&mut self) {
+        self.link_prompt_open = false;
+        if self.ime_target == ImeTarget::LinkPromptBox {
+            self.ime_target = ImeTarget::None;
+        }
+    }
+
+    fn confirm_link_prompt(&mut self) {
+        let url = self.link_prompt_url.trim().to_string();
+        self.close_link_prompt();
+        if url.is_empty() {
+            self.set_notice("Empty URL — link not inserted");
+            return;
+        }
+        self.dispatch_editor(EditorAction::InsertLink(url));
+    }
+
+    fn has_link_at_offset(&self, offset: usize) -> bool {
+        self.workbench
+            .active_tab()
+            .and_then(|tab| link_destination_at_offset(tab, offset))
+            .is_some()
+    }
+
+    fn try_open_link_at_offset(&mut self, offset: usize) -> bool {
+        let dest = self
+            .workbench
+            .active_tab()
+            .and_then(|tab| link_destination_at_offset(tab, offset));
+        let Some(dest) = dest else {
+            return false;
+        };
+        self.open_resolved_link_destination(&dest);
+        true
+    }
+
+    fn jump_active_tab_to_anchor(&mut self, anchor: &str) {
+        let Some(item) = self
+            .workbench
+            .active_tab()
+            .and_then(|tab| find_matching_outline_item(&tab.outline(), anchor))
+        else {
+            self.set_notice(format!("Heading anchor not found: #{anchor}"));
+            return;
+        };
+        if let Some(tab) = self.workbench.active_tab_mut() {
+            tab.jump_to_outline_item(&item);
+            self.preferred_caret_x = None;
+            self.pending_scroll_ensure_caret = true;
+            self.set_notice(format!("Jumped to: {}", item.title));
+        }
+    }
+
+    fn open_resolved_link_destination(&mut self, raw_dest: &str) {
+        let trimmed = raw_dest.trim();
+        if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+            self.set_notice(if trimmed.is_empty() {
+                "Empty link target"
+            } else {
+                "Invalid link target"
+            });
+            return;
+        }
+        if let Some(anchor) = trimmed.strip_prefix('#') {
+            self.jump_active_tab_to_anchor(anchor);
+            return;
+        }
+
+        let local_raw: String = if let Some(scheme) = extract_uri_scheme(trimmed) {
+            if is_allowed_external_url(trimmed) {
+                match self.link_opener.open_url(trimmed) {
+                    Ok(()) => self.set_notice(format!("Opened link: {trimmed}")),
+                    Err(e) => self.set_notice(e),
+                }
+                return;
+            }
+            if scheme.eq_ignore_ascii_case("file")
+                && has_ascii_prefix_ignore_case(trimmed, "file://")
+            {
+                let Some(local_path) = parse_local_file_uri_path(&trimmed[7..]) else {
+                    self.set_notice("Blocked non-local file URI");
+                    return;
+                };
+                local_path
+            } else {
+                self.set_notice(format!("Unsupported link scheme: {scheme}:"));
+                return;
+            }
+        } else {
+            trimmed.to_string()
+        };
+
+        let (file_part, frag_part) = match local_raw.split_once('#') {
+            Some((p, f)) => (p, Some(f)),
+            None => (local_raw.as_str(), None),
+        };
+        let resolved = self.resolve_local_link_path(file_part);
+        let Some(target) = resolved else {
+            self.set_notice(format!("Link target not found: {file_part}"));
+            return;
+        };
+
+        let is_doc = is_supported_document_path(&target);
+        if is_doc {
+            self.flush_active_tab_before_switch();
+            match self.workbench.open_document(&target) {
+                Ok(_) => {
+                    self.ime_target = ImeTarget::None;
+                    self.find_focused = false;
+                    self.preferred_caret_x = None;
+                    self.pending_scroll_ensure_caret = true;
+                    if let Some(frag) = frag_part.filter(|s| !s.is_empty()) {
+                        self.jump_active_tab_to_anchor(frag);
+                    } else {
+                        let name = target
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("document");
+                        self.set_notice(format!("Opened {name}"));
+                    }
+                }
+                Err(e) => self.set_notice(format!("Open failed: {e}")),
+            }
+        } else if is_blocked_executable_path(&target) {
+            let name = target
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("executable");
+            self.set_notice(format!("Blocked opening executable file: {name}"));
+        } else {
+            let target_str = target.to_string_lossy().into_owned();
+            match self.link_opener.open_url(&target_str) {
+                Ok(()) => self.set_notice(format!("Opened {target_str}")),
+                Err(e) => self.set_notice(e),
+            }
+        }
+    }
+
+    fn resolve_local_link_path(&self, raw_path: &str) -> Option<PathBuf> {
+        let mut candidates = Vec::new();
+        let decoded = decode_percent_spaces(raw_path);
+        for candidate_str in [raw_path, decoded.as_str()] {
+            if candidate_str.is_empty() {
+                continue;
+            }
+            let p = Path::new(candidate_str);
+            if p.is_absolute() {
+                candidates.push(normalize_lexical_path(p));
+                continue;
+            }
+            if let Some(doc_dir) = self
+                .workbench
+                .active_tab()
+                .and_then(|t| t.session.path.as_deref())
+                .and_then(|p| p.parent())
+            {
+                candidates.push(normalize_lexical_path(&doc_dir.join(p)));
+            }
+            if let Some(root) = &self.workbench.workspace_root {
+                candidates.push(normalize_lexical_path(&root.join(p)));
+            }
+        }
+        candidates.into_iter().find(|p| p.is_file())
     }
 
     fn run_find_next(&mut self, advance: bool) {
@@ -3435,6 +4543,13 @@ impl ApplicationHandler for VellmarkApp {
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
+                let (px, py) = self.controller.pointer_pos;
+                let (icon, _) =
+                    self.controller
+                        .handle_pointer_move_with_mods(px, py, self.modifiers);
+                if let Some(win) = &self.window {
+                    win.set_cursor(icon);
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.controller.handle_key_press(&event, self.modifiers) {
@@ -3453,7 +4568,10 @@ impl ApplicationHandler for VellmarkApp {
                 match state {
                     ElementState::Pressed => {
                         let (px, py) = self.controller.pointer_pos;
-                        if self.controller.handle_pointer_down(px, py) {
+                        if self
+                            .controller
+                            .handle_pointer_down_with_mods(px, py, self.modifiers)
+                        {
                             self.request_redraw();
                         }
                     }
@@ -3469,7 +4587,9 @@ impl ApplicationHandler for VellmarkApp {
                 let scale = self.controller.scale_factor.max(0.5);
                 let lx = (x as f32) / scale;
                 let ly = (y as f32) / scale;
-                let (icon, changed) = self.controller.handle_pointer_move(lx, ly);
+                let (icon, changed) =
+                    self.controller
+                        .handle_pointer_move_with_mods(lx, ly, self.modifiers);
                 if let Some(win) = &self.window {
                     win.set_cursor(icon);
                 }
@@ -3589,6 +4709,167 @@ fn flatten_file_tree(
             flatten_file_tree(child, depth + 1, collapsed, out);
         }
     }
+}
+
+fn is_primary_mod(mods: ModifiersState) -> bool {
+    if cfg!(target_os = "macos") {
+        mods.super_key()
+    } else {
+        mods.control_key()
+    }
+}
+
+fn overlay_printable_key_text(logical_key: &Key, text: Option<&str>) -> Option<String> {
+    if let Some(txt) = text {
+        let clean: String = txt.chars().filter(|c| !c.is_control()).collect();
+        if !clean.is_empty() {
+            return Some(clean);
+        }
+    }
+    if *logical_key == NamedKey::Space {
+        return Some(" ".to_string());
+    }
+    if let Key::Character(ch) = logical_key {
+        let clean: String = ch.chars().filter(|c| !c.is_control()).collect();
+        if !clean.is_empty() {
+            return Some(clean);
+        }
+    }
+    None
+}
+
+fn has_ascii_prefix_ignore_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn is_supported_document_path(path: &Path) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        None => true,
+        Some(ext) => matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "md" | "markdown" | "mdown" | "mkd" | "txt" | "text"
+        ),
+    }
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_percent_spaces(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(comp.as_os_str());
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn link_destination_at_offset(tab: &DocumentTab, offset: usize) -> Option<String> {
+    let source = tab.session.buffer.to_string();
+    tab.with_incremental_blocks(|blocks| {
+        let block = blocks.iter().find(|b| b.range.contains_inclusive(offset))?;
+        let span = block.inlines.iter().find(|s| {
+            s.kind == InlineKind::Link
+                && offset >= s.full_range.start
+                && offset < s.full_range.end
+        })?;
+        let close = source.get(span.close_marker.start..span.close_marker.end)?;
+        let inner = close.strip_prefix("](")?.strip_suffix(')')?;
+        let dest = extract_markdown_link_destination(inner);
+        (!dest.is_empty()).then_some(dest)
+    })
+}
+
+fn extract_markdown_link_destination(raw_inner: &str) -> String {
+    extract_link_destination(raw_inner).unwrap_or_default()
+}
+
+fn heading_to_github_slug(title: &str) -> String {
+    let mut slug = String::new();
+    for ch in title.trim().chars() {
+        if ch == ' ' || ch == '-' {
+            slug.push('-');
+        } else if ch == '_' {
+            slug.push('_');
+        } else if ch.is_alphanumeric() {
+            for lc in ch.to_lowercase() {
+                slug.push(lc);
+            }
+        }
+    }
+    slug
+}
+
+fn find_matching_outline_item(outline: &[OutlineItem], anchor: &str) -> Option<OutlineItem> {
+    let decoded = decode_percent_spaces(anchor);
+    let target = decoded.trim().trim_start_matches('#').to_lowercase();
+    if target.is_empty() {
+        return None;
+    }
+
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for item in outline {
+        let base = heading_to_github_slug(&item.title);
+        let count = seen.entry(base.clone()).or_insert(0);
+        let unique = if *count == 0 {
+            base
+        } else {
+            format!("{base}-{}", *count)
+        };
+        *count += 1;
+        if unique == target {
+            return Some(item.clone());
+        }
+    }
+
+    let slugified_target = heading_to_github_slug(&decoded);
+    if !slugified_target.is_empty() {
+        if let Some(item) = outline
+            .iter()
+            .find(|item| heading_to_github_slug(&item.title) == slugified_target)
+        {
+            return Some(item.clone());
+        }
+    }
+
+    outline
+        .iter()
+        .find(|item| item.title.trim().eq_ignore_ascii_case(decoded.trim()))
+        .cloned()
 }
 
 #[cfg(test)]
@@ -4654,6 +5935,518 @@ mod tests {
             gui.workbench.active_tab().unwrap().view.selection.head,
             h2_content_end
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn primary_test_mod() -> ModifiersState {
+        if cfg!(target_os = "macos") {
+            ModifiersState::SUPER
+        } else {
+            ModifiersState::CONTROL
+        }
+    }
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn test_cmd_o_and_cmd_shift_o_open_file_and_folder_dialogs() {
+        let dir = unique_test_dir("vellmark-gui-open-dialog");
+        let rec_root = dir.join("rec");
+        let docs_dir = dir.join("workspace");
+        fs::create_dir_all(&docs_dir).unwrap();
+        let file_a = docs_dir.join("notes.md");
+        fs::write(&file_a, "# Notes\n\nHello open dialog.").unwrap();
+
+        let dialog = Arc::new(MemorySaveDialog::new(None));
+        struct SharedDialog(Arc<MemorySaveDialog>);
+        impl SaveDialogBackend for SharedDialog {
+            fn pick_save_as_path(&self, cur: Option<&Path>, def: &str) -> Option<PathBuf> {
+                self.0.pick_save_as_path(cur, def)
+            }
+            fn pick_open_path(&self, cur_dir: Option<&Path>) -> Option<PathBuf> {
+                self.0.pick_open_path(cur_dir)
+            }
+            fn pick_open_folder(&self, cur_dir: Option<&Path>) -> Option<PathBuf> {
+                self.0.pick_open_folder(cur_dir)
+            }
+        }
+
+        let wb = AppWorkbench::new(AppConfig::default(), Some(rec_root));
+        let mut gui = GuiController::with_backends(
+            wb,
+            Box::new(MemoryClipboard::default()),
+            Box::new(SharedDialog(dialog.clone())),
+        );
+        let p_mod = primary_test_mod();
+
+        // Cancelled Open File leaves tabs untouched
+        assert!(gui.handle_key_input(&Key::Character("o".into()), None, p_mod));
+        assert!(gui.workbench.tabs.is_empty());
+
+        // Configured Open File loads document into active tab
+        dialog.set_next_open_path(Some(file_a.clone()));
+        assert!(gui.handle_key_input(&Key::Character("o".into()), None, p_mod));
+        assert_eq!(gui.workbench.tabs.len(), 1);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "# Notes\n\nHello open dialog."
+        );
+
+        // Configured Cmd/Ctrl+Shift+O opens workspace folder & reveals Files sidebar
+        gui.workbench.config.sidebar_visible = false;
+        gui.sidebar_section = SidebarSection::Outline;
+        dialog.set_next_open_folder(Some(docs_dir.clone()));
+        assert!(gui.handle_key_input(
+            &Key::Character("o".into()),
+            None,
+            p_mod | ModifiersState::SHIFT
+        ));
+        assert_eq!(gui.workbench.workspace_root.as_deref(), Some(docs_dir.as_path()));
+        assert!(gui.workbench.file_tree.is_some());
+        assert!(gui.workbench.config.sidebar_visible);
+        assert_eq!(gui.sidebar_section, SidebarSection::Files);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cmd_p_quick_open_fuzzy_search_keyboard_ime_and_click() {
+        let dir = unique_test_dir("vellmark-gui-quick-open");
+        let rec_root = dir.join("rec");
+        let ws = dir.join("ws");
+        fs::create_dir_all(ws.join("docs")).unwrap();
+        fs::create_dir_all(ws.join("notes")).unwrap();
+        fs::create_dir_all(ws.join("assets")).unwrap();
+        fs::write(ws.join("README.md"), "# Root").unwrap();
+        fs::write(ws.join("docs/architecture.md"), "# Arch").unwrap();
+        fs::write(ws.join("notes/todo.txt"), "Todo list").unwrap();
+        fs::write(ws.join("assets/logo.png"), b"PNG").unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root));
+        wb.new_document();
+        wb.active_tab_mut()
+            .unwrap()
+            .session
+            .buffer
+            .reset_content("Keep me intact");
+
+        let mut gui = GuiController::with_clipboard(wb, Box::new(MemoryClipboard::default()));
+        let p_mod = primary_test_mod();
+
+        // Empty-workspace Quick Open renders clean prompt without panicking
+        assert!(gui.handle_key_input(&Key::Character("p".into()), None, p_mod));
+        assert!(gui.quick_open_open);
+        assert!(gui.quick_open_matches.is_empty());
+        let _ = gui.build_frame();
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Escape), None, ModifiersState::empty()));
+        assert!(!gui.quick_open_open);
+
+        // Open workspace and launch Cmd/Ctrl + P
+        gui.workbench.open_folder(&ws).unwrap();
+        assert!(gui.handle_key_input(&Key::Character("p".into()), None, p_mod));
+        assert!(gui.quick_open_open);
+        assert_eq!(gui.quick_open_matches.len(), 3);
+
+        // Filter via keyboard + IME without touching active tab buffer
+        assert!(gui.handle_key_input(&Key::Character("a".into()), Some("a"), ModifiersState::empty()));
+        assert!(gui.handle_key_input(&Key::Character("r".into()), Some("r"), ModifiersState::empty()));
+        gui.handle_ime_event(&Ime::Preedit("ch".to_string(), None));
+        assert!(gui.workbench.active_tab().unwrap().view.ime_preedit.is_none());
+        gui.handle_ime_event(&Ime::Preedit(String::new(), None));
+        gui.handle_ime_event(&Ime::Commit("ch".to_string()));
+        assert_eq!(gui.quick_open_query, "arch");
+        assert!(
+            gui.quick_open_matches
+                .iter()
+                .any(|m| m.relative_path.ends_with("architecture.md"))
+        );
+        assert_eq!(
+            gui.workbench.tabs[0].session.buffer.to_string(),
+            "Keep me intact"
+        );
+
+        // Confirm via Enter opens matching document
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert!(!gui.quick_open_open);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "# Arch"
+        );
+
+        // Re-open Quick Open, clear query, ArrowDown + Enter / UI hit zone click opens another file
+        assert!(gui.handle_key_input(&Key::Character("p".into()), None, p_mod));
+        assert_eq!(gui.quick_open_matches.len(), 3);
+        let _ = gui.build_frame();
+        let target_idx = gui
+            .quick_open_matches
+            .iter()
+            .position(|m| m.relative_path.ends_with("todo.txt"))
+            .unwrap();
+        assert!(click_hit_action(&mut gui, |a| {
+            matches!(a, UiAction::SelectQuickOpenMatch(i) if *i == target_idx)
+        }));
+        assert!(!gui.quick_open_open);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "Todo list"
+        );
+
+        // ArrowDown + Enter selection works
+        assert!(gui.handle_key_input(&Key::Character("p".into()), None, p_mod));
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::ArrowDown), None, ModifiersState::empty()));
+        assert_eq!(gui.quick_open_selected, 1);
+        let expected_path = gui.quick_open_matches[1].path.clone();
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.path.as_deref(),
+            Some(expected_path.as_path())
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cmd_k_link_prompt_prefill_typing_ime_cancel_insert_and_clipboard() {
+        let mut gui = controller_with_doc("Click here please");
+        let p_mod = primary_test_mod();
+
+        // 1. Non-URL clipboard does not prefill; IME commit + Esc cancels cleanly
+        gui.clipboard
+            .write("not a url just text", None)
+            .unwrap();
+        gui.workbench
+            .active_tab_mut()
+            .unwrap()
+            .edit(|ctx| ctx.set_selection("Click ".len(), "Click here".len()))
+            .unwrap();
+        assert!(gui.handle_key_input(&Key::Character("k".into()), None, p_mod));
+        assert!(gui.link_prompt_open);
+        assert_eq!(gui.link_prompt_url, "");
+        gui.handle_ime_event(&Ime::Commit("guide.md".to_string()));
+        assert_eq!(gui.link_prompt_url, "guide.md");
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Escape), None, ModifiersState::empty()));
+        assert!(!gui.link_prompt_open);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "Click here please"
+        );
+
+        // 2. HTTPS URL clipboard prefills cleanly and Enter inserts [here](url)
+        gui.clipboard
+            .write("  https://vellmark.dev  ", None)
+            .unwrap();
+        assert!(gui.handle_key_input(&Key::Character("k".into()), None, p_mod));
+        assert!(gui.link_prompt_open);
+        assert_eq!(gui.link_prompt_url, "https://vellmark.dev");
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert!(!gui.link_prompt_open);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "Click [here](https://vellmark.dev) please"
+        );
+
+        // 3. Cmd+K at caret + typed/pasted URL + Insert button click places caret inside []
+        let end = gui.workbench.active_tab().unwrap().session.buffer.len_bytes();
+        gui.workbench
+            .active_tab_mut()
+            .unwrap()
+            .edit(|ctx| ctx.set_caret(end))
+            .unwrap();
+        gui.clipboard.write("ignored text", None).unwrap();
+        assert!(gui.handle_key_input(&Key::Character("k".into()), None, p_mod));
+        assert_eq!(gui.link_prompt_url, "");
+        for ch in "https://".chars() {
+            let s = ch.to_string();
+            assert!(gui.handle_key_input(&Key::Character(s.clone().into()), Some(&s), ModifiersState::empty()));
+        }
+        gui.clipboard.write("example.org", None).unwrap();
+        assert!(gui.handle_key_input(&Key::Character("v".into()), None, p_mod));
+        assert_eq!(gui.link_prompt_url, "https://example.org");
+        let _ = gui.build_frame();
+        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ConfirmLinkPrompt)));
+        assert!(!gui.link_prompt_open);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "Click [here](https://vellmark.dev) please[](https://example.org)"
+        );
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().view.selection.head,
+            "Click [here](https://vellmark.dev) please[".len()
+        );
+    }
+
+    #[test]
+    fn test_cmd_ctrl_click_navigation_external_relative_and_heading_anchors() {
+        let dir = unique_test_dir("vellmark-gui-link-nav");
+        let rec_root = dir.join("rec");
+        let ws = dir.join("ws");
+        fs::create_dir_all(ws.join("docs")).unwrap();
+        let arch_md = ws.join("arch.md");
+        fs::write(
+            &arch_md,
+            "# Architecture\n\nIntro paragraph.\n\n## Deep Dive\n\nNested architecture details.\n",
+        )
+        .unwrap();
+        let intro_md = ws.join("docs/intro.md");
+        let intro_src = "\
+# Intro\n\
+\n\
+Plain line before links\n\
+\n\
+[Vellmark](https://vellmark.dev \"Home\")\n\
+\n\
+[Anchor First](#second-heading)\n\
+\n\
+[Anchor Second](#second-heading-1)\n\
+\n\
+[Relative Arch](<../arch.md#deep-dive> \"Arch\")\n\
+\n\
+[Broken Rel](missing-note.md)\n\
+\n\
+## Second Heading\n\
+\n\
+First duplicate body\n\
+\n\
+## Second Heading\n\
+\n\
+Second duplicate body\n";
+        fs::write(&intro_md, intro_src).unwrap();
+
+        let opener = Arc::new(MemoryLinkOpener::default());
+        struct SharedOpener(Arc<MemoryLinkOpener>);
+        impl LinkOpenerBackend for SharedOpener {
+            fn open_url(&self, url: &str) -> Result<(), String> {
+                self.0.open_url(url)
+            }
+        }
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root));
+        wb.open_folder(&ws).unwrap();
+        wb.open_document(&intro_md).unwrap();
+        let mut gui = GuiController::with_clipboard(wb, Box::new(MemoryClipboard::default()));
+        gui.set_link_opener(Box::new(SharedOpener(opener.clone())));
+
+        let p_mod = primary_test_mod();
+
+        // Helper: find screen pixel inside a given byte offset while link markers are collapsed
+        let caret_point_for_offset = |gui: &mut GuiController, caret_off: usize, collapse_off: usize| {
+            gui.workbench
+                .active_tab_mut()
+                .unwrap()
+                .edit(|ctx| ctx.set_caret(caret_off))
+                .unwrap();
+            let _ = gui.build_frame();
+            let rect = gui.last_ime_cursor_area.expect("caret rect");
+            gui.workbench
+                .active_tab_mut()
+                .unwrap()
+                .edit(|ctx| ctx.set_caret(collapse_off))
+                .unwrap();
+            let _ = gui.build_frame();
+            (rect.x + 8.0, rect.y + rect.h * 0.5)
+        };
+
+        // Plain line does not trigger pointer cursor or link open on Cmd/Ctrl+Click
+        let plain_off = intro_src.find("Plain line").unwrap() + 2;
+        let (px, py) = caret_point_for_offset(&mut gui, plain_off, 0);
+        let (icon_mod, _) = gui.handle_pointer_move_with_mods(px, py, p_mod);
+        assert_eq!(icon_mod, CursorIcon::Text);
+        assert!(gui.handle_pointer_down_with_mods(px, py, p_mod));
+        assert!(opener.opened_urls().is_empty());
+
+        // 1. External URL link: Pointer cursor under Cmd/Ctrl, Text cursor without; Click opens URL
+        let ext_off = intro_src.find("Vellmark").unwrap() + 2;
+        let (ex, ey) = caret_point_for_offset(&mut gui, ext_off, 0);
+        assert_eq!(
+            gui.handle_pointer_move_with_mods(ex, ey, ModifiersState::empty()).0,
+            CursorIcon::Text
+        );
+        assert_eq!(gui.handle_pointer_move_with_mods(ex, ey, p_mod).0, CursorIcon::Pointer);
+        assert!(gui.handle_pointer_down_with_mods(ex, ey, p_mod));
+        assert!(!gui.dragging_selection);
+        assert_eq!(opener.opened_urls(), vec!["https://vellmark.dev".to_string()]);
+
+        // 2. Same-document heading anchor jump & duplicate GitHub slug disambiguation (-1)
+        let a1_off = intro_src.find("Anchor First").unwrap() + 2;
+        let (ax1, ay1) = caret_point_for_offset(&mut gui, a1_off, 0);
+        assert!(gui.handle_pointer_down_with_mods(ax1, ay1, p_mod));
+        let first_heading_pos = intro_src.find("## Second Heading").unwrap();
+        let caret1 = gui.workbench.active_tab().unwrap().view.selection.head;
+        assert!(
+            caret1 >= first_heading_pos && caret1 < intro_src.rfind("## Second Heading").unwrap(),
+            "caret1={caret1} should jump to first Second Heading"
+        );
+
+        let a2_off = intro_src.find("Anchor Second").unwrap() + 2;
+        let (ax2, ay2) = caret_point_for_offset(&mut gui, a2_off, 0);
+        assert!(gui.handle_pointer_down_with_mods(ax2, ay2, p_mod));
+        let second_heading_pos = intro_src.rfind("## Second Heading").unwrap();
+        let caret2 = gui.workbench.active_tab().unwrap().view.selection.head;
+        assert!(
+            caret2 >= second_heading_pos,
+            "caret2={caret2} should jump to second Second Heading at {second_heading_pos}"
+        );
+
+        // 3. Broken relative link sets status notice safely without drag
+        let broken_off = intro_src.find("Broken Rel").unwrap() + 2;
+        let (bx, by) = caret_point_for_offset(&mut gui, broken_off, 0);
+        assert!(gui.handle_pointer_down_with_mods(bx, by, p_mod));
+        assert!(!gui.dragging_selection);
+        assert!(
+            gui.active_status_notice()
+                .is_some_and(|n| n.contains("not found")),
+            "expected not found notice, got {:?}",
+            gui.active_status_notice()
+        );
+
+        // 4. Relative `.md#heading` angle-bracket link opens target file and jumps to `## Deep Dive`
+        let rel_off = intro_src.find("Relative Arch").unwrap() + 2;
+        let (rx, ry) = caret_point_for_offset(&mut gui, rel_off, 0);
+        assert!(gui.handle_pointer_down_with_mods(rx, ry, p_mod));
+        let active = gui.workbench.active_tab().unwrap();
+        assert_eq!(active.session.path.as_deref(), Some(arch_md.as_path()));
+        let arch_text = active.session.buffer.to_string();
+        let deep_idx = arch_text.find("Deep Dive").unwrap();
+        assert_eq!(active.view.selection.head, deep_idx);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_link_security_scheme_allowlist_and_escaped_link_roundtrip() {
+        // 1. `validate_native_open_target` enforces scheme allowlist, blocks control chars & executables,
+        // while keeping `&` and `%` intact in valid https/http/mailto URLs (no cmd.exe metachar injection).
+        assert!(validate_native_open_target("https://example.com/search?q=1&b=2%203").is_ok());
+        assert!(validate_native_open_target("http://evil.com&calc").is_ok());
+        assert!(validate_native_open_target("mailto:test@example.com").is_ok());
+        assert!(validate_native_open_target("/tmp/report.pdf").is_ok());
+        assert!(validate_native_open_target(r"C:\docs\report.pdf").is_ok());
+
+        for blocked in [
+            "",
+            "https://example.com\ncalc",
+            "https://example.com\0",
+            "ftp://example.com/file",
+            "smb://attacker/share",
+            "search-ms:displayname=evil",
+            "ms-msdt:/id",
+            "javascript:alert(1)//http://example.com",
+            "file:///tmp/secret.txt",
+            r"C:\notes\payload.bat",
+            "/tmp/setup.exe",
+        ] {
+            assert!(
+                validate_native_open_target(blocked).is_err(),
+                "expected `{blocked}` to be rejected by validate_native_open_target"
+            );
+        }
+
+        // 2. `open_resolved_link_destination` blocks arbitrary URI schemes, remote `file://host/...` SMB/UNC,
+        // and executable local files while allowing case-insensitive `FILE:///...` local notes.
+        let dir = unique_test_dir("vellmark-gui-link-sec");
+        let ws = dir.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let note = ws.join("note.md");
+        fs::write(&note, "# Hello\n").unwrap();
+        let script = ws.join("run.bat");
+        fs::write(&script, "@echo hi\n").unwrap();
+
+        let opener = Arc::new(MemoryLinkOpener::default());
+        struct SharedOpener(Arc<MemoryLinkOpener>);
+        impl LinkOpenerBackend for SharedOpener {
+            fn open_url(&self, url: &str) -> Result<(), String> {
+                self.0.open_url(url)
+            }
+        }
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(dir.join("rec")));
+        wb.open_folder(&ws).unwrap();
+        let mut gui = GuiController::with_clipboard(wb, Box::new(MemoryClipboard::default()));
+        gui.set_link_opener(Box::new(SharedOpener(opener.clone())));
+
+        for disallowed in [
+            "ftp://example.com/a",
+            "smb://evil.example/share",
+            "ms-msdt:/id",
+            "javascript:alert(1)//http://x",
+            "file://attacker/share/secret.md",
+            "run.bat",
+        ] {
+            gui.open_resolved_link_destination(disallowed);
+            assert!(
+                opener.opened_urls().is_empty(),
+                "`{disallowed}` must never reach LinkOpenerBackend"
+            );
+        }
+
+        // Case-insensitive `FILE:///...` resolves local note cleanly inside Vellmark.
+        let note_display = note.to_string_lossy().replace('\\', "/");
+        let file_uri = if note_display.starts_with('/') {
+            format!("FILE://{note_display}")
+        } else {
+            format!("FILE:///{note_display}")
+        };
+        gui.open_resolved_link_destination(&file_uri);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.path.as_deref(),
+            Some(note.as_path())
+        );
+
+        // 3. End-to-end `Cmd+K` (`InsertLink`) -> HTML export -> WYSIWYG parser -> `link_destination_at_offset`.
+        let cases = [
+            ("a]b", "http://example.com/path"),
+            ("text", "http://example.com/a b"),
+            ("text", "http://example.com/a(b"),
+            ("text", "http://example.com/a)"),
+            ("text", r"http://example.com/a\b"),
+        ];
+        for (idx, (label, url)) in cases.iter().enumerate() {
+            let tab = gui.workbench.active_tab_mut().unwrap();
+            let full = tab.session.buffer.len_bytes();
+            tab.edit(|ctx| {
+                ctx.set_selection(0, full);
+                ctx.insert_text(label);
+                ctx.set_selection(0, label.len());
+                ctx.insert_link(url);
+            })
+            .unwrap();
+            let md = gui.workbench.active_tab().unwrap().session.buffer.to_string();
+            let html = vellmark_parser::render_markdown_to_html(&md);
+            assert!(
+                html.contains("<a href="),
+                "case {idx} (`{md}`) did not export an HTML link: {html}"
+            );
+            let extracted = link_destination_at_offset(gui.workbench.active_tab().unwrap(), 1);
+            assert_eq!(
+                extracted.as_deref(),
+                Some(*url),
+                "case {idx} (`{md}`) failed round-trip extraction"
+            );
+        }
+
+        // 4. Bare invalid space/backslash-space links do NOT parse or open.
+        for bad_md in ["[a](my file.md)", "[a](my\\ file.md)"] {
+            let tab = gui.workbench.active_tab_mut().unwrap();
+            let full = tab.session.buffer.len_bytes();
+            tab.edit(|ctx| {
+                ctx.set_selection(0, full);
+                ctx.insert_text(bad_md);
+            })
+            .unwrap();
+            assert_eq!(
+                link_destination_at_offset(gui.workbench.active_tab().unwrap(), 1),
+                None,
+                "`{bad_md}` should not produce an interactive link target"
+            );
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

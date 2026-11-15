@@ -12,6 +12,7 @@ pub mod find_replace;
 pub mod recovery_history;
 pub mod state;
 pub mod stats;
+pub mod table;
 pub mod undo;
 pub mod workspace;
 
@@ -19,6 +20,13 @@ pub use buffer::{ByteOffset, ByteRange, Selection, TextBuffer};
 pub use editor::{
     EditorAction, EditorContext, EditorController, EditorViewState, ViewMode,
     map_offset_across_reload,
+};
+pub use table::{
+    GfmTableContext, ScannedGfmTable, TableAlign, TableCellSpan, TableRowParsed,
+    find_enclosing_gfm_table_at, is_pipe_table_line, is_table_body_row_candidate,
+    parse_table_block, parse_table_cell_rel_ranges, parse_table_delimiter_alignments,
+    parse_table_delimiter_alignments_for_cells, scan_line_bounds, scan_line_content_bounds,
+    try_scan_gfm_table_from_line, unescaped_pipe_offsets,
 };
 pub use encoding::{
     DetectedEncoding, EncodingDecision, EncodingError, FileFormatMeta, LineEnding,

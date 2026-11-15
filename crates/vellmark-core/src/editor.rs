@@ -7,6 +7,10 @@
 
 use crate::buffer::{ByteOffset, ByteRange, Selection, TextBuffer};
 use crate::encoding::{LineEnding, normalize_line_endings};
+use crate::table::{
+    GfmTableContext, TableCellSpan, TableRowParsed, find_enclosing_gfm_table_at,
+    parse_table_delimiter_alignments, unescaped_pipe_offsets,
+};
 use crate::undo::{EditKind, EditOp, Transaction, UndoHistory};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +33,7 @@ pub enum EditorAction {
     ToggleItalic,
     ToggleInlineCode,
     ToggleStrikethrough,
+    InsertLink(String),
     SetHeadingLevel(u8),
     ToggleTaskCheckbox,
     AlignCurrentTable,
@@ -274,6 +279,7 @@ impl EditorContext<'_> {
             EditorAction::ToggleItalic => self.toggle_inline_wrap("*"),
             EditorAction::ToggleInlineCode => self.toggle_inline_wrap("`"),
             EditorAction::ToggleStrikethrough => self.toggle_inline_wrap("~~"),
+            EditorAction::InsertLink(url) => self.insert_link(&url),
             EditorAction::SetHeadingLevel(lvl) => self.set_heading_level(lvl),
             EditorAction::ToggleTaskCheckbox => {
                 self.toggle_task_checkbox();
@@ -556,15 +562,16 @@ impl EditorContext<'_> {
         *self.selection = sel_after;
     }
 
-    /// Insert or wrap selection as a Markdown hyperlink `[label](url)` (PRD 4.10 `Cmd/Ctrl+K`).
+    /// Insert or wrap selection as a CommonMark hyperlink `[label](url)` (PRD 4.10 `Cmd/Ctrl+K`).
     pub fn insert_link(&mut self, url: &str) {
         self.abort_ime_preedit();
         self.normalize_selection_out_of_crlf();
-        let url = self.normalize_newlines(url);
         let range = self.selection.range();
         let sel_before = *self.selection;
         let selected = self.buffer.slice_to_string(range);
-        let snippet = format!("[{selected}]({url})");
+        let escaped_text = escape_markdown_link_text(&selected);
+        let formatted_dest = format_markdown_link_destination(url);
+        let snippet = format!("[{escaped_text}]({formatted_dest})");
         let caret_pos = if selected.is_empty() {
             range.start + 1
         } else {
@@ -691,7 +698,7 @@ impl EditorContext<'_> {
         if *self.mode == ViewMode::Wysiwyg
             && !in_code_fence
             && ch == '|'
-            && self.is_caret_in_table_row()
+            && self.is_caret_in_gfm_table_or_piped_row(line_start_before)
         {
             let range = self.selection.range();
             let sel_before = *self.selection;
@@ -916,9 +923,9 @@ impl EditorContext<'_> {
     ///   of the next data row (or append a new empty row if at the bottom-right cell of the table).
     pub fn tab(&mut self) {
         self.abort_ime_preedit();
-        let (line_start, line_end) = self.current_line_bounds();
+        let (line_start, content_end, line_end) = self.current_line_content_bounds();
         if *self.mode == ViewMode::Wysiwyg && !self.is_offset_inside_fenced_code_block(line_start) {
-            let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
+            let line = self.buffer.slice_to_string(ByteRange::new(line_start, content_end));
             if list_prefix_parts(&line).is_some() {
                 let sel_before = *self.selection;
                 let sel_after = Selection::caret(self.selection.head + 2);
@@ -933,11 +940,13 @@ impl EditorContext<'_> {
                 *self.selection = sel_after;
                 return;
             }
-            if self.is_caret_in_table_row()
-                && (self.has_adjacent_table_row(line_start, line_end)
-                    || !is_table_delimiter_row(&line))
-            {
-                self.tab_in_table(line_start, line_end, &line);
+            let full = self.buffer.to_string();
+            if let Some(ctx) = find_enclosing_gfm_table_at(&full, line_start) {
+                self.tab_in_gfm_table(&full, &ctx);
+                return;
+            }
+            if is_standalone_piped_header(&line) {
+                self.tab_in_standalone_header(&full, line_start, line_end, &line);
                 return;
             }
         }
@@ -961,11 +970,11 @@ impl EditorContext<'_> {
     /// - Or move to previous cell in a Markdown table.
     pub fn shift_tab(&mut self) {
         self.abort_ime_preedit();
-        let (line_start, line_end) = self.current_line_bounds();
+        let (line_start, content_end, _) = self.current_line_content_bounds();
         if self.is_offset_inside_fenced_code_block(line_start) {
             return;
         }
-        let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
+        let line = self.buffer.slice_to_string(ByteRange::new(line_start, content_end));
         if let Some((indent_bytes, _)) = list_prefix_parts(&line) {
             if indent_bytes >= 2 {
                 let sel_before = *self.selection;
@@ -983,10 +992,15 @@ impl EditorContext<'_> {
             }
             return;
         }
-        if *self.mode == ViewMode::Wysiwyg && self.is_caret_in_table_row() {
-            let pipes = unescaped_pipe_offsets(&line);
-            let rel_caret = self.selection.head.saturating_sub(line_start);
-            if pipes.len() >= 2 {
+        if *self.mode == ViewMode::Wysiwyg {
+            let full = self.buffer.to_string();
+            if let Some(ctx) = find_enclosing_gfm_table_at(&full, line_start) {
+                self.shift_tab_in_gfm_table(&full, &ctx);
+                return;
+            }
+            if is_standalone_piped_header(&line) {
+                let pipes = unescaped_pipe_offsets(&line);
+                let rel_caret = self.selection.head.saturating_sub(line_start);
                 if let Some(cell_idx) = current_table_cell_index(&pipes, rel_caret) {
                     if cell_idx > 0 {
                         let prev_pipe = pipes[cell_idx - 1];
@@ -994,34 +1008,6 @@ impl EditorContext<'_> {
                         let cell_slice = &line[prev_pipe + 1..next_pipe];
                         let target_rel = prev_pipe + 1 + table_cell_caret_offset(cell_slice);
                         *self.selection = Selection::caret(line_start + target_rel);
-                        return;
-                    }
-                    // Cell 0: jump backward to the last cell of the previous non-delimiter table row
-                    let full = self.buffer.to_string();
-                    let mut probe_end = line_start;
-                    while probe_end > 0 {
-                        let before = &full[..probe_end - 1];
-                        let prev_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-                        let prev_line = before[prev_start..].trim_end_matches('\r');
-                        if !(prev_line.trim().starts_with('|') && prev_line.trim().ends_with('|')) {
-                            break;
-                        }
-                        if is_table_delimiter_row(prev_line) {
-                            probe_end = prev_start;
-                            continue;
-                        }
-                        let prev_pipes = unescaped_pipe_offsets(prev_line);
-                        if prev_pipes.len() >= 2 {
-                            let last_idx = prev_pipes.len() - 2;
-                            let c_slice = &prev_line[prev_pipes[last_idx] + 1..prev_pipes[last_idx + 1]];
-                            *self.selection = Selection::caret(
-                                prev_start
-                                    + prev_pipes[last_idx]
-                                    + 1
-                                    + table_cell_caret_offset(c_slice),
-                            );
-                        }
-                        break;
                     }
                 }
             }
@@ -1137,46 +1123,52 @@ impl EditorContext<'_> {
                 }
 
                 // PRD 4.1.1 G #6 & 4.3 T-01 / T-02: Table Enter handling
-                if self.is_caret_in_table_row()
-                    && (self.has_adjacent_table_row(line_start, line_end)
-                        || !is_table_delimiter_row(&line))
-                {
+                let full = self.buffer.to_string();
+                if let Some(ctx) = find_enclosing_gfm_table_at(&full, line_start) {
+                    let nl = detect_line_ending_str(&full, self.preferred_line_ending);
+                    let empty_row = build_empty_table_row(ctx.delim_cols);
+                    let anchor_row = if ctx.row_idx == 0 {
+                        &ctx.rows[1]
+                    } else {
+                        &ctx.rows[ctx.row_idx]
+                    };
+                    let insert_pos = anchor_row.line_range.end;
+                    let insertion = format!("{nl}{empty_row}");
+                    let sel_before = *self.selection;
+                    let sel_after = Selection::caret(insert_pos + nl.len() + 2);
+                    self.undo.apply_edit(
+                        self.buffer,
+                        ByteRange::empty(insert_pos),
+                        &insertion,
+                        sel_before,
+                        sel_after,
+                        EditKind::Structural,
+                    );
+                    *self.selection = sel_after;
+                    return;
+                } else if is_standalone_piped_header(&line) {
+                    // PRD 4.3 T-01: `| a | b |` + Enter -> create separator row + first empty data row
                     let pipes = unescaped_pipe_offsets(&line);
-                    if pipes.len() >= 2 {
-                        let cols = pipes.len() - 1;
-                        let empty_row = build_empty_table_row(cols);
-                        let is_standalone_header = !self.has_adjacent_table_row(line_start, line_end);
-
-                        let full = self.buffer.to_string();
-                        let nl = detect_line_ending_str(&full, self.preferred_line_ending);
-                        let insert_pos = table_row_insert_pos(&full, line_start, line_end);
-
-                        let (insertion, caret_offset_in_insertion) = if is_standalone_header {
-                            // PRD 4.3 T-01: `| a | b |` + Enter -> create separator row + first empty data row
-                            let sep_row = build_table_separator_row(cols);
-                            let ins = format!("{nl}{sep_row}{nl}{empty_row}");
-                            let caret_rel = nl.len() + sep_row.len() + nl.len() + 2; // inside `| ‸ |` of empty_row
-                            (ins, caret_rel)
-                        } else {
-                            // PRD 4.1.1 G #6 & 4.3 T-02: Enter inside table inserts a new row below
-                            let ins = format!("{nl}{empty_row}");
-                            let caret_rel = nl.len() + 2; // after `<nl>| `
-                            (ins, caret_rel)
-                        };
-
-                        let sel_before = *self.selection;
-                        let sel_after = Selection::caret(insert_pos + caret_offset_in_insertion);
-                        self.undo.apply_edit(
-                            self.buffer,
-                            ByteRange::empty(insert_pos),
-                            &insertion,
-                            sel_before,
-                            sel_after,
-                            EditKind::Structural,
-                        );
-                        *self.selection = sel_after;
-                        return;
-                    }
+                    let cols = pipes.len() - 1;
+                    let nl = detect_line_ending_str(&full, self.preferred_line_ending);
+                    let insert_pos = table_row_insert_pos(&full, line_start, line_end);
+                    let sep_row = build_table_separator_row(cols);
+                    let empty_row = build_empty_table_row(cols);
+                    let insertion = format!("{nl}{sep_row}{nl}{empty_row}");
+                    let sel_before = *self.selection;
+                    let sel_after = Selection::caret(
+                        insert_pos + nl.len() + sep_row.len() + nl.len() + 2,
+                    );
+                    self.undo.apply_edit(
+                        self.buffer,
+                        ByteRange::empty(insert_pos),
+                        &insertion,
+                        sel_before,
+                        sel_after,
+                        EditKind::Structural,
+                    );
+                    *self.selection = sel_after;
+                    return;
                 }
 
                 // PRD 4.1.1 C: BlockQuote Enter continuation, nested outdent, or empty exit
@@ -1362,24 +1354,9 @@ impl EditorContext<'_> {
             self.enclosing_fenced_code_block_body_range(line_start)
         {
             body_range
-        } else if self.is_caret_in_table_row() {
-            let line = self
-                .buffer
-                .slice_to_string(ByteRange::new(line_start, content_end));
-            let pipes = unescaped_pipe_offsets(&line);
-            let rel_caret = self.selection.head.saturating_sub(line_start);
-            if let Some(cell_idx) = current_table_cell_index(&pipes, rel_caret) {
-                let c_start = line_start + pipes[cell_idx] + 1;
-                let c_end = line_start + pipes[cell_idx + 1];
-                let raw_cell = self.buffer.slice_to_string(ByteRange::new(c_start, c_end));
-                let trim_l = raw_cell.len() - raw_cell.trim_start().len();
-                let trim_r = raw_cell.len() - raw_cell.trim_end().len();
-                let inner_start = (c_start + trim_l).min(c_end);
-                let inner_end = c_end.saturating_sub(trim_r).max(inner_start);
-                ByteRange::new(inner_start, inner_end)
-            } else {
-                ByteRange::new(line_start, content_end)
-            }
+        } else if let Some(cell_range) = self.table_cell_selection_range_at(line_start, content_end)
+        {
+            cell_range
         } else {
             ByteRange::new(line_start, content_end)
         };
@@ -1397,22 +1374,22 @@ impl EditorContext<'_> {
         self.abort_ime_preedit();
         self.normalize_selection_out_of_crlf();
         let (line_start, _) = self.current_line_bounds();
-        if self.is_offset_inside_fenced_code_block(line_start) || !self.is_caret_in_table_row() {
+        if self.is_offset_inside_fenced_code_block(line_start) {
             return false;
         }
         let full = self.buffer.to_string();
-        let Some(table_range) = find_enclosing_table_range(&full, line_start) else {
+        let Some(ctx) = find_enclosing_gfm_table_at(&full, line_start) else {
             return false;
         };
-        let raw_table = &full[table_range.start..table_range.end];
-        let aligned = format_markdown_table(raw_table);
+        let raw_table = &full[ctx.range.start..ctx.range.end];
+        let aligned = format_gfm_table(raw_table, &full, &ctx);
         if aligned == raw_table {
             return false;
         }
         let sel_before = *self.selection;
         let mut rel_after = aligned
             .len()
-            .min(sel_before.head.saturating_sub(table_range.start));
+            .min(sel_before.head.saturating_sub(ctx.range.start));
         while rel_after > 0 && !aligned.is_char_boundary(rel_after) {
             rel_after -= 1;
         }
@@ -1422,10 +1399,10 @@ impl EditorContext<'_> {
         {
             rel_after -= 1;
         }
-        let sel_after = Selection::caret(table_range.start + rel_after);
+        let sel_after = Selection::caret(ctx.range.start + rel_after);
         self.undo.apply_edit(
             self.buffer,
-            table_range,
+            ctx.range,
             &aligned,
             sel_before,
             sel_after,
@@ -1435,66 +1412,75 @@ impl EditorContext<'_> {
         true
     }
 
-    fn tab_in_table(&mut self, line_start: ByteOffset, line_end: ByteOffset, line: &str) {
-        let pipes = unescaped_pipe_offsets(line);
-        if pipes.len() < 2 {
+    fn tab_in_gfm_table(&mut self, full: &str, ctx: &GfmTableContext) {
+        let row = &ctx.rows[ctx.row_idx];
+        let Some(cell_idx) = cell_index_for_offset(row, self.selection.head) else {
             return;
-        }
-        let cols = pipes.len() - 1;
-        let rel_caret = self.selection.head.saturating_sub(line_start);
-        let cell_idx = current_table_cell_index(&pipes, rel_caret).unwrap_or(0);
-
-        if cell_idx + 1 < cols {
-            // Move to next cell on the same row
-            let p_start = pipes[cell_idx + 1];
-            let p_end = pipes[cell_idx + 2];
-            let cell_slice = &line[p_start + 1..p_end];
-            let target_rel = p_start + 1 + table_cell_caret_offset(cell_slice);
-            *self.selection = Selection::caret(line_start + target_rel);
-            return;
-        }
-
-        // At last cell of current row: check if there is a next row in the table
-        let full = self.buffer.to_string();
-        let mut probe_start = if line_end < full.len() {
-            line_end + 1
-        } else {
-            full.len()
         };
-        while probe_start < full.len() {
-            let rel_end = full[probe_start..]
-                .find('\n')
-                .unwrap_or(full.len() - probe_start);
-            let next_line_end = probe_start + rel_end;
-            let next_line = full[probe_start..next_line_end].trim_end_matches('\r');
-            if !(next_line.trim().starts_with('|') && next_line.trim().ends_with('|')) {
-                break;
-            }
-            if is_table_delimiter_row(next_line) {
-                probe_start = if next_line_end < full.len() {
-                    next_line_end + 1
-                } else {
-                    full.len()
-                };
-                continue;
-            }
-            let next_pipes = unescaped_pipe_offsets(next_line);
-            if next_pipes.len() >= 2 {
-                let c_slice = &next_line[next_pipes[0] + 1..next_pipes[1]];
-                *self.selection =
-                    Selection::caret(probe_start + next_pipes[0] + 1 + table_cell_caret_offset(c_slice));
+
+        if cell_idx + 1 < ctx.delim_cols {
+            if cell_idx + 1 < row.cells.len() {
+                let target = cell_target_caret_offset(full, &row.cells[cell_idx + 1]);
+                *self.selection = Selection::caret(target);
                 return;
             }
-            break;
+            // Short body row (`row.cells.len() < ctx.delim_cols`): materialize missing cells
+            // on the same row and move the caret into column `cell_idx + 1`.
+            let Some(last_cell) = row.cells.last() else {
+                return;
+            };
+            let missing = ctx.delim_cols - row.cells.len();
+            let last_end = last_cell.raw_range.end;
+            let has_trailing_pipe = full[last_end..row.line_range.end].starts_with('|');
+            let (replace_range, insertion, caret_rel) = if has_trailing_pipe {
+                (
+                    ByteRange::new(last_end + 1, row.line_range.end),
+                    "  |".repeat(missing),
+                    1usize,
+                )
+            } else {
+                (
+                    ByteRange::new(last_end, row.line_range.end),
+                    format!(" |{}", "  |".repeat(missing)),
+                    3usize,
+                )
+            };
+            let sel_before = *self.selection;
+            let sel_after = Selection::caret(replace_range.start + caret_rel);
+            self.undo.apply_edit(
+                self.buffer,
+                replace_range,
+                &insertion,
+                sel_before,
+                sel_after,
+                EditKind::Structural,
+            );
+            *self.selection = sel_after;
+            return;
         }
 
-        // Bottom-right cell of table: append a new empty row (PRD 4.1.1 G #6)
-        let nl = detect_line_ending_str(&full, self.preferred_line_ending);
-        let insert_pos = table_row_insert_pos(&full, line_start, line_end);
-        let empty_row = build_empty_table_row(cols);
+        // At last canonical column (or beyond it on an over-wide body row): jump to the next
+        // non-delimiter row's cell 0, or append a canonical `delim_cols`-column row at table end.
+        if let Some(next_row) = ctx
+            .rows
+            .iter()
+            .skip(ctx.row_idx + 1)
+            .find(|r| !r.is_delimiter && !r.cells.is_empty())
+        {
+            let target = cell_target_caret_offset(full, &next_row.cells[0]);
+            *self.selection = Selection::caret(target);
+            return;
+        }
+
+        let nl = detect_line_ending_str(full, self.preferred_line_ending);
+        let insert_pos = ctx
+            .rows
+            .last()
+            .map_or(ctx.range.end, |last| last.line_range.end);
+        let empty_row = build_empty_table_row(ctx.delim_cols);
         let insertion = format!("{nl}{empty_row}");
         let sel_before = *self.selection;
-        let sel_after = Selection::caret(insert_pos + nl.len() + 2); // inside `| ‸ |` of new row
+        let sel_after = Selection::caret(insert_pos + nl.len() + 2);
         self.undo.apply_edit(
             self.buffer,
             ByteRange::empty(insert_pos),
@@ -1506,25 +1492,102 @@ impl EditorContext<'_> {
         *self.selection = sel_after;
     }
 
-    fn has_adjacent_table_row(&self, line_start: ByteOffset, line_end: ByteOffset) -> bool {
+    fn tab_in_standalone_header(
+        &mut self,
+        full: &str,
+        line_start: ByteOffset,
+        line_end: ByteOffset,
+        line: &str,
+    ) {
+        let pipes = unescaped_pipe_offsets(line);
+        if pipes.len() < 2 {
+            return;
+        }
+        let cols = pipes.len() - 1;
+        let rel_caret = self.selection.head.saturating_sub(line_start);
+        let cell_idx = current_table_cell_index(&pipes, rel_caret).unwrap_or(0);
+        if cell_idx + 1 < cols {
+            let p_start = pipes[cell_idx + 1];
+            let p_end = pipes[cell_idx + 2];
+            let cell_slice = &line[p_start + 1..p_end];
+            let target_rel = p_start + 1 + table_cell_caret_offset(cell_slice);
+            *self.selection = Selection::caret(line_start + target_rel);
+            return;
+        }
+        let nl = detect_line_ending_str(full, self.preferred_line_ending);
+        let insert_pos = table_row_insert_pos(full, line_start, line_end);
+        let empty_row = build_empty_table_row(cols);
+        let insertion = format!("{nl}{empty_row}");
+        let sel_before = *self.selection;
+        let sel_after = Selection::caret(insert_pos + nl.len() + 2);
+        self.undo.apply_edit(
+            self.buffer,
+            ByteRange::empty(insert_pos),
+            &insertion,
+            sel_before,
+            sel_after,
+            EditKind::Structural,
+        );
+        *self.selection = sel_after;
+    }
+
+    fn shift_tab_in_gfm_table(&mut self, full: &str, ctx: &GfmTableContext) {
+        let row = &ctx.rows[ctx.row_idx];
+        let Some(cell_idx) = cell_index_for_offset(row, self.selection.head) else {
+            return;
+        };
+        if cell_idx > 0 {
+            let target = cell_target_caret_offset(full, &row.cells[cell_idx - 1]);
+            *self.selection = Selection::caret(target);
+            return;
+        }
+        if let Some(prev_row) = ctx
+            .rows[..ctx.row_idx]
+            .iter()
+            .rev()
+            .find(|r| !r.is_delimiter && !r.cells.is_empty())
+        {
+            let target_col = ctx.delim_cols.saturating_sub(1).min(prev_row.cells.len() - 1);
+            let target = cell_target_caret_offset(full, &prev_row.cells[target_col]);
+            *self.selection = Selection::caret(target);
+        }
+    }
+
+    fn table_cell_selection_range_at(
+        &self,
+        line_start: ByteOffset,
+        content_end: ByteOffset,
+    ) -> Option<ByteRange> {
         let full = self.buffer.to_string();
-        if line_start > 0 {
-            let before = &full[..line_start - 1];
-            let prev_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-            let prev_line = before[prev_start..].trim_end_matches('\r').trim();
-            if prev_line.starts_with('|') && prev_line.ends_with('|') {
-                return true;
+        if let Some(ctx) = find_enclosing_gfm_table_at(&full, line_start) {
+            let row = &ctx.rows[ctx.row_idx];
+            if let Some(cell_idx) = cell_index_for_offset(row, self.selection.head) {
+                let raw_range = row.cells[cell_idx].raw_range;
+                let raw_cell = &full[raw_range.start..raw_range.end];
+                let trim_l = raw_cell.len() - raw_cell.trim_start().len();
+                let trim_r = raw_cell.len() - raw_cell.trim_end().len();
+                let inner_start = (raw_range.start + trim_l).min(raw_range.end);
+                let inner_end = raw_range.end.saturating_sub(trim_r).max(inner_start);
+                return Some(ByteRange::new(inner_start, inner_end));
+            }
+            return Some(ByteRange::new(line_start, content_end));
+        }
+        let line = self.buffer.slice_to_string(ByteRange::new(line_start, content_end));
+        if is_standalone_piped_header(&line) {
+            let pipes = unescaped_pipe_offsets(&line);
+            let rel_caret = self.selection.head.saturating_sub(line_start);
+            if let Some(cell_idx) = current_table_cell_index(&pipes, rel_caret) {
+                let c_start = line_start + pipes[cell_idx] + 1;
+                let c_end = line_start + pipes[cell_idx + 1];
+                let raw_cell = self.buffer.slice_to_string(ByteRange::new(c_start, c_end));
+                let trim_l = raw_cell.len() - raw_cell.trim_start().len();
+                let trim_r = raw_cell.len() - raw_cell.trim_end().len();
+                let inner_start = (c_start + trim_l).min(c_end);
+                let inner_end = c_end.saturating_sub(trim_r).max(inner_start);
+                return Some(ByteRange::new(inner_start, inner_end));
             }
         }
-        if line_end < full.len() {
-            let after = &full[line_end + 1..];
-            let next_len = after.find('\n').unwrap_or(after.len());
-            let next_line = after[..next_len].trim_end_matches('\r').trim();
-            if next_line.starts_with('|') && next_line.ends_with('|') {
-                return true;
-            }
-        }
-        false
+        None
     }
 
     fn enclosing_fenced_code_block_body_range(
@@ -1635,10 +1698,15 @@ impl EditorContext<'_> {
         self.enclosing_fenced_code_block(target_line_start).is_some()
     }
 
-    fn is_caret_in_table_row(&self) -> bool {
-        let (start, end) = self.current_line_bounds();
-        let line = self.buffer.slice_to_string(ByteRange::new(start, end));
-        line.trim().starts_with('|') && line.trim().ends_with('|')
+    fn is_caret_in_gfm_table_or_piped_row(&self, line_start: ByteOffset) -> bool {
+        let full = self.buffer.to_string();
+        if find_enclosing_gfm_table_at(&full, line_start).is_some() {
+            return true;
+        }
+        let (_, content_end, _) = self.current_line_content_bounds();
+        let line = &full[line_start..content_end];
+        let trimmed = line.trim();
+        trimmed.starts_with('|') && trimmed.ends_with('|')
     }
 
     fn enclosing_empty_code_fence_range(&self, empty_line_start: ByteOffset) -> Option<ByteRange> {
@@ -2243,23 +2311,6 @@ fn list_prefix_parts(line: &str) -> Option<(usize, usize)> {
     ordered_list_prefix(line).map(|(indent, marker_len, _, _)| (indent, marker_len))
 }
 
-fn unescaped_pipe_offsets(line: &str) -> Vec<usize> {
-    let bytes = line.as_bytes();
-    let mut pipes = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            i += 2;
-            continue;
-        }
-        if bytes[i] == b'|' {
-            pipes.push(i);
-        }
-        i += 1;
-    }
-    pipes
-}
-
 fn current_table_cell_index(pipes: &[usize], rel_caret: usize) -> Option<usize> {
     if pipes.len() < 2 {
         return None;
@@ -2274,6 +2325,31 @@ fn current_table_cell_index(pipes: &[usize], rel_caret: usize) -> Option<usize> 
     } else {
         Some(pipes.len() - 2)
     }
+}
+
+fn cell_index_for_offset(row: &TableRowParsed, offset: ByteOffset) -> Option<usize> {
+    if row.cells.is_empty() {
+        return None;
+    }
+    for (idx, cell) in row.cells.iter().enumerate() {
+        if offset <= cell.raw_range.end {
+            return Some(idx);
+        }
+    }
+    Some(row.cells.len() - 1)
+}
+
+fn cell_target_caret_offset(source: &str, cell: &TableCellSpan) -> ByteOffset {
+    let raw = &source[cell.raw_range.start..cell.raw_range.end];
+    cell.raw_range.start + table_cell_caret_offset(raw)
+}
+
+fn is_standalone_piped_header(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|')
+        && trimmed.ends_with('|')
+        && unescaped_pipe_offsets(line).len() >= 2
+        && parse_table_delimiter_alignments(line, &[]).is_none()
 }
 
 fn build_empty_table_row(cols: usize) -> String {
@@ -2294,101 +2370,40 @@ fn build_table_separator_row(cols: usize) -> String {
     out
 }
 
-fn is_table_delimiter_row(line: &str) -> bool {
-    let pipes = unescaped_pipe_offsets(line);
-    if pipes.len() < 2 {
-        return false;
-    }
-    for idx in 0..pipes.len() - 1 {
-        let cell = line[pipes[idx] + 1..pipes[idx + 1]].trim();
-        let after_left = cell.strip_prefix(':').unwrap_or(cell);
-        let dashes = after_left.strip_suffix(':').unwrap_or(after_left);
-        if dashes.is_empty() || !dashes.bytes().all(|b| b == b'-') {
-            return false;
-        }
-    }
-    true
-}
-
-fn find_enclosing_table_range(source: &str, current_line_start: ByteOffset) -> Option<ByteRange> {
-    let bytes = source.as_bytes();
-    let mut lines: Vec<(ByteOffset, ByteOffset)> = Vec::new();
-    let mut pos = 0usize;
-    let mut current_idx = None;
-
-    while pos < bytes.len() {
-        let l_start = pos;
-        let mut l_end = pos;
-        while l_end < bytes.len() && bytes[l_end] != b'\n' {
-            l_end += 1;
-        }
-        if l_start == current_line_start {
-            current_idx = Some(lines.len());
-        }
-        lines.push((l_start, l_end));
-        pos = if l_end < bytes.len() { l_end + 1 } else { l_end };
-    }
-
-    let idx = current_idx?;
-    let is_tbl_line = |(s, e): (ByteOffset, ByteOffset)| -> bool {
-        let l = source[s..e].trim_end_matches('\r').trim();
-        l.starts_with('|') && l.ends_with('|') && unescaped_pipe_offsets(l).len() >= 2
-    };
-    if !is_tbl_line(lines[idx]) {
-        return None;
-    }
-
-    let mut first = idx;
-    while first > 0 && is_tbl_line(lines[first - 1]) {
-        first -= 1;
-    }
-    let mut last = idx;
-    while last + 1 < lines.len() && is_tbl_line(lines[last + 1]) {
-        last += 1;
-    }
-    Some(ByteRange::new(lines[first].0, lines[last].1))
-}
-
-fn format_markdown_table(raw_table: &str) -> String {
-    let raw_lines: Vec<&str> = raw_table.split('\n').collect();
-    let mut parsed_rows: Vec<(bool, Vec<String>)> = Vec::with_capacity(raw_lines.len());
-    let mut max_cols = 0usize;
-
-    for raw_line in &raw_lines {
-        let trimmed_cr = raw_line.trim_end_matches('\r');
-        let pipes = unescaped_pipe_offsets(trimmed_cr);
-        let is_delim = is_table_delimiter_row(trimmed_cr);
-        let mut cells = Vec::new();
-        for i in 0..pipes.len().saturating_sub(1) {
-            let cell = trimmed_cr[pipes[i] + 1..pipes[i + 1]].trim().to_string();
-            cells.push(cell);
-        }
-        max_cols = max_cols.max(cells.len());
-        parsed_rows.push((is_delim, cells));
-    }
-
-    if max_cols == 0 {
+/// Format a GFM table using the delimiter row's canonical column count (`ctx.delim_cols`).
+///
+/// Header and delimiter rows stay fixed at `delim_cols` so alignment never changes GFM table
+/// semantics or HTML export; short body rows pad to `delim_cols`, and excess body cells past
+/// `delim_cols` are preserved verbatim (trimmed) after the canonical columns to prevent data loss.
+fn format_gfm_table(raw_table: &str, full_source: &str, ctx: &GfmTableContext) -> String {
+    let delim_cols = ctx.delim_cols;
+    if delim_cols == 0 || ctx.rows.len() < 2 {
         return raw_table.to_string();
     }
 
-    let mut col_widths = vec![3usize; max_cols];
-    for (is_delim, cells) in &parsed_rows {
-        if *is_delim {
+    let mut col_widths = vec![3usize; delim_cols];
+    for row in &ctx.rows {
+        if row.is_delimiter {
             continue;
         }
-        for (col, cell) in cells.iter().enumerate() {
-            col_widths[col] = col_widths[col].max(cell.chars().count());
+        for (col, cell) in row.cells.iter().take(delim_cols).enumerate() {
+            let trimmed = full_source[cell.raw_range.start..cell.raw_range.end].trim();
+            col_widths[col] = col_widths[col].max(trimmed.chars().count());
         }
     }
 
-    let mut formatted_lines = Vec::with_capacity(raw_lines.len());
-    for (row_idx, (is_delim, cells)) in parsed_rows.iter().enumerate() {
-        let has_cr = raw_lines[row_idx].ends_with('\r');
+    let mut formatted_lines = Vec::with_capacity(ctx.rows.len());
+    for row in &ctx.rows {
+        let has_cr = row.line_range.end < ctx.range.end
+            && full_source.as_bytes().get(row.line_range.end) == Some(&b'\r');
         let mut row_str = String::from("|");
-        for col in 0..max_cols {
-            let width = col_widths[col];
-            let cell = cells.get(col).map(|s| s.as_str()).unwrap_or("");
-            if *is_delim {
+        for (col, &width) in col_widths.iter().enumerate() {
+            let cell = row
+                .cells
+                .get(col)
+                .map(|c| full_source[c.raw_range.start..c.raw_range.end].trim())
+                .unwrap_or("");
+            if row.is_delimiter {
                 let left_colon = cell.starts_with(':');
                 let right_colon = cell.ends_with(':');
                 let dash_count = width
@@ -2416,6 +2431,14 @@ fn format_markdown_table(raw_table: &str) -> String {
                 row_str.push_str(" |");
             }
         }
+        if !row.is_delimiter && row.cells.len() > delim_cols {
+            for extra in &row.cells[delim_cols..] {
+                let trimmed = full_source[extra.raw_range.start..extra.raw_range.end].trim();
+                row_str.push(' ');
+                row_str.push_str(trimmed);
+                row_str.push_str(" |");
+            }
+        }
         if has_cr {
             row_str.push('\r');
         }
@@ -2423,6 +2446,71 @@ fn format_markdown_table(raw_table: &str) -> String {
     }
 
     formatted_lines.join("\n")
+}
+
+/// Escape backslash and square brackets in Markdown inline link text `[label](...)`.
+fn escape_markdown_link_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(ch, '\\' | '[' | ']') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Return true if parentheses in `s` are unbalanced.
+fn has_unbalanced_parens(s: &str) -> bool {
+    let mut depth = 0usize;
+    for ch in s.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    depth != 0
+}
+
+/// Format a Markdown link destination per CommonMark §6.4.
+///
+/// Strips line breaks/control characters (illegal inside link destinations). If the
+/// destination contains whitespace, wraps it in `<...>` and escapes `\`, `<`, `>`, `(`, `)`.
+/// Otherwise escapes `\`, `<`, `>`, plus `(`, `)` when parentheses are unbalanced.
+fn format_markdown_link_destination(raw_url: &str) -> String {
+    let sanitized: String = raw_url
+        .chars()
+        .filter(|&c| !c.is_control() || c == '\t')
+        .collect();
+    let has_ws = sanitized.chars().any(char::is_whitespace);
+    if has_ws {
+        let mut out = String::with_capacity(sanitized.len() + 2);
+        out.push('<');
+        for ch in sanitized.chars() {
+            if matches!(ch, '\\' | '<' | '>' | '(' | ')') {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out.push('>');
+        out
+    } else {
+        let escape_parens = has_unbalanced_parens(&sanitized);
+        let mut out = String::with_capacity(sanitized.len());
+        for ch in sanitized.chars() {
+            if matches!(ch, '\\' | '<' | '>') || (escape_parens && matches!(ch, '(' | ')')) {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -3322,6 +3410,234 @@ mod tests {
         link.set_caret(6); // `\r|\n` midpoint
         link.insert_link("https://example.com\n");
         assert_strict_crlf(&link.buffer.to_string());
-        assert_eq!(link.buffer.to_string(), "click[](https://example.com\r\n)\r\nhere");
+        // Line breaks are illegal inside CommonMark destinations and are sanitized while keeping CRLF intact.
+        assert_eq!(link.buffer.to_string(), "click[](https://example.com)\r\nhere");
+
+        // Selecting up to `\r|\n` midpoint snaps back to before `\r\n` without splitting CRLF.
+        let mut link_sel = EditorController::from_str("click\r\nhere");
+        link_sel.set_selection(0, 6); // "click\r|" midpoint
+        link_sel.insert_link("https://example.com");
+        assert_strict_crlf(&link_sel.buffer.to_string());
+        assert_eq!(
+            link_sel.buffer.to_string(),
+            "[click](https://example.com)\r\nhere"
+        );
+    }
+
+    #[test]
+    fn test_align_table_preserves_canonical_delimiter_cols_and_body_overflow() {
+        // Defect #2: 2-col delimiter with 3-cell body row keeps header & delimiter at 2 cols
+        // while preserving trailing body cell "3" without changing GFM table column count.
+        let mut ed = EditorController::from_str("| a | b |\n| - | - |\n| 1 | 2 | 3 |\n");
+        let caret_in_body = ed.buffer.to_string().find('1').unwrap();
+        ed.set_caret(caret_in_body);
+        assert!(ed.align_current_table());
+        assert_eq!(
+            ed.buffer.to_string(),
+            "| a   | b   |\n| --- | --- |\n| 1   | 2   | 3 |\n"
+        );
+        // Aligning again is idempotent and returns false.
+        assert!(!ed.align_current_table());
+        // Single undo restores unaligned source.
+        ed.undo();
+        assert_eq!(ed.buffer.to_string(), "| a | b |\n| - | - |\n| 1 | 2 | 3 |\n");
+
+        // Short body row pads to canonical delim_cols (3).
+        let mut short_ed = EditorController::from_str("| a | b | c |\n| - | - | - |\n| 1 |\n");
+        short_ed.set_caret(short_ed.buffer.to_string().find('1').unwrap());
+        assert!(short_ed.align_current_table());
+        assert_eq!(
+            short_ed.buffer.to_string(),
+            "| a   | b   | c   |\n| --- | --- | --- |\n| 1   |     |     |\n"
+        );
+
+        // Outer-pipe-optional GFM table is aligned properly; body row with `| - | - |` stays data row.
+        let mut no_outer = EditorController::from_str("a | b\n:--- | ---:\n1 | 2");
+        no_outer.set_caret(1);
+        assert!(no_outer.align_current_table());
+        assert_eq!(
+            no_outer.buffer.to_string(),
+            "| a   | b   |\n| :-- | --: |\n| 1   | 2   |"
+        );
+
+        let mut dash_body = EditorController::from_str("| a | b |\n| - | - |\n| - | - |");
+        dash_body.set_caret(dash_body.buffer.to_string().rfind('-').unwrap());
+        assert!(dash_body.align_current_table());
+        assert_eq!(
+            dash_body.buffer.to_string(),
+            "| a   | b   |\n| --- | --- |\n| -   | -   |"
+        );
+
+        // Preceding prose containing `|` must not swallow or break the following table.
+        let mut prefixed = EditorController::from_str("foo | bar\n| a | b |\n| - | - |\n| 1 | 2 |");
+        prefixed.set_caret(2); // inside "foo | bar"
+        assert!(!prefixed.align_current_table());
+        prefixed.set_caret(prefixed.buffer.to_string().find('1').unwrap());
+        assert!(prefixed.align_current_table());
+        assert_eq!(
+            prefixed.buffer.to_string(),
+            "foo | bar\n| a   | b   |\n| --- | --- |\n| 1   | 2   |"
+        );
+
+        // CRLF table alignment preserves strict CRLF without bare LF.
+        let mut crlf = EditorController::from_str("| a | b |\r\n| - | - |\r\n| 1 | 2 | 3 |\r\n");
+        crlf.set_caret(crlf.buffer.to_string().find('2').unwrap());
+        assert!(crlf.align_current_table());
+        assert_strict_crlf(&crlf.buffer.to_string());
+        assert_eq!(
+            crlf.buffer.to_string(),
+            "| a   | b   |\r\n| --- | --- |\r\n| 1   | 2   | 3 |\r\n"
+        );
+    }
+
+    #[test]
+    fn test_short_and_wide_table_rows_tab_shift_tab_enter_use_delimiter_cols() {
+        // Defect #3: Short 1-cell body row in a 3-col table: Tab pads and advances to col 2
+        // on the SAME line rather than jumping out / creating a 1-col row.
+        let mut ed = EditorController::from_str("| a | b | c |\n| - | - | - |\n| 1 |\n");
+        let pos_1 = ed.buffer.to_string().find('1').unwrap();
+        ed.set_caret(pos_1);
+
+        ed.tab();
+        assert_eq!(ed.buffer.to_string(), "| a | b | c |\n| - | - | - |\n| 1 |  |  |\n");
+        ed.insert_char('2');
+        assert_eq!(ed.buffer.to_string(), "| a | b | c |\n| - | - | - |\n| 1 | 2 |  |\n");
+
+        ed.tab();
+        ed.insert_char('3');
+        assert_eq!(ed.buffer.to_string(), "| a | b | c |\n| - | - | - |\n| 1 | 2 | 3 |\n");
+
+        // Tab at last canonical column appends a canonical 3-col empty row.
+        ed.tab();
+        assert_eq!(
+            ed.buffer.to_string(),
+            "| a | b | c |\n| - | - | - |\n| 1 | 2 | 3 |\n|  |  |  |\n"
+        );
+        ed.insert_char('x');
+        assert_eq!(
+            ed.buffer.to_string(),
+            "| a | b | c |\n| - | - | - |\n| 1 | 2 | 3 |\n| x |  |  |\n"
+        );
+
+        // Shift+Tab walks backward across rows and skips delimiter row 1 to land in header col 3 ("c").
+        ed.shift_tab(); // -> row 2 col 3 (caret at start of "3")
+        ed.insert_char('!');
+        assert!(ed.buffer.to_string().contains("| 1 | 2 | !3 |"));
+        ed.shift_tab(); // -> row 2 col 2
+        ed.shift_tab(); // -> row 2 col 1
+        ed.shift_tab(); // -> skips delimiter row 1 -> header col 3 (caret at start of "c")
+        ed.insert_char('?');
+        assert!(ed.buffer.to_string().starts_with("| a | b | ?c |"));
+
+        // Undo reverts padding edit cleanly on short row without trailing pipe.
+        let mut no_tail = EditorController::from_str("| a | b | c |\n| - | - | - |\n| 1");
+        no_tail.set_caret(no_tail.buffer.len_bytes());
+        no_tail.tab();
+        assert_eq!(
+            no_tail.buffer.to_string(),
+            "| a | b | c |\n| - | - | - |\n| 1 |  |  |"
+        );
+        no_tail.insert_char('2');
+        assert_eq!(
+            no_tail.buffer.to_string(),
+            "| a | b | c |\n| - | - | - |\n| 1 | 2 |  |"
+        );
+        no_tail.undo();
+        no_tail.undo();
+        assert_eq!(no_tail.buffer.to_string(), "| a | b | c |\n| - | - | - |\n| 1");
+
+        // Enter in short row (3-col table) inserts 3-col empty row; Enter in wide row (2-col table)
+        // inserts 2-col empty row; Enter in header inserts below delimiter row.
+        let mut enter_short = EditorController::from_str("| a | b | c |\n| - | - | - |\n| 1 |");
+        enter_short.set_caret(enter_short.buffer.to_string().find('1').unwrap());
+        enter_short.enter();
+        assert_eq!(
+            enter_short.buffer.to_string(),
+            "| a | b | c |\n| - | - | - |\n| 1 |\n|  |  |  |"
+        );
+
+        let mut enter_wide = EditorController::from_str("| a | b |\n| - | - |\n| 1 | 2 | 3 |");
+        enter_wide.set_caret(enter_wide.buffer.to_string().find('3').unwrap());
+        enter_wide.enter();
+        assert_eq!(
+            enter_wide.buffer.to_string(),
+            "| a | b |\n| - | - |\n| 1 | 2 | 3 |\n|  |  |"
+        );
+
+        let mut enter_hdr = EditorController::from_str("| a | b |\n| - | - |\n| 1 | 2 |");
+        enter_hdr.set_caret(2); // inside header cell "a"
+        enter_hdr.enter();
+        assert_eq!(
+            enter_hdr.buffer.to_string(),
+            "| a | b |\n| - | - |\n|  |  |\n| 1 | 2 |"
+        );
+
+        // CRLF short row Tab + Enter preserve CRLF strictly.
+        let mut crlf = EditorController::from_str("| a | b | c |\r\n| - | - | - |\r\n| 1 |\r\n");
+        crlf.set_caret(crlf.buffer.to_string().find('1').unwrap());
+        crlf.tab();
+        assert_strict_crlf(&crlf.buffer.to_string());
+        assert_eq!(
+            crlf.buffer.to_string(),
+            "| a | b | c |\r\n| - | - | - |\r\n| 1 |  |  |\r\n"
+        );
+        crlf.enter();
+        assert_strict_crlf(&crlf.buffer.to_string());
+        assert_eq!(
+            crlf.buffer.to_string(),
+            "| a | b | c |\r\n| - | - | - |\r\n| 1 |  |  |\r\n|  |  |  |\r\n"
+        );
+    }
+
+    #[test]
+    fn test_insert_link_escapes_text_and_destinations_for_commonmark() {
+        // 1. Selected label containing `[`, `]`, `\`
+        let mut ed = EditorController::from_str("a]b[c\\d");
+        ed.set_selection(0, ed.buffer.len_bytes());
+        ed.insert_link("https://example.com");
+        assert_eq!(
+            ed.buffer.to_string(),
+            "[a\\]b\\[c\\\\d](https://example.com)"
+        );
+
+        // 2. Destination containing whitespace wraps in `<...>` and escapes `\`, `<`, `>`, `(`, `)`
+        let mut ws = EditorController::from_str("text");
+        ws.set_selection(0, 4);
+        ws.insert_link("http://example.com/a b");
+        assert_eq!(ws.buffer.to_string(), "[text](<http://example.com/a b>)");
+
+        let mut ws_win = EditorController::from_str("doc");
+        ws_win.set_selection(0, 3);
+        ws_win.insert_link(r"C:\My Docs\a>b\");
+        assert_eq!(
+            ws_win.buffer.to_string(),
+            r"[doc](<C:\\My Docs\\a\>b\\>)"
+        );
+
+        // 3. Destination with unbalanced parens escapes `(`, `)` cleanly without breaking `)`
+        let mut lp = EditorController::from_str("text");
+        lp.set_selection(0, 4);
+        lp.insert_link("http://example.com/a(b");
+        assert_eq!(lp.buffer.to_string(), r"[text](http://example.com/a\(b)");
+
+        let mut rp = EditorController::from_str("text");
+        rp.set_selection(0, 4);
+        rp.insert_link("http://example.com/a)");
+        assert_eq!(rp.buffer.to_string(), r"[text](http://example.com/a\))");
+
+        // 4. Balanced parens stay readable without redundant escaping
+        let mut bal = EditorController::from_str("Rust");
+        bal.set_selection(0, 4);
+        bal.insert_link("https://en.wikipedia.org/wiki/Rust_(programming_language)");
+        assert_eq!(
+            bal.buffer.to_string(),
+            "[Rust](https://en.wikipedia.org/wiki/Rust_(programming_language))"
+        );
+
+        // 5. Backslashes in bare destination are escaped so trailing `\` or `\b` is preserved
+        let mut bs = EditorController::from_str("text");
+        bs.set_selection(0, 4);
+        bs.insert_link(r"http://example.com/a\b\");
+        assert_eq!(bs.buffer.to_string(), r"[text](http://example.com/a\\b\\)");
     }
 }
