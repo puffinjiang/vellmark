@@ -14,7 +14,7 @@ use vellmark_core::{
     EditorAction, EncodingDecision, ExternalSyncResult, FindMatch, FindOptions, SaveOutcome,
     Selection, ViewMode,
 };
-use vellmark_parser::{OutlineItem, active_outline_index};
+use vellmark_parser::{BlockKind, OutlineItem, active_outline_index, parse_table_block};
 use vellmark_render::{
     DrawList, EditorHitTarget, EditorSceneResult, EditorViewport, Rect, ResolvedThemeStyle,
     SceneRect, ShapedDocumentCache, shape_ui_text_into,
@@ -29,7 +29,7 @@ use winit::window::{CursorIcon, Theme as WindowTheme, Window, WindowAttributes, 
 
 use crate::clipboard::{ClipboardBackend, NativeClipboard};
 use crate::gpu::WgpuRenderer;
-use crate::workbench::{AppWorkbench, WorkbenchRuntimeEvent};
+use crate::workbench::{AppWorkbench, DocumentTab, WorkbenchRuntimeEvent};
 
 const TAB_BAR_H: f32 = 36.0;
 const STATUS_BAR_H: f32 = 26.0;
@@ -191,6 +191,11 @@ Welcome to **Vellmark M0**! Move your cursor inside any formatted element like *
 3. `Cmd/Ctrl + B / I / E` — Toggle Bold / Italic / Inline Code\n\
 4. `Cmd/Ctrl + \\` — Toggle Sidebar (Files & Outline)\n\
 5. `Cmd/Ctrl + + / - / 0` — Zoom in / out / reset\n\
+\n\
+| Feature | Shortcut / Syntax | Status |\n\
+| :--- | :---: | ---: |\n\
+| Bold & Italic | `**bold**` / `*italic*` | **Ready** |\n\
+| Live Table Grid | `Tab` / `Enter` in cells | **Ready** |\n\
 \n\
 ```rust\n\
 fn hello_vellmark() {\n\
@@ -2988,7 +2993,7 @@ impl GuiController {
         if let Some(tab) = self.workbench.active_tab_mut() {
             let sel = tab.view.selection;
             let total = tab.session.buffer.len_bytes();
-            let target = if !extend && !sel.is_caret() {
+            let raw_target = if !extend && !sel.is_caret() {
                 if dir < 0 {
                     sel.range().start
                 } else {
@@ -3022,6 +3027,11 @@ impl GuiController {
                     }
                 }
             };
+            let target = if !extend && tab.view.mode == ViewMode::Wysiwyg {
+                Self::skip_wysiwyg_table_delimiter(tab, raw_target, dir, sel.head)
+            } else {
+                raw_target
+            };
             let _ = tab.edit(|ctx| {
                 if extend {
                     ctx.set_selection(sel.anchor, target);
@@ -3031,6 +3041,61 @@ impl GuiController {
             });
             self.pending_scroll_ensure_caret = true;
         }
+    }
+
+    fn skip_wysiwyg_table_delimiter(
+        tab: &DocumentTab,
+        target: usize,
+        dir: i32,
+        prev_head: usize,
+    ) -> usize {
+        let source = tab.session.buffer.to_string();
+        tab.with_incremental_blocks(|blocks| {
+            let idx = blocks.partition_point(|b| b.range.end < target);
+            let Some(block) = blocks.get(idx) else {
+                return target;
+            };
+            if !matches!(block.kind, BlockKind::Table) {
+                return target;
+            }
+            let rows = parse_table_block(&source, block.range);
+            if rows.len() < 2 || !rows[1].is_delimiter {
+                return target;
+            }
+            let delim = &rows[1].line_range;
+            if target < delim.start || target > delim.end {
+                return target;
+            }
+            let header_end = rows[0]
+                .cells
+                .last()
+                .map(|c| c.content_range.end)
+                .unwrap_or(rows[0].line_range.end);
+            if dir < 0 {
+                return header_end;
+            }
+            if let Some(body0) = rows.get(2) {
+                return body0
+                    .cells
+                    .first()
+                    .map(|c| c.content_range.start)
+                    .unwrap_or(body0.line_range.start);
+            }
+            // Two-row table (header + delimiter only): step to the following line if present,
+            // otherwise keep caret out of the hidden delimiter row.
+            let total = source.len();
+            if delim.end < total {
+                let mut after = delim.end;
+                if source.as_bytes().get(after) == Some(&b'\r') {
+                    after += 1;
+                }
+                if source.as_bytes().get(after) == Some(&b'\n') {
+                    after += 1;
+                }
+                return after.min(total);
+            }
+            prev_head.min(rows[0].line_range.end)
+        })
     }
 
     fn move_caret_line_edge(&mut self, to_start: bool, extend: bool) {
@@ -4560,6 +4625,35 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(fs::read(&single_eol).unwrap(), b"A\r\nB");
+
+        // Horizontal caret movement in WYSIWYG skips collapsed table delimiter row cleanly (CRLF & LF)
+        let tbl_doc = dir.join("tbl_nav.md");
+        fs::write(&tbl_doc, b"| H1 | H2 |\r\n| --- | --- |\r\n| B1 | B2 |").unwrap();
+        gui.workbench.open_document(&tbl_doc).unwrap();
+        let hdr_end = "| H1 | H2 |".len();
+        let b1_start = "| H1 | H2 |\r\n| --- | --- |\r\n| ".len();
+        let body_row_start = "| H1 | H2 |\r\n| --- | --- |\r\n".len();
+        let h2_content_end = "| H1 | H2".len();
+        gui.workbench
+            .active_tab_mut()
+            .unwrap()
+            .edit(|ctx| ctx.set_caret(hdr_end))
+            .unwrap();
+        gui.move_caret_horizontal(1, false);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().view.selection.head,
+            b1_start
+        );
+        gui.workbench
+            .active_tab_mut()
+            .unwrap()
+            .edit(|ctx| ctx.set_caret(body_row_start))
+            .unwrap();
+        gui.move_caret_horizontal(-1, false);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().view.selection.head,
+            h2_content_end
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

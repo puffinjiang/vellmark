@@ -22,7 +22,7 @@ pub use editor::{
 };
 pub use encoding::{
     DetectedEncoding, EncodingDecision, EncodingError, FileFormatMeta, LineEnding,
-    detect_and_decode, encode_for_save,
+    detect_and_decode, encode_for_save, normalize_line_endings,
 };
 pub use recovery_history::{
     DEFAULT_BACKUP_MAX_AGE_SECS, DEFAULT_MAX_BACKUPS_PER_FILE, DEFAULT_MAX_TOTAL_HISTORY_BYTES,

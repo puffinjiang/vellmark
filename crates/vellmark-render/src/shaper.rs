@@ -6,11 +6,11 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use cosmic_text::{
-    Attrs, Buffer as CosmicBuffer, CacheKey, CacheMetrics, Cursor, Family, FontSystem, Metrics,
-    Shaping, Style as FontStyle, Weight, Wrap,
+    Align, Attrs, Buffer as CosmicBuffer, CacheKey, CacheMetrics, Cursor, Family, FontSystem,
+    Metrics, Shaping, Style as FontStyle, Weight, Wrap,
 };
 use vellmark_core::{ByteOffset, ByteRange, EditorViewState, Selection, ViewMode};
-use vellmark_parser::{BlockKind, BlockNode, InlineKind};
+use vellmark_parser::{parse_table_block, BlockKind, BlockNode, InlineKind, InlineSpan, TableAlign};
 
 use crate::style::{ResolvedThemeStyle, RgbaColor};
 
@@ -340,8 +340,61 @@ struct CachedBlockShape {
     inline_code_rects: Vec<Rect>,
 }
 
+struct TableCellDisplay {
+    rel_raw_range: ByteRange,
+    rel_src_range: ByteRange,
+    align: TableAlign,
+    is_placeholder: bool,
+    map: VisualTextMap,
+    spans: Vec<DisplaySpanStyle>,
+    default_weight: u16,
+}
+
+struct TableRowDisplay {
+    line_range_rel: ByteRange,
+    is_header: bool,
+    is_delimiter: bool,
+    cells: Vec<TableCellDisplay>,
+}
+
+struct TableCellShape {
+    x_rel: f32,
+    w: f32,
+    text_x_rel: f32,
+    inner_w: f32,
+    rel_raw_range: ByteRange,
+    rel_src_range: ByteRange,
+    align: TableAlign,
+    is_placeholder: bool,
+    buffer: CosmicBuffer,
+    map: VisualTextMap,
+    spans: Vec<DisplaySpanStyle>,
+    inline_code_rects: Vec<Rect>,
+}
+
+struct TableRowShape {
+    y_rel: f32,
+    h: f32,
+    is_header: bool,
+    is_delimiter: bool,
+    line_range_rel: ByteRange,
+    cells: Vec<TableCellShape>,
+}
+
+struct CachedTableShape {
+    last_used_frame: u64,
+    table_w: f32,
+    table_h: f32,
+    top_pad_px: f32,
+    cell_pad_y: f32,
+    col_widths: Vec<f32>,
+    rows: Vec<TableRowShape>,
+    total_height: f32,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct HitBlockRecord {
+    is_table: bool,
     shape_hash: u64,
     row_rect: Rect,
     text_origin_x: f32,
@@ -355,6 +408,7 @@ struct HitBlockRecord {
 pub struct ShapedDocumentCache {
     font_system: FontSystem,
     shaped_lru: HashMap<u64, CachedBlockShape>,
+    table_lru: HashMap<u64, CachedTableShape>,
     frame_seq: u64,
     /// Persistent per-block layout state so 10 MB docs only recompute prefix Y on real edits.
     cached_rev: u64,
@@ -372,6 +426,7 @@ pub struct ShapedDocumentCache {
 }
 
 const MAX_SHAPED_BLOCK_CACHE: usize = 512;
+const MAX_SHAPED_TABLE_CACHE: usize = 128;
 
 impl Default for ShapedDocumentCache {
     fn default() -> Self {
@@ -384,6 +439,7 @@ impl ShapedDocumentCache {
         Self {
             font_system: FontSystem::new(),
             shaped_lru: HashMap::with_capacity(256),
+            table_lru: HashMap::with_capacity(32),
             frame_seq: 0,
             cached_rev: u64::MAX,
             cached_width_bits: 0,
@@ -542,6 +598,96 @@ impl ShapedDocumentCache {
             let raw_text = read_slice(node.range);
             let block_focused = node.range.contains_inclusive(exp_sel.head);
 
+            if matches!(node.kind, BlockKind::Table) && vp.view.mode != ViewMode::Source {
+                if let Some(table_display) = build_table_display(
+                    node,
+                    &raw_text,
+                    vp.view,
+                    exp_sel,
+                    style,
+                    block_focused,
+                    vp.focus_mode,
+                ) {
+                    let avail_table_w = (vp.content_width_px - 8.0).max(120.0);
+                    let table_key = shape_table_cache_key(
+                        &table_display,
+                        avail_table_w,
+                        style_sig,
+                        block_focused,
+                        vp.focus_mode,
+                    );
+                    let frame_seq = self.frame_seq;
+                    if let Some(cached) = self.table_lru.get_mut(&table_key) {
+                        cached.last_used_frame = frame_seq;
+                    } else {
+                        let shaped = shape_table_block(
+                            &mut self.font_system,
+                            table_display,
+                            avail_table_w,
+                            style,
+                            frame_seq,
+                        );
+                        if self.table_lru.len() >= MAX_SHAPED_TABLE_CACHE {
+                            evict_oldest_table_lru(&mut self.table_lru);
+                        }
+                        self.table_lru.insert(table_key, shaped);
+                    }
+
+                    let table = self.table_lru.get(&table_key).expect("just inserted");
+                    let measured_h = table.total_height.max(style.base_line_height_px);
+                    update_block_height_metric(
+                        idx,
+                        block_y,
+                        measured_h,
+                        &mut self.block_ys,
+                        &mut self.block_heights,
+                        &mut y_cursor_shift,
+                        &mut any_height_changed,
+                        &mut first_changed_idx,
+                    );
+
+                    let screen_top_y = vp.doc_rect.y + block_y - vp.scroll_y;
+                    let table_left_x = vp.content_left_x + 4.0;
+                    let table_top_y = screen_top_y + table.top_pad_px;
+
+                    emit_table_scene(
+                        table,
+                        node,
+                        block_y,
+                        screen_top_y,
+                        table_left_x,
+                        table_top_y,
+                        caret_after_last_block,
+                        base_caret,
+                        sel,
+                        vp,
+                        style,
+                        block_focused,
+                        &mut draw,
+                        &mut caret_doc_y,
+                        &mut caret_line_height,
+                        &mut ime_cursor_area,
+                    );
+
+                    self.last_hit_blocks.push(HitBlockRecord {
+                        is_table: true,
+                        shape_hash: table_key,
+                        row_rect: Rect::new(
+                            vp.doc_rect.x,
+                            screen_top_y,
+                            vp.doc_rect.w,
+                            measured_h.max(style.base_line_height_px),
+                        ),
+                        text_origin_x: table_left_x,
+                        text_origin_y: table_top_y,
+                        checkbox_rect: None,
+                        block_range: node.range,
+                        src_end_fallback: node.range.end,
+                    });
+                    continue;
+                }
+            }
+
             let display = build_block_display(
                 node,
                 &raw_text,
@@ -572,19 +718,16 @@ impl ShapedDocumentCache {
 
             let shaped = self.shaped_lru.get(&key).expect("just inserted");
             let measured_h = shaped.total_height.max(style.base_line_height_px * 0.7);
-            let old_h = self.block_heights[idx];
-            if (measured_h - old_h).abs() > 0.5 {
-                let delta = measured_h - old_h;
-                self.block_heights[idx] = measured_h;
-                self.block_ys[idx] = block_y;
-                y_cursor_shift += delta;
-                if !any_height_changed {
-                    first_changed_idx = idx;
-                }
-                any_height_changed = true;
-            } else {
-                self.block_ys[idx] = block_y;
-            }
+            update_block_height_metric(
+                idx,
+                block_y,
+                measured_h,
+                &mut self.block_ys,
+                &mut self.block_heights,
+                &mut y_cursor_shift,
+                &mut any_height_changed,
+                &mut first_changed_idx,
+            );
 
             let screen_top_y = vp.doc_rect.y + block_y - vp.scroll_y;
             let text_origin_x = vp.content_left_x + shaped.display.left_indent_px;
@@ -681,150 +824,25 @@ impl ShapedDocumentCache {
                 }
             }
 
-            // Inline code pill backgrounds
-            for pill in &shaped.inline_code_rects {
-                draw.rects.push(
-                    SceneRect::rounded(pill.translate(text_origin_x, text_origin_y), style.inline_code_bg, 4.0)
-                        .with_clip(Some(vp.doc_rect)),
-                );
-            }
-
-            // Find match highlights intersecting this block
-            for m in vp.find_matches {
-                if m.end <= node.range.start || m.start >= node.range.end {
-                    continue;
-                }
-                let is_active = vp.active_find == Some(*m);
-                let color = if is_active {
-                    style.chrome.warning.with_alpha(120)
-                } else {
-                    style.chrome.warning.with_alpha(55)
-                };
-                emit_highlight_range(
-                    &shaped.buffer,
-                    &shaped.map,
-                    node.range.start,
-                    m.start.max(node.range.start),
-                    m.end.min(node.range.end),
-                    text_origin_x,
-                    text_origin_y,
-                    color,
-                    vp.doc_rect,
-                    &mut draw.rects,
-                );
-            }
-
-            // Selection highlight intersecting this block
-            let sel_range = sel.range();
-            if !sel_range.is_empty() && sel_range.end > node.range.start && sel_range.start <= node.range.end {
-                let s_start = sel_range.start.max(node.range.start);
-                let s_end = sel_range.end.min(node.range.end);
-                if s_start < s_end {
-                    emit_highlight_range(
-                        &shaped.buffer,
-                        &shaped.map,
-                        node.range.start,
-                        s_start,
-                        s_end,
-                        text_origin_x,
-                        text_origin_y,
-                        style.selection_bg,
-                        vp.doc_rect,
-                        &mut draw.rects,
-                    );
-                } else {
-                    // Selection spans entire empty line cleanly
-                    draw.rects.push(
-                        SceneRect::solid(
-                            Rect::new(text_origin_x, text_origin_y, 6.0, style.base_line_height_px),
-                            style.selection_bg,
-                        )
-                        .with_clip(Some(vp.doc_rect)),
-                    );
-                }
-            }
-
-            // IME preedit highlight + bottom underline
-            if let Some(pre_vis) = shaped.map.preedit_visual_range() {
-                if !pre_vis.is_empty() {
-                    let c0 = shaped.map.visual_to_line_col(pre_vis.start);
-                    let c1 = shaped.map.visual_to_line_col(pre_vis.end);
-                    for run in shaped.buffer.layout_runs() {
-                        for (hx, hw) in run.highlight(c0, c1) {
-                            let bg = Rect::new(
-                                text_origin_x + hx,
-                                text_origin_y + run.line_top,
-                                hw,
-                                run.line_height,
-                            );
-                            draw.rects.push(
-                                SceneRect::solid(bg, style.ime_preedit_bg).with_clip(Some(vp.doc_rect)),
-                            );
-                            let ul = Rect::new(
-                                text_origin_x + hx,
-                                text_origin_y + run.line_top + run.line_height - 2.0,
-                                hw,
-                                2.0,
-                            );
-                            draw.rects.push(
-                                SceneRect::solid(ul, style.ime_underline_color)
-                                    .with_clip(Some(vp.doc_rect)),
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Emit glyphs (including strikethrough & underline lines for links/preedit/strikethrough spans)
             let fallback_text_color =
                 style.apply_focus_mode(style.text_color, block_focused, vp.focus_mode);
-            let scale = vp.scale_factor.max(0.5);
-            for run in shaped.buffer.layout_runs() {
-                for glyph in run.glyphs {
-                    let phys = glyph.physical(
-                        (text_origin_x * scale, (text_origin_y + run.line_y) * scale),
-                        scale,
-                    );
-                    let color = glyph
-                        .color_opt
-                        .map(|c| RgbaColor::new(c.r(), c.g(), c.b(), c.a()))
-                        .unwrap_or(fallback_text_color);
-                    draw.glyphs.push(SceneGlyph {
-                        cache_key: phys.cache_key,
-                        x: phys.x,
-                        y: phys.y,
-                        color,
-                        clip: Some(vp.doc_rect),
-                    });
-
-                    // Check inline strikethrough / link underline
-                    let vis_g_start = shaped.map.line_col_to_visual(run.line_i, glyph.start);
-                    for span in &shaped.display.spans {
-                        if span.range.start <= vis_g_start && vis_g_start < span.range.end {
-                            if span.strikethrough {
-                                let mid_y = text_origin_y + run.line_top + run.line_height * 0.52;
-                                draw.rects.push(
-                                    SceneRect::solid(
-                                        Rect::new(text_origin_x + glyph.x, mid_y, glyph.w, 1.4),
-                                        color,
-                                    )
-                                    .with_clip(Some(vp.doc_rect)),
-                                );
-                            }
-                            if span.underline && !span.ime_preedit {
-                                let u_y = text_origin_y + run.line_top + run.line_height - 2.5;
-                                draw.rects.push(
-                                    SceneRect::solid(
-                                        Rect::new(text_origin_x + glyph.x, u_y, glyph.w, 1.2),
-                                        color,
-                                    )
-                                    .with_clip(Some(vp.doc_rect)),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            let sel_range = sel.range();
+            render_text_buffer_contents(
+                &shaped.inline_code_rects,
+                &shaped.buffer,
+                &shaped.map,
+                &shaped.display.spans,
+                node.range,
+                node.range.start,
+                true,
+                text_origin_x,
+                text_origin_y,
+                fallback_text_color,
+                sel_range,
+                vp,
+                style,
+                &mut draw,
+            );
 
             // Caret / IME candidate anchor if inside this block (and not past final block)
             let owns_ime = shaped.map.active_ime_caret_visual().is_some();
@@ -860,6 +878,7 @@ impl ShapedDocumentCache {
             }
 
             self.last_hit_blocks.push(HitBlockRecord {
+                is_table: false,
                 shape_hash: key,
                 row_rect: Rect::new(
                     vp.doc_rect.x,
@@ -974,7 +993,16 @@ impl ShapedDocumentCache {
                 }
             }
             if win_y >= rec.row_rect.y && win_y <= rec.row_rect.y + rec.row_rect.h {
-                if let Some(shaped) = self.shaped_lru.get(&rec.shape_hash) {
+                if rec.is_table {
+                    if let Some(table) = self.table_lru.get(&rec.shape_hash) {
+                        return Some(EditorHitTarget::Text(hit_test_table(
+                            table,
+                            rec.block_range,
+                            win_x - rec.text_origin_x,
+                            win_y - rec.text_origin_y,
+                        )));
+                    }
+                } else if let Some(shaped) = self.shaped_lru.get(&rec.shape_hash) {
                     let lx = (win_x - rec.text_origin_x).max(0.0);
                     let ly = (win_y - rec.text_origin_y).max(0.0);
                     if let Some(cur) = shaped.buffer.hit(lx, ly) {
@@ -1027,49 +1055,78 @@ impl ShapedDocumentCache {
             .partition_point(|b| b.range.end < caret)
             .min(blocks.len() - 1);
 
-        let cur_offset = self
-            .shape_single_for_nav(block_idx, blocks, view, exp_sel, style, content_width_px, &mut read_slice);
-        let Some((cur_shaped, caret_vis)) = cur_offset else {
-            return (caret, preferred_x);
-        };
-        let cursor = cur_shaped.map.visual_to_line_col(caret_vis);
-        let _ = cursor;
-        let cur_rect = caret_rect_in_buffer(
-            &cur_shaped.buffer,
-            &cur_shaped.map,
-            caret_vis,
-            cur_shaped.display.left_indent_px,
-            0.0,
-            style.base_line_height_px,
-        );
-        let target_x = preferred_x.unwrap_or(cur_rect.x);
+        let mut crossed_target_x = preferred_x;
+        if matches!(blocks[block_idx].kind, BlockKind::Table) && view.mode != ViewMode::Source {
+            if let Some(table_key) = self.shape_table_for_nav(
+                block_idx,
+                blocks,
+                view,
+                exp_sel,
+                style,
+                content_width_px,
+                &mut read_slice,
+            ) {
+                if let Some(table) = self.table_lru.get(&table_key) {
+                    match move_caret_vertical_in_table(
+                        table,
+                        blocks[block_idx].range.start,
+                        caret,
+                        direction,
+                        preferred_x,
+                        style,
+                    ) {
+                        TableNavOutcome::Moved(off, tx) => return (off, Some(tx)),
+                        TableNavOutcome::Exited(tx) => {
+                            crossed_target_x = Some(tx);
+                        }
+                    }
+                }
+            }
+        } else {
+            let cur_offset = self
+                .shape_single_for_nav(block_idx, blocks, view, exp_sel, style, content_width_px, &mut read_slice);
+            let Some((cur_shaped, caret_vis)) = cur_offset else {
+                return (caret, preferred_x);
+            };
+            let cur_rect = caret_rect_in_buffer(
+                &cur_shaped.buffer,
+                &cur_shaped.map,
+                caret_vis,
+                cur_shaped.display.left_indent_px,
+                0.0,
+                style.base_line_height_px,
+            );
+            let target_x = preferred_x.unwrap_or(cur_rect.x);
+            crossed_target_x = Some(target_x);
 
-        // Try moving inside the same block's wrapped visual runs first!
-        let runs: Vec<(f32, f32)> = cur_shaped
-            .buffer
-            .layout_runs()
-            .map(|r| (r.line_top, r.line_height))
-            .collect();
-        if let Some(cur_run_pos) = runs
-            .iter()
-            .position(|(top, h)| cur_rect.y >= *top - 1.0 && cur_rect.y < *top + *h + 1.0)
-        {
-            let next_run_pos = cur_run_pos as isize + direction as isize;
-            if next_run_pos >= 0 && (next_run_pos as usize) < runs.len() {
-                let (top, h) = runs[next_run_pos as usize];
-                let lx = (target_x - cur_shaped.display.left_indent_px).max(0.0);
-                if let Some(hit) = cur_shaped.buffer.hit(lx, top + h * 0.5) {
-                    let vis = cur_shaped.map.line_col_to_visual(hit.line, hit.index);
-                    return (
-                        cur_shaped
-                            .map
-                            .visual_to_source_rebased(vis, blocks[block_idx].range.start),
-                        Some(target_x),
-                    );
+            // Try moving inside the same block's wrapped visual runs first!
+            let runs: Vec<(f32, f32)> = cur_shaped
+                .buffer
+                .layout_runs()
+                .map(|r| (r.line_top, r.line_height))
+                .collect();
+            if let Some(cur_run_pos) = runs
+                .iter()
+                .position(|(top, h)| cur_rect.y >= *top - 1.0 && cur_rect.y < *top + *h + 1.0)
+            {
+                let next_run_pos = cur_run_pos as isize + direction as isize;
+                if next_run_pos >= 0 && (next_run_pos as usize) < runs.len() {
+                    let (top, h) = runs[next_run_pos as usize];
+                    let lx = (target_x - cur_shaped.display.left_indent_px).max(0.0);
+                    if let Some(hit) = cur_shaped.buffer.hit(lx, top + h * 0.5) {
+                        let vis = cur_shaped.map.line_col_to_visual(hit.line, hit.index);
+                        return (
+                            cur_shaped
+                                .map
+                                .visual_to_source_rebased(vis, blocks[block_idx].range.start),
+                            Some(target_x),
+                        );
+                    }
                 }
             }
         }
 
+        let target_x = crossed_target_x.unwrap_or(12.0);
         // Cross to adjacent block above or below
         let next_idx = if direction < 0 {
             if block_idx == 0 {
@@ -1082,6 +1139,30 @@ impl ShapedDocumentCache {
             }
             block_idx + 1
         };
+
+        if matches!(blocks[next_idx].kind, BlockKind::Table) && view.mode != ViewMode::Source {
+            if let Some(table_key) = self.shape_table_for_nav(
+                next_idx,
+                blocks,
+                view,
+                exp_sel,
+                style,
+                content_width_px,
+                &mut read_slice,
+            ) {
+                if let Some(table) = self.table_lru.get(&table_key) {
+                    return (
+                        enter_table_from_adjacent(
+                            table,
+                            blocks[next_idx].range.start,
+                            direction,
+                            target_x,
+                        ),
+                        Some(target_x),
+                    );
+                }
+            }
+        }
 
         if let Some((adj_shaped, _)) =
             self.shape_single_for_nav(next_idx, blocks, view, exp_sel, style, content_width_px, &mut read_slice)
@@ -1106,6 +1187,40 @@ impl ShapedDocumentCache {
         }
 
         (caret, Some(target_x))
+    }
+
+    fn shape_table_for_nav<S>(
+        &mut self,
+        block_idx: usize,
+        blocks: &[BlockNode],
+        view: &EditorViewState,
+        exp_sel: Selection,
+        style: &ResolvedThemeStyle,
+        content_width_px: f32,
+        read_slice: &mut S,
+    ) -> Option<u64>
+    where
+        S: FnMut(ByteRange) -> String,
+    {
+        let node = blocks.get(block_idx)?;
+        let raw = read_slice(node.range);
+        let rows_display = build_table_display(node, &raw, view, exp_sel, style, true, false)?;
+        let avail_table_w = (content_width_px - 8.0).max(120.0);
+        let style_sig = style_signature(style);
+        let key = shape_table_cache_key(&rows_display, avail_table_w, style_sig, true, false);
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+        let frame_seq = self.frame_seq;
+        if let Some(cached) = self.table_lru.get_mut(&key) {
+            cached.last_used_frame = frame_seq;
+        } else {
+            let shaped =
+                shape_table_block(&mut self.font_system, rows_display, avail_table_w, style, frame_seq);
+            if self.table_lru.len() >= MAX_SHAPED_TABLE_CACHE {
+                evict_oldest_table_lru(&mut self.table_lru);
+            }
+            self.table_lru.insert(key, shaped);
+        }
+        Some(key)
     }
 
     fn shape_single_for_nav<S>(
@@ -1192,6 +1307,679 @@ pub fn shape_ui_text_into(
         }
     }
     max_w
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_block_height_metric(
+    idx: usize,
+    block_y: f32,
+    measured_h: f32,
+    block_ys: &mut [f32],
+    block_heights: &mut [f32],
+    y_cursor_shift: &mut f32,
+    any_height_changed: &mut bool,
+    first_changed_idx: &mut usize,
+) {
+    let old_h = block_heights[idx];
+    if (measured_h - old_h).abs() > 0.5 {
+        let delta = measured_h - old_h;
+        block_heights[idx] = measured_h;
+        block_ys[idx] = block_y;
+        *y_cursor_shift += delta;
+        if !*any_height_changed {
+            *first_changed_idx = idx;
+        }
+        *any_height_changed = true;
+    } else {
+        block_ys[idx] = block_y;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_text_buffer_contents(
+    inline_code_rects: &[Rect],
+    buffer: &CosmicBuffer,
+    map: &VisualTextMap,
+    spans: &[DisplaySpanStyle],
+    highlight_range: ByteRange,
+    actual_map_start: ByteOffset,
+    empty_sel_sliver: bool,
+    text_origin_x: f32,
+    text_origin_y: f32,
+    fallback_text_color: RgbaColor,
+    sel_range: ByteRange,
+    vp: &EditorViewport<'_>,
+    style: &ResolvedThemeStyle,
+    draw: &mut DrawList,
+) {
+    for pill in inline_code_rects {
+        draw.rects.push(
+            SceneRect::rounded(
+                pill.translate(text_origin_x, text_origin_y),
+                style.inline_code_bg,
+                4.0,
+            )
+            .with_clip(Some(vp.doc_rect)),
+        );
+    }
+
+    for m in vp.find_matches {
+        if m.end <= highlight_range.start || m.start >= highlight_range.end {
+            continue;
+        }
+        let is_active = vp.active_find == Some(*m);
+        let color = if is_active {
+            style.chrome.warning.with_alpha(120)
+        } else {
+            style.chrome.warning.with_alpha(55)
+        };
+        emit_highlight_range(
+            buffer,
+            map,
+            actual_map_start,
+            m.start.max(highlight_range.start),
+            m.end.min(highlight_range.end),
+            text_origin_x,
+            text_origin_y,
+            color,
+            vp.doc_rect,
+            &mut draw.rects,
+        );
+    }
+
+    if !sel_range.is_empty()
+        && sel_range.end > highlight_range.start
+        && sel_range.start <= highlight_range.end
+    {
+        let s_start = sel_range.start.max(highlight_range.start);
+        let s_end = sel_range.end.min(highlight_range.end);
+        if s_start < s_end {
+            emit_highlight_range(
+                buffer,
+                map,
+                actual_map_start,
+                s_start,
+                s_end,
+                text_origin_x,
+                text_origin_y,
+                style.selection_bg,
+                vp.doc_rect,
+                &mut draw.rects,
+            );
+        } else if empty_sel_sliver {
+            draw.rects.push(
+                SceneRect::solid(
+                    Rect::new(text_origin_x, text_origin_y, 6.0, style.base_line_height_px),
+                    style.selection_bg,
+                )
+                .with_clip(Some(vp.doc_rect)),
+            );
+        }
+    }
+
+    if let Some(pre_vis) = map.preedit_visual_range() {
+        if !pre_vis.is_empty() {
+            let c0 = map.visual_to_line_col(pre_vis.start);
+            let c1 = map.visual_to_line_col(pre_vis.end);
+            for run in buffer.layout_runs() {
+                for (hx, hw) in run.highlight(c0, c1) {
+                    let bg = Rect::new(
+                        text_origin_x + hx,
+                        text_origin_y + run.line_top,
+                        hw,
+                        run.line_height,
+                    );
+                    draw.rects.push(
+                        SceneRect::solid(bg, style.ime_preedit_bg).with_clip(Some(vp.doc_rect)),
+                    );
+                    let ul = Rect::new(
+                        text_origin_x + hx,
+                        text_origin_y + run.line_top + run.line_height - 2.0,
+                        hw,
+                        2.0,
+                    );
+                    draw.rects.push(
+                        SceneRect::solid(ul, style.ime_underline_color)
+                            .with_clip(Some(vp.doc_rect)),
+                    );
+                }
+            }
+        }
+    }
+
+    let scale = vp.scale_factor.max(0.5);
+    for run in buffer.layout_runs() {
+        for glyph in run.glyphs {
+            let phys = glyph.physical(
+                (text_origin_x * scale, (text_origin_y + run.line_y) * scale),
+                scale,
+            );
+            let color = glyph
+                .color_opt
+                .map(|c| RgbaColor::new(c.r(), c.g(), c.b(), c.a()))
+                .unwrap_or(fallback_text_color);
+            draw.glyphs.push(SceneGlyph {
+                cache_key: phys.cache_key,
+                x: phys.x,
+                y: phys.y,
+                color,
+                clip: Some(vp.doc_rect),
+            });
+
+            let vis_g_start = map.line_col_to_visual(run.line_i, glyph.start);
+            for span in spans {
+                if span.range.start <= vis_g_start && vis_g_start < span.range.end {
+                    if span.strikethrough {
+                        let mid_y = text_origin_y + run.line_top + run.line_height * 0.52;
+                        draw.rects.push(
+                            SceneRect::solid(
+                                Rect::new(text_origin_x + glyph.x, mid_y, glyph.w, 1.4),
+                                color,
+                            )
+                            .with_clip(Some(vp.doc_rect)),
+                        );
+                    }
+                    if span.underline && !span.ime_preedit {
+                        let u_y = text_origin_y + run.line_top + run.line_height - 2.5;
+                        draw.rects.push(
+                            SceneRect::solid(
+                                Rect::new(text_origin_x + glyph.x, u_y, glyph.w, 1.2),
+                                color,
+                            )
+                            .with_clip(Some(vp.doc_rect)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_table_scene(
+    table: &CachedTableShape,
+    node: &BlockNode,
+    block_y: f32,
+    screen_top_y: f32,
+    table_left_x: f32,
+    table_top_y: f32,
+    caret_after_last_block: bool,
+    base_caret: ByteOffset,
+    sel: Selection,
+    vp: &EditorViewport<'_>,
+    style: &ResolvedThemeStyle,
+    block_focused: bool,
+    draw: &mut DrawList,
+    caret_doc_y: &mut f32,
+    caret_line_height: &mut f32,
+    ime_cursor_area: &mut Option<Rect>,
+) {
+    let outer_rect = Rect::new(table_left_x, table_top_y, table.table_w, table.table_h);
+    draw.rects.push(
+        SceneRect::rounded(outer_rect, style.bg_color, 4.0 * style.zoom_scale)
+            .with_clip(Some(vp.doc_rect)),
+    );
+
+    // Row backgrounds (header fill / revealed delimiter bar)
+    for row in &table.rows {
+        let fill = if row.is_header {
+            Some(style.table_header_bg)
+        } else if row.is_delimiter {
+            Some(style.code_block_bg)
+        } else {
+            None
+        };
+        if let Some(bg) = fill {
+            let row_bg = Rect::new(
+                table_left_x + 1.0,
+                table_top_y + row.y_rel + if row.y_rel == 0.0 { 1.0 } else { 0.0 },
+                (table.table_w - 2.0).max(1.0),
+                (row.h - if row.y_rel == 0.0 { 1.0 } else { 0.0 }).max(1.0),
+            );
+            draw.rects
+                .push(SceneRect::solid(row_bg, bg).with_clip(Some(vp.doc_rect)));
+        }
+    }
+
+    // Horizontal row dividers
+    for (r_idx, row) in table.rows.iter().enumerate() {
+        if r_idx + 1 >= table.rows.len() {
+            continue;
+        }
+        let thick = if row.is_header { 1.5 } else { 1.0 };
+        let line_y = table_top_y + row.y_rel + row.h - thick * 0.5;
+        draw.rects.push(
+            SceneRect::solid(
+                Rect::new(table_left_x + 1.0, line_y, (table.table_w - 2.0).max(1.0), thick),
+                style.table_border,
+            )
+            .with_clip(Some(vp.doc_rect)),
+        );
+    }
+
+    // Vertical column dividers
+    let mut col_x = 0.0f32;
+    for (c_idx, &w) in table.col_widths.iter().enumerate() {
+        col_x += w;
+        if c_idx + 1 >= table.col_widths.len() {
+            continue;
+        }
+        draw.rects.push(
+            SceneRect::solid(
+                Rect::new(
+                    table_left_x + col_x - 0.5,
+                    table_top_y + 1.0,
+                    1.0,
+                    (table.table_h - 2.0).max(1.0),
+                ),
+                style.table_border,
+            )
+            .with_clip(Some(vp.doc_rect)),
+        );
+    }
+
+    // Outer border drawn above inner row fills and divider endpoints for crisp corners
+    draw.rects.push(
+        SceneRect::rounded(
+            outer_rect,
+            style.table_border.with_alpha(0),
+            4.0 * style.zoom_scale,
+        )
+        .with_border(1.0, style.table_border)
+        .with_clip(Some(vp.doc_rect)),
+    );
+
+    let sel_range = sel.range();
+    let base_text_color = style.apply_focus_mode(style.text_color, block_focused, vp.focus_mode);
+
+    for row in &table.rows {
+        let cell_text_y = table_top_y + row.y_rel + table.cell_pad_y;
+        for cell in &row.cells {
+            if cell.is_placeholder {
+                continue;
+            }
+            let cell_src_abs = ByteRange::new(
+                node.range.start + cell.rel_src_range.start,
+                node.range.start + cell.rel_src_range.end,
+            );
+            let cell_raw_abs = ByteRange::new(
+                node.range.start + cell.rel_raw_range.start,
+                node.range.start + cell.rel_raw_range.end,
+            );
+            if !sel_range.is_empty()
+                && cell.map.display_text.is_empty()
+                && sel_range.start <= cell_raw_abs.start
+                && sel_range.end >= cell_raw_abs.end
+            {
+                draw.rects.push(
+                    SceneRect::solid(
+                        Rect::new(
+                            table_left_x + cell.x_rel + 1.0,
+                            table_top_y + row.y_rel + 1.0,
+                            (cell.w - 2.0).max(1.0),
+                            (row.h - 2.0).max(1.0),
+                        ),
+                        style.selection_bg,
+                    )
+                    .with_clip(Some(vp.doc_rect)),
+                );
+            }
+
+            let cell_color = if row.is_delimiter {
+                style.apply_focus_mode(style.muted_marker_color, block_focused, vp.focus_mode)
+            } else {
+                base_text_color
+            };
+            render_text_buffer_contents(
+                &cell.inline_code_rects,
+                &cell.buffer,
+                &cell.map,
+                &cell.spans,
+                cell_src_abs,
+                cell_src_abs.start,
+                false,
+                table_left_x + cell.text_x_rel,
+                cell_text_y,
+                cell_color,
+                sel_range,
+                vp,
+                style,
+                draw,
+            );
+        }
+    }
+
+    // Active caret / IME anchor inside this table
+    if !caret_after_last_block && ime_cursor_area.is_none() {
+        let ime_loc = find_table_ime_cell(table);
+        let target_cell = ime_loc.or_else(|| {
+            if !node.range.contains_inclusive(base_caret) {
+                return None;
+            }
+            let rel_caret = base_caret - node.range.start;
+            find_table_cell_for_rel_caret(table, rel_caret).map(|(r, c)| {
+                let cell = &table.rows[r].cells[c];
+                let vis = cell
+                    .map
+                    .source_to_visual_rebased(base_caret, node.range.start + cell.rel_src_range.start);
+                (r, c, vis)
+            })
+        });
+        if let Some((r_idx, c_idx, target_vis)) = target_cell {
+            let cur_rect = table_cell_caret_rect(
+                table,
+                r_idx,
+                c_idx,
+                target_vis,
+                table_left_x,
+                table_top_y,
+                style,
+            );
+            *caret_doc_y = block_y + (cur_rect.y - screen_top_y);
+            *caret_line_height = cur_rect.h;
+            *ime_cursor_area = Some(cur_rect);
+            if vp.show_caret {
+                draw.rects
+                    .push(SceneRect::solid(cur_rect, style.caret_color).with_clip(Some(vp.doc_rect)));
+            }
+        }
+    }
+}
+
+fn find_table_ime_cell(table: &CachedTableShape) -> Option<(usize, usize, usize)> {
+    for (r_idx, row) in table.rows.iter().enumerate() {
+        for (c_idx, cell) in row.cells.iter().enumerate() {
+            if let Some(vis) = cell.map.active_ime_caret_visual() {
+                return Some((r_idx, c_idx, vis));
+            }
+        }
+    }
+    None
+}
+
+fn find_table_cell_for_rel_caret(
+    table: &CachedTableShape,
+    rel_caret: ByteOffset,
+) -> Option<(usize, usize)> {
+    if table.rows.is_empty() {
+        return None;
+    }
+    let row_idx = table
+        .rows
+        .iter()
+        .position(|r| r.line_range_rel.contains_inclusive(rel_caret))
+        .unwrap_or_else(|| {
+            table
+                .rows
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, r)| {
+                    if rel_caret < r.line_range_rel.start {
+                        r.line_range_rel.start - rel_caret
+                    } else {
+                        rel_caret - r.line_range_rel.end
+                    }
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        });
+    let row = &table.rows[row_idx];
+    let cell_idx = row
+        .cells
+        .iter()
+        .position(|c| !c.is_placeholder && c.rel_raw_range.contains_inclusive(rel_caret))
+        .or_else(|| {
+            let real_cells: Vec<usize> = row
+                .cells
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !c.is_placeholder)
+                .map(|(i, _)| i)
+                .collect();
+            if real_cells.is_empty() {
+                None
+            } else if rel_caret <= row.cells[real_cells[0]].rel_raw_range.start {
+                Some(real_cells[0])
+            } else {
+                real_cells.last().copied()
+            }
+        })?;
+    Some((row_idx, cell_idx))
+}
+
+fn table_cell_caret_rect(
+    table: &CachedTableShape,
+    row_idx: usize,
+    cell_idx: usize,
+    target_vis: usize,
+    origin_x: f32,
+    origin_y: f32,
+    style: &ResolvedThemeStyle,
+) -> Rect {
+    let row = &table.rows[row_idx];
+    let cell = &row.cells[cell_idx];
+    let cell_text_x = origin_x + cell.text_x_rel;
+    let cell_text_y = origin_y + row.y_rel + table.cell_pad_y;
+    let mut cur = caret_rect_in_buffer(
+        &cell.buffer,
+        &cell.map,
+        target_vis,
+        cell_text_x,
+        cell_text_y,
+        style.base_line_height_px,
+    );
+    if cell.map.display_text.is_empty() && (cur.x - cell_text_x).abs() < 0.5 {
+        let align_off = match cell.align {
+            TableAlign::Left => 0.0,
+            TableAlign::Center => cell.inner_w * 0.5,
+            TableAlign::Right => (cell.inner_w - 2.0).max(0.0),
+        };
+        cur.x = cell_text_x + align_off;
+    }
+    let max_x = (cell_text_x + cell.inner_w - 2.0).max(cell_text_x);
+    cur.x = cur.x.clamp(cell_text_x, max_x);
+    cur
+}
+
+fn hit_test_table(
+    table: &CachedTableShape,
+    block_range: ByteRange,
+    tx: f32,
+    ty: f32,
+) -> ByteOffset {
+    if table.rows.is_empty() {
+        return block_range.start;
+    }
+    let row_idx = table
+        .rows
+        .iter()
+        .position(|r| ty >= r.y_rel && ty <= r.y_rel + r.h)
+        .unwrap_or_else(|| {
+            if ty < table.rows[0].y_rel {
+                0
+            } else {
+                table.rows.len() - 1
+            }
+        });
+    let row = &table.rows[row_idx];
+    let real_cells: Vec<usize> = row
+        .cells
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_placeholder)
+        .map(|(i, _)| i)
+        .collect();
+    if real_cells.is_empty() {
+        return block_range.start + row.line_range_rel.start;
+    }
+    let cell_idx = real_cells
+        .iter()
+        .copied()
+        .find(|&i| tx >= row.cells[i].x_rel && tx <= row.cells[i].x_rel + row.cells[i].w)
+        .unwrap_or_else(|| {
+            if tx < row.cells[real_cells[0]].x_rel {
+                real_cells[0]
+            } else {
+                *real_cells.last().unwrap()
+            }
+        });
+    let cell = &row.cells[cell_idx];
+    let lx = (tx - cell.text_x_rel).max(0.0);
+    let ly = (ty - (row.y_rel + table.cell_pad_y)).max(0.0);
+    if let Some(cur) = cell.buffer.hit(lx, ly) {
+        let vis = cell.map.line_col_to_visual(cur.line, cur.index);
+        return cell
+            .map
+            .visual_to_source_rebased(vis, block_range.start + cell.rel_src_range.start);
+    }
+    block_range.start + cell.rel_src_range.end
+}
+
+enum TableNavOutcome {
+    Moved(ByteOffset, f32),
+    Exited(f32),
+}
+
+fn hit_cell_at_target_x(
+    cell: &TableCellShape,
+    block_start: ByteOffset,
+    target_x_rel_content: f32,
+    target_y_in_cell: f32,
+) -> ByteOffset {
+    let cell_nav_text_x = 4.0 + cell.text_x_rel;
+    let lx = (target_x_rel_content - cell_nav_text_x).max(0.0);
+    if let Some(hit) = cell.buffer.hit(lx, target_y_in_cell) {
+        let vis = cell.map.line_col_to_visual(hit.line, hit.index);
+        return cell
+            .map
+            .visual_to_source_rebased(vis, block_start + cell.rel_src_range.start);
+    }
+    block_start + cell.rel_src_range.start
+}
+
+fn move_caret_vertical_in_table(
+    table: &CachedTableShape,
+    block_start: ByteOffset,
+    caret: ByteOffset,
+    direction: i32,
+    preferred_x: Option<f32>,
+    style: &ResolvedThemeStyle,
+) -> TableNavOutcome {
+    let rel_caret = caret.saturating_sub(block_start);
+    let Some((r_idx, c_idx)) = find_table_cell_for_rel_caret(table, rel_caret) else {
+        return TableNavOutcome::Exited(preferred_x.unwrap_or(16.0));
+    };
+    let cell = &table.rows[r_idx].cells[c_idx];
+    let vis = cell
+        .map
+        .active_ime_caret_visual()
+        .unwrap_or_else(|| {
+            cell.map
+                .source_to_visual_rebased(caret, block_start + cell.rel_src_range.start)
+        });
+    let cur_rect = table_cell_caret_rect(table, r_idx, c_idx, vis, 4.0, 0.0, style);
+    let target_x = preferred_x.unwrap_or(cur_rect.x);
+    let cell_top = table.rows[r_idx].y_rel + table.cell_pad_y;
+    let local_cur_y = cur_rect.y - cell_top;
+
+    // 1. Try wrapped visual lines inside the current cell first
+    let runs: Vec<(f32, f32)> = cell
+        .buffer
+        .layout_runs()
+        .map(|r| (r.line_top, r.line_height))
+        .collect();
+    if let Some(cur_run_pos) = runs
+        .iter()
+        .position(|(top, h)| local_cur_y >= *top - 1.0 && local_cur_y < *top + *h + 1.0)
+    {
+        let next_run_pos = cur_run_pos as isize + direction as isize;
+        if next_run_pos >= 0 && (next_run_pos as usize) < runs.len() {
+            let (top, h) = runs[next_run_pos as usize];
+            return TableNavOutcome::Moved(
+                hit_cell_at_target_x(cell, block_start, target_x, top + h * 0.5),
+                target_x,
+            );
+        }
+    }
+
+    // 2. Step into the adjacent visible row in the same column
+    let next_r = r_idx as isize + direction as isize;
+    if next_r >= 0 && (next_r as usize) < table.rows.len() {
+        let next_row = &table.rows[next_r as usize];
+        let mut target_col = c_idx.min(next_row.cells.len().saturating_sub(1));
+        while target_col > 0 && next_row.cells[target_col].is_placeholder {
+            target_col -= 1;
+        }
+        if let Some(next_cell) = next_row.cells.get(target_col) {
+            if !next_cell.is_placeholder {
+                let target_y = if direction < 0 {
+                    next_cell
+                        .buffer
+                        .layout_runs()
+                        .last()
+                        .map(|r| r.line_top + r.line_height * 0.5)
+                        .unwrap_or(2.0)
+                } else {
+                    2.0
+                };
+                return TableNavOutcome::Moved(
+                    hit_cell_at_target_x(next_cell, block_start, target_x, target_y),
+                    target_x,
+                );
+            }
+        }
+    }
+
+    TableNavOutcome::Exited(target_x)
+}
+
+fn enter_table_from_adjacent(
+    table: &CachedTableShape,
+    block_start: ByteOffset,
+    direction: i32,
+    target_x_rel_content: f32,
+) -> ByteOffset {
+    let row = if direction > 0 {
+        table.rows.first()
+    } else {
+        table.rows.last()
+    };
+    let Some(row) = row else {
+        return block_start;
+    };
+    let real_cells: Vec<usize> = row
+        .cells
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_placeholder)
+        .map(|(i, _)| i)
+        .collect();
+    if real_cells.is_empty() {
+        return block_start + row.line_range_rel.start;
+    }
+    let tx_in_table = target_x_rel_content - 4.0;
+    let cell_idx = real_cells
+        .iter()
+        .copied()
+        .find(|&i| tx_in_table >= row.cells[i].x_rel && tx_in_table <= row.cells[i].x_rel + row.cells[i].w)
+        .unwrap_or_else(|| {
+            if tx_in_table < row.cells[real_cells[0]].x_rel {
+                real_cells[0]
+            } else {
+                *real_cells.last().unwrap()
+            }
+        });
+    let cell = &row.cells[cell_idx];
+    let target_y = if direction < 0 {
+        cell.buffer
+            .layout_runs()
+            .last()
+            .map(|r| r.line_top + r.line_height * 0.5)
+            .unwrap_or(2.0)
+    } else {
+        2.0
+    };
+    hit_cell_at_target_x(cell, block_start, target_x_rel_content, target_y)
 }
 
 fn build_block_display(
@@ -1331,67 +2119,23 @@ fn build_block_display(
         BlockKind::Paragraph => {}
     }
 
-    // Process inline spans unless we're in a verbatim code fence or Source mode hides nothing.
-    for span in &node.inlines {
-        let o_start = (span.open_marker.start - block_start).min(block_len);
-        let o_end = (span.open_marker.end - block_start).min(block_len);
-        let c_start = (span.close_marker.start - block_start).min(block_len);
-        let c_end = (span.close_marker.end - block_start).min(block_len);
-
-        if is_source || span.should_expand_markers(exp_sel) {
-            if o_start < o_end {
-                marker_ranges.push(o_start..o_end);
-            }
-            if c_start < c_end {
-                marker_ranges.push(c_start..c_end);
-            }
-        } else {
-            if o_start < o_end {
-                hidden.push(o_start..o_end);
-            }
-            if c_start < c_end {
-                hidden.push(c_start..c_end);
-            }
-        }
-    }
-
-    let merged_hidden = merge_ranges(hidden);
-    let mut map = build_visual_text_map(block_start, raw_text, &merged_hidden, synthetic_prefix);
-
-    // Optional active IME preedit splicing if this block owns the active composition point.
-    let mut preedit_vis_range: Option<Range<usize>> = None;
-    if let Some(preedit) = &view.ime_preedit {
-        let comp_sel = view.ime_composition_selection.unwrap_or(view.selection);
-        let comp_range = comp_sel.range();
-        let owns_comp = node.range.contains_inclusive(comp_range.start)
-            && !matches!(node.kind, BlockKind::Paragraph if raw_text.is_empty() && comp_range.start > node.range.end);
-        // If multiple blocks border `comp_range.start` (`block1.end == comp_range.start`), only the owning block picks it up cleanly:
-        if owns_comp {
-            let v_start = map.source_to_visual(comp_range.start);
-            let v_end = map.source_to_visual(comp_range.end.min(node.range.end));
-            map.display_text.replace_range(v_start..v_end, preedit);
-            let new_v_end = v_start + preedit.len();
-            map.line_starts = compute_line_starts(&map.display_text);
-            map.ime_splice = Some(ImeSplice {
-                vis_start: v_start,
-                vis_end: new_v_end,
-                comp_src_start: comp_range.start,
-                comp_src_end: comp_range.end.min(node.range.end),
-                preedit_caret_vis: new_v_end,
-            });
-            preedit_vis_range = Some(v_start..new_v_end);
-        }
-    }
-
-    let spans = build_display_spans(
-        node,
+    let disallow_past_end =
+        matches!(node.kind, BlockKind::Paragraph if raw_text.is_empty());
+    let (map, spans) = collect_fragment_display(
+        node.range,
         raw_text,
-        &map,
-        &marker_ranges,
-        preedit_vis_range,
+        &node.inlines,
+        block_start,
+        hidden,
+        marker_ranges,
+        synthetic_prefix,
         base_color,
         base_weight,
         base_monospace,
+        true,
+        disallow_past_end,
+        view,
+        exp_sel,
         style,
         is_focused,
         focus_mode,
@@ -1410,6 +2154,291 @@ fn build_block_display(
         heading_level,
         task_checkbox,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_fragment_display(
+    frag_range_abs: ByteRange,
+    frag_raw: &str,
+    inlines_abs: &[InlineSpan],
+    map_base_offset: ByteOffset,
+    mut hidden: Vec<Range<usize>>,
+    mut marker_ranges: Vec<Range<usize>>,
+    synthetic_prefix: Option<&str>,
+    base_color: RgbaColor,
+    base_weight: u16,
+    base_monospace: bool,
+    allow_ime: bool,
+    disallow_past_end: bool,
+    view: &EditorViewState,
+    exp_sel: Selection,
+    style: &ResolvedThemeStyle,
+    is_focused: bool,
+    focus_mode: bool,
+) -> (VisualTextMap, Vec<DisplaySpanStyle>) {
+    let is_source = view.mode == ViewMode::Source;
+    let frag_len = frag_raw.len();
+    let delta = map_base_offset as isize - frag_range_abs.start as isize;
+    let mut rebased_inlines: Vec<(InlineKind, ByteRange)> = Vec::new();
+
+    for span in inlines_abs {
+        if span.full_range.end <= frag_range_abs.start || span.full_range.start >= frag_range_abs.end
+        {
+            continue;
+        }
+        let o_start = span
+            .open_marker
+            .start
+            .saturating_sub(frag_range_abs.start)
+            .min(frag_len);
+        let o_end = span
+            .open_marker
+            .end
+            .saturating_sub(frag_range_abs.start)
+            .min(frag_len);
+        let c_start = span
+            .close_marker
+            .start
+            .saturating_sub(frag_range_abs.start)
+            .min(frag_len);
+        let c_end = span
+            .close_marker
+            .end
+            .saturating_sub(frag_range_abs.start)
+            .min(frag_len);
+
+        if is_source || span.should_expand_markers(exp_sel) {
+            if o_start < o_end {
+                marker_ranges.push(o_start..o_end);
+            }
+            if c_start < c_end {
+                marker_ranges.push(c_start..c_end);
+            }
+        } else {
+            if o_start < o_end {
+                hidden.push(o_start..o_end);
+            }
+            if c_start < c_end {
+                hidden.push(c_start..c_end);
+            }
+        }
+
+        let s_abs = span.full_range.start.clamp(frag_range_abs.start, frag_range_abs.end);
+        let e_abs = span.full_range.end.clamp(frag_range_abs.start, frag_range_abs.end);
+        if s_abs < e_abs {
+            rebased_inlines.push((
+                span.kind,
+                ByteRange::new(
+                    (s_abs as isize + delta) as usize,
+                    (e_abs as isize + delta) as usize,
+                ),
+            ));
+        }
+    }
+
+    let merged_hidden = merge_ranges(hidden);
+    let mut map = build_visual_text_map(map_base_offset, frag_raw, &merged_hidden, synthetic_prefix);
+
+    let mut preedit_vis_range: Option<Range<usize>> = None;
+    if allow_ime {
+        if let Some(preedit) = &view.ime_preedit {
+            let comp_sel = view.ime_composition_selection.unwrap_or(view.selection);
+            let comp_range = comp_sel.range();
+            let owns_comp = frag_range_abs.contains_inclusive(comp_range.start)
+                && !(disallow_past_end && comp_range.start > frag_range_abs.end);
+            if owns_comp {
+                let c_start_mapped = ((comp_range
+                    .start
+                    .clamp(frag_range_abs.start, frag_range_abs.end)) as isize
+                    + delta) as usize;
+                let c_end_mapped = ((comp_range
+                    .end
+                    .clamp(frag_range_abs.start, frag_range_abs.end)) as isize
+                    + delta) as usize;
+                let v_start = map.source_to_visual(c_start_mapped);
+                let v_end = map.source_to_visual(c_end_mapped);
+                map.display_text.replace_range(v_start..v_end, preedit);
+                let new_v_end = v_start + preedit.len();
+                map.line_starts = compute_line_starts(&map.display_text);
+                map.ime_splice = Some(ImeSplice {
+                    vis_start: v_start,
+                    vis_end: new_v_end,
+                    comp_src_start: c_start_mapped,
+                    comp_src_end: c_end_mapped,
+                    preedit_caret_vis: new_v_end,
+                });
+                preedit_vis_range = Some(v_start..new_v_end);
+            }
+        }
+    }
+
+    let spans = build_display_spans_with_inlines(
+        &rebased_inlines,
+        &map,
+        &marker_ranges,
+        preedit_vis_range,
+        base_color,
+        base_weight,
+        base_monospace,
+        style,
+        is_focused,
+        focus_mode,
+    );
+    (map, spans)
+}
+
+fn build_table_display(
+    node: &BlockNode,
+    raw_text: &str,
+    view: &EditorViewState,
+    exp_sel: Selection,
+    style: &ResolvedThemeStyle,
+    is_focused: bool,
+    focus_mode: bool,
+) -> Option<Vec<TableRowDisplay>> {
+    let rows = parse_table_block(raw_text, ByteRange::new(0, raw_text.len()));
+    if rows.len() < 2 || !rows[1].is_delimiter || rows.iter().all(|r| r.cells.is_empty()) {
+        return None;
+    }
+
+    let has_delim = true;
+    let alignments: &[TableAlign] = &rows[1].alignments;
+
+    // PRD 4.1.1 A & GFM 4.10: The delimiter row defines column count/alignment only and
+    // NEVER renders as a visible cell row in WYSIWYG mode.
+    let visible_indices: Vec<usize> = (0..rows.len()).filter(|&i| i != 1).collect();
+    let num_cols = visible_indices
+        .iter()
+        .map(|&i| rows[i].cells.len())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    let active_caret_abs = if exp_sel.is_caret() {
+        Some(exp_sel.head)
+    } else if view.ime_preedit.is_some() {
+        view.ime_composition_selection.map(|s| s.head)
+    } else {
+        None
+    };
+
+    let ime_comp_start = view
+        .ime_preedit
+        .as_ref()
+        .map(|_| view.ime_composition_selection.unwrap_or(view.selection).range().start);
+    let mut ime_assigned = false;
+
+    let mut out_rows = Vec::with_capacity(visible_indices.len());
+    for r_idx in visible_indices {
+        let row = &rows[r_idx];
+        let is_header = has_delim && r_idx == 0;
+        let default_weight = if is_header { 700 } else { 400 };
+        let base_color = if row.is_delimiter {
+            style.apply_focus_mode(style.muted_marker_color, is_focused, focus_mode)
+        } else {
+            style.apply_focus_mode(style.text_color, is_focused, focus_mode)
+        };
+
+        let mut cells = Vec::with_capacity(num_cols);
+        for c_idx in 0..num_cols {
+            let align = alignments.get(c_idx).copied().unwrap_or(TableAlign::Left);
+            if c_idx < row.cells.len() {
+                let cell = &row.cells[c_idx];
+                let mut rel_s = cell.content_range.start;
+                let mut rel_e = cell.content_range.end;
+                if let Some(abs_c) = active_caret_abs {
+                    if abs_c >= node.range.start {
+                        let rel_c = abs_c - node.range.start;
+                        if rel_c >= cell.raw_range.start && rel_c <= cell.raw_range.end {
+                            let raw_slice = &raw_text[cell.raw_range.start..cell.raw_range.end];
+                            let lead_cap = if raw_slice.starts_with(' ') {
+                                cell.raw_range.start + 1
+                            } else {
+                                cell.raw_range.start
+                            };
+                            let tail_cap = if raw_slice.len() >= 2 && raw_slice.ends_with(' ') {
+                                cell.raw_range.end - 1
+                            } else {
+                                cell.raw_range.end
+                            };
+                            if rel_c < rel_s {
+                                rel_s = rel_c.max(lead_cap);
+                            }
+                            if rel_c > rel_e {
+                                rel_e = rel_c.min(tail_cap).max(rel_s);
+                            }
+                        }
+                    }
+                }
+                let rel_src = ByteRange::new(rel_s, rel_e);
+                let cell_abs_src = ByteRange::new(node.range.start + rel_s, node.range.start + rel_e);
+                let cell_abs_raw = ByteRange::new(
+                    node.range.start + cell.raw_range.start,
+                    node.range.start + cell.raw_range.end,
+                );
+                let allow_ime_here = !ime_assigned
+                    && ime_comp_start.is_some_and(|cs| {
+                        cell_abs_raw.contains_inclusive(cs)
+                            || (c_idx == 0
+                                && cs >= node.range.start + row.line_range.start
+                                && cs < cell_abs_raw.start)
+                    });
+                if allow_ime_here {
+                    ime_assigned = true;
+                }
+
+                let frag_raw = &raw_text[rel_s..rel_e];
+                let (map, spans) = collect_fragment_display(
+                    cell_abs_src,
+                    frag_raw,
+                    &node.inlines,
+                    rel_src.start,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    base_color,
+                    default_weight,
+                    row.is_delimiter,
+                    allow_ime_here,
+                    false,
+                    view,
+                    exp_sel,
+                    style,
+                    is_focused,
+                    focus_mode,
+                );
+                cells.push(TableCellDisplay {
+                    rel_raw_range: cell.raw_range,
+                    rel_src_range: rel_src,
+                    align,
+                    is_placeholder: false,
+                    map,
+                    spans,
+                    default_weight,
+                });
+            } else {
+                let end_rel = ByteRange::empty(row.line_range.end);
+                cells.push(TableCellDisplay {
+                    rel_raw_range: end_rel,
+                    rel_src_range: end_rel,
+                    align,
+                    is_placeholder: true,
+                    map: build_visual_text_map(end_rel.start, "", &[], None),
+                    spans: Vec::new(),
+                    default_weight,
+                });
+            }
+        }
+
+        out_rows.push(TableRowDisplay {
+            line_range_rel: row.line_range,
+            is_header,
+            is_delimiter: row.is_delimiter,
+            cells,
+        });
+    }
+
+    Some(out_rows)
 }
 
 fn list_item_prefix_len(raw: &str) -> usize {
@@ -1537,9 +2566,8 @@ fn compute_line_starts(s: &str) -> Vec<usize> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_display_spans(
-    node: &BlockNode,
-    raw_text: &str,
+fn build_display_spans_with_inlines(
+    inlines_mapped: &[(InlineKind, ByteRange)],
     map: &VisualTextMap,
     marker_ranges: &[Range<usize>],
     preedit_vis_range: Option<Range<usize>>,
@@ -1557,14 +2585,14 @@ fn build_display_spans(
 
     // Collect split boundaries in visual coordinates.
     let mut cuts = vec![0usize, total_vis];
-    let block_start = node.range.start;
-    let inline_vis: Vec<_> = node
-        .inlines
+    let map_start = map.block_range.start;
+    let map_end = map.block_range.end;
+    let inline_vis: Vec<_> = inlines_mapped
         .iter()
-        .filter_map(|span| {
-            let s = map.source_to_visual(span.full_range.start.clamp(block_start, node.range.end));
-            let e = map.source_to_visual(span.full_range.end.clamp(block_start, node.range.end));
-            (s < e).then_some((span.kind, s..e))
+        .filter_map(|(kind, range)| {
+            let s = map.source_to_visual(range.start.clamp(map_start, map_end));
+            let e = map.source_to_visual(range.end.clamp(map_start, map_end));
+            (s < e).then_some((*kind, s..e))
         })
         .collect();
     for (_, r) in &inline_vis {
@@ -1574,8 +2602,8 @@ fn build_display_spans(
     let marker_vis: Vec<Range<usize>> = marker_ranges
         .iter()
         .filter_map(|r| {
-            let s = map.source_to_visual((block_start + r.start).min(node.range.end));
-            let e = map.source_to_visual((block_start + r.end).min(node.range.end));
+            let s = map.source_to_visual((map_start + r.start).min(map_end));
+            let e = map.source_to_visual((map_start + r.end).min(map_end));
             (s < e).then_some(s..e)
         })
         .collect();
@@ -1587,7 +2615,6 @@ fn build_display_spans(
         cuts.push(pre.start);
         cuts.push(pre.end);
     }
-    let _ = raw_text;
 
     cuts.sort_unstable();
     cuts.dedup();
@@ -1675,30 +2702,27 @@ fn build_display_spans(
     out
 }
 
-fn shape_block(
+#[allow(clippy::too_many_arguments)]
+fn shape_rich_text_buffer(
     font_system: &mut FontSystem,
-    display: BlockDisplay,
+    map: &VisualTextMap,
+    spans: &[DisplaySpanStyle],
     avail_w: f32,
+    font_size: f32,
+    line_height: f32,
+    default_weight: u16,
+    monospace: bool,
+    align: Option<Align>,
     style: &ResolvedThemeStyle,
-    _hash: u64,
-    frame_seq: u64,
-) -> CachedBlockShape {
-    let (font_size, line_height, default_weight) = if let Some(lvl) = display.heading_level {
-        let hs = &style.headings[(lvl.clamp(1, 6) - 1) as usize];
-        (hs.font_size_px, hs.line_height_px, hs.weight)
-    } else if display.code_box {
-        (style.code_font_size_px, style.code_line_height_px, 400)
-    } else {
-        (style.base_font_size_px, style.base_line_height_px, 400)
-    };
-
+    empty_fallback_height: Option<f32>,
+) -> (CosmicBuffer, f32, f32, Vec<Rect>) {
     let metrics = Metrics::new(font_size.max(8.0), line_height.max(12.0));
     let mut buffer = CosmicBuffer::new(font_system, metrics);
     buffer.set_wrap(Wrap::WordOrGlyph);
     buffer.set_size(Some(avail_w), None);
 
     let default_attrs = Attrs::new()
-        .family(if display.code_box {
+        .family(if monospace {
             Family::Monospace
         } else {
             Family::Name(&style.base_font_family)
@@ -1706,14 +2730,13 @@ fn shape_block(
         .weight(Weight(default_weight))
         .color(style.text_color.to_cosmic_color());
 
-    if display.spans.is_empty() || display.map.display_text.is_empty() {
-        buffer.set_text("", &default_attrs, Shaping::Advanced, None);
+    if spans.is_empty() || map.display_text.is_empty() {
+        buffer.set_text("", &default_attrs, Shaping::Advanced, align);
     } else {
-        let rich: Vec<(&str, Attrs<'_>)> = display
-            .spans
+        let rich: Vec<(&str, Attrs<'_>)> = spans
             .iter()
             .filter_map(|sp| {
-                let s = display.map.display_text.get(sp.range.clone())?;
+                let s = map.display_text.get(sp.range.clone())?;
                 let mut attrs = Attrs::new()
                     .color(sp.color.to_cosmic_color())
                     .family(if sp.monospace {
@@ -1735,25 +2758,29 @@ fn shape_block(
                 Some((s, attrs))
             })
             .collect();
-        buffer.set_rich_text(rich, &default_attrs, Shaping::Advanced, None);
+        buffer.set_rich_text(rich, &default_attrs, Shaping::Advanced, align);
     }
     buffer.shape_until_scroll(font_system, false);
 
     let mut run_count = 0usize;
+    let mut max_line_w = 0.0f32;
     let mut text_height = line_height;
     for run in buffer.layout_runs() {
         run_count += 1;
+        max_line_w = max_line_w.max(run.line_w);
         text_height = text_height.max(run.line_top + run.line_height);
     }
     if run_count == 0 {
-        text_height = if display.hr_rule { 8.0 } else { line_height };
+        if let Some(fb) = empty_fallback_height {
+            text_height = fb;
+        }
     }
 
     let mut inline_code_rects = Vec::new();
-    for sp in &display.spans {
+    for sp in spans {
         if sp.inline_code_bg {
-            let c0 = display.map.visual_to_line_col(sp.range.start);
-            let c1 = display.map.visual_to_line_col(sp.range.end);
+            let c0 = map.visual_to_line_col(sp.range.start);
+            let c1 = map.visual_to_line_col(sp.range.end);
             for run in buffer.layout_runs() {
                 for (hx, hw) in run.highlight(c0, c1) {
                     inline_code_rects.push(Rect::new(
@@ -1767,6 +2794,39 @@ fn shape_block(
         }
     }
 
+    (buffer, max_line_w, text_height, inline_code_rects)
+}
+
+fn shape_block(
+    font_system: &mut FontSystem,
+    display: BlockDisplay,
+    avail_w: f32,
+    style: &ResolvedThemeStyle,
+    _hash: u64,
+    frame_seq: u64,
+) -> CachedBlockShape {
+    let (font_size, line_height, default_weight) = if let Some(lvl) = display.heading_level {
+        let hs = &style.headings[(lvl.clamp(1, 6) - 1) as usize];
+        (hs.font_size_px, hs.line_height_px, hs.weight)
+    } else if display.code_box {
+        (style.code_font_size_px, style.code_line_height_px, 400)
+    } else {
+        (style.base_font_size_px, style.base_line_height_px, 400)
+    };
+
+    let (buffer, _, text_height, inline_code_rects) = shape_rich_text_buffer(
+        font_system,
+        &display.map,
+        &display.spans,
+        avail_w,
+        font_size,
+        line_height,
+        default_weight,
+        display.code_box,
+        None,
+        style,
+        if display.hr_rule { Some(8.0) } else { None },
+    );
     let total_height = text_height + display.top_pad_px + display.bottom_pad_px;
 
     CachedBlockShape {
@@ -1776,6 +2836,152 @@ fn shape_block(
         display,
         total_height,
         inline_code_rects,
+    }
+}
+
+fn shape_table_block(
+    font_system: &mut FontSystem,
+    rows_display: Vec<TableRowDisplay>,
+    avail_table_w: f32,
+    style: &ResolvedThemeStyle,
+    frame_seq: u64,
+) -> CachedTableShape {
+    let cell_pad_x = 12.0 * style.zoom_scale;
+    let cell_pad_y = 7.0 * style.zoom_scale;
+    let top_pad_px = 6.0 * style.zoom_scale;
+    let bottom_pad_px = 6.0 * style.zoom_scale;
+
+    let num_cols = rows_display
+        .iter()
+        .map(|r| r.cells.len())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let mut natural_text_w = vec![0.0f32; num_cols];
+
+    for row in &rows_display {
+        for (c_idx, cell) in row.cells.iter().enumerate() {
+            if cell.is_placeholder || cell.map.display_text.is_empty() {
+                continue;
+            }
+            let (_, line_w, _, _) = shape_rich_text_buffer(
+                font_system,
+                &cell.map,
+                &cell.spans,
+                4096.0,
+                style.base_font_size_px,
+                style.base_line_height_px,
+                cell.default_weight,
+                row.is_delimiter,
+                Some(Align::Left),
+                style,
+                None,
+            );
+            natural_text_w[c_idx] = natural_text_w[c_idx].max(line_w);
+        }
+    }
+
+    let min_col_w = (56.0 * style.zoom_scale).min(avail_table_w / num_cols as f32);
+    let mut col_widths: Vec<f32> = natural_text_w
+        .iter()
+        .map(|&tw| (tw + 2.0 * cell_pad_x).max(min_col_w))
+        .collect();
+    let desired_sum: f32 = col_widths.iter().sum();
+
+    if desired_sum <= avail_table_w {
+        let extra = avail_table_w - desired_sum;
+        let equal_share = extra * 0.5 / num_cols as f32;
+        let weight_sum: f32 = col_widths.iter().sum::<f32>().max(1.0);
+        for w in &mut col_widths {
+            *w += equal_share + (extra * 0.5) * (*w / weight_sum);
+        }
+    } else if (num_cols as f32) * min_col_w >= avail_table_w {
+        let uniform = avail_table_w / num_cols as f32;
+        col_widths.fill(uniform);
+    } else {
+        let excess = desired_sum - avail_table_w;
+        let shrinkable: f32 = col_widths
+            .iter()
+            .map(|&w| (w - min_col_w).max(0.0))
+            .sum::<f32>()
+            .max(1.0);
+        for w in &mut col_widths {
+            let slack = (*w - min_col_w).max(0.0);
+            *w -= excess * (slack / shrinkable);
+        }
+    }
+
+    let mut y_acc = 0.0f32;
+    let mut shaped_rows = Vec::with_capacity(rows_display.len());
+
+    for row in rows_display {
+        let mut x_acc = 0.0f32;
+        let mut row_text_h = style.base_line_height_px;
+        let mut shaped_cells = Vec::with_capacity(row.cells.len());
+
+        for (c_idx, cell) in row.cells.into_iter().enumerate() {
+            let col_w = col_widths[c_idx];
+            let inner_w = (col_w - 2.0 * cell_pad_x).max(12.0);
+            let cosmic_align = match cell.align {
+                TableAlign::Left => Align::Left,
+                TableAlign::Center => Align::Center,
+                TableAlign::Right => Align::Right,
+            };
+            let (buffer, _, text_h, inline_code_rects) = shape_rich_text_buffer(
+                font_system,
+                &cell.map,
+                &cell.spans,
+                inner_w,
+                style.base_font_size_px,
+                style.base_line_height_px,
+                cell.default_weight,
+                row.is_delimiter,
+                Some(cosmic_align),
+                style,
+                None,
+            );
+            if !cell.is_placeholder {
+                row_text_h = row_text_h.max(text_h);
+            }
+            shaped_cells.push(TableCellShape {
+                x_rel: x_acc,
+                w: col_w,
+                text_x_rel: x_acc + cell_pad_x,
+                inner_w,
+                rel_raw_range: cell.rel_raw_range,
+                rel_src_range: cell.rel_src_range,
+                align: cell.align,
+                is_placeholder: cell.is_placeholder,
+                buffer,
+                map: cell.map,
+                spans: cell.spans,
+                inline_code_rects,
+            });
+            x_acc += col_w;
+        }
+
+        let row_h = row_text_h + 2.0 * cell_pad_y;
+        shaped_rows.push(TableRowShape {
+            y_rel: y_acc,
+            h: row_h,
+            is_header: row.is_header,
+            is_delimiter: row.is_delimiter,
+            line_range_rel: row.line_range_rel,
+            cells: shaped_cells,
+        });
+        y_acc += row_h;
+    }
+
+    let table_h = y_acc.max(style.base_line_height_px + 2.0 * cell_pad_y);
+    CachedTableShape {
+        last_used_frame: frame_seq,
+        table_w: avail_table_w,
+        table_h,
+        top_pad_px,
+        cell_pad_y,
+        col_widths,
+        rows: shaped_rows,
+        total_height: top_pad_px + table_h + bottom_pad_px,
     }
 }
 
@@ -1858,6 +3064,10 @@ fn estimate_block_height(node: &BlockNode, style: &ResolvedThemeStyle, width_cha
             let est_lines = (node.range.len() as f32 / (width_chars * 0.6).max(12.0)).clamp(2.0, 200.0);
             est_lines * style.code_line_height_px + 16.0 * style.zoom_scale
         }
+        BlockKind::Table => {
+            let est_rows = ((node.range.len() as f32 / (width_chars * 0.7).max(20.0)).ceil().max(1.0) - 0.5).max(1.0);
+            est_rows * (style.base_line_height_px + 14.0 * style.zoom_scale) + 12.0 * style.zoom_scale
+        }
         _ => {
             let est_lines = (node.range.len() as f32 / width_chars).ceil().max(1.0);
             est_lines * style.base_line_height_px + 7.0 * style.zoom_scale
@@ -1873,11 +3083,42 @@ fn style_signature(style: &ResolvedThemeStyle) -> u64 {
     style.inline_code_color.hash(&mut h);
     style.code_block_text.hash(&mut h);
     style.blockquote_text.hash(&mut h);
+    style.table_border.hash(&mut h);
+    style.table_header_bg.hash(&mut h);
     style.base_font_family.hash(&mut h);
     style.base_font_size_px.to_bits().hash(&mut h);
     style.base_line_height_px.to_bits().hash(&mut h);
     style.zoom_scale.to_bits().hash(&mut h);
     h.finish()
+}
+
+fn hash_map_and_spans(
+    h: &mut std::collections::hash_map::DefaultHasher,
+    map: &VisualTextMap,
+    spans: &[DisplaySpanStyle],
+) {
+    let block_start = map.block_range.start;
+    map.display_text.hash(h);
+    map.block_range.len().hash(h);
+    map.segments.len().hash(h);
+    for seg in &map.segments {
+        seg.vis_start.hash(h);
+        seg.vis_end.hash(h);
+        seg.src_start.saturating_sub(block_start).hash(h);
+        seg.src_end.saturating_sub(block_start).hash(h);
+        seg.synthetic.hash(h);
+    }
+    if let Some(ime) = &map.ime_splice {
+        true.hash(h);
+        ime.vis_start.hash(h);
+        ime.vis_end.hash(h);
+        ime.comp_src_start.saturating_sub(block_start).hash(h);
+        ime.comp_src_end.saturating_sub(block_start).hash(h);
+        ime.preedit_caret_vis.hash(h);
+    } else {
+        false.hash(h);
+    }
+    spans.hash(h);
 }
 
 fn shape_cache_key(
@@ -1887,28 +3128,7 @@ fn shape_cache_key(
     code_box: bool,
 ) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    let block_start = display.map.block_range.start;
-    display.map.display_text.hash(&mut h);
-    display.map.block_range.len().hash(&mut h);
-    display.map.segments.len().hash(&mut h);
-    for seg in &display.map.segments {
-        seg.vis_start.hash(&mut h);
-        seg.vis_end.hash(&mut h);
-        seg.src_start.saturating_sub(block_start).hash(&mut h);
-        seg.src_end.saturating_sub(block_start).hash(&mut h);
-        seg.synthetic.hash(&mut h);
-    }
-    if let Some(ime) = &display.map.ime_splice {
-        true.hash(&mut h);
-        ime.vis_start.hash(&mut h);
-        ime.vis_end.hash(&mut h);
-        ime.comp_src_start.saturating_sub(block_start).hash(&mut h);
-        ime.comp_src_end.saturating_sub(block_start).hash(&mut h);
-        ime.preedit_caret_vis.hash(&mut h);
-    } else {
-        false.hash(&mut h);
-    }
-    display.spans.hash(&mut h);
+    hash_map_and_spans(&mut h, &display.map, &display.spans);
     avail_w.to_bits().hash(&mut h);
     style_sig.hash(&mut h);
     display.top_pad_px.to_bits().hash(&mut h);
@@ -1917,7 +3137,47 @@ fn shape_cache_key(
     h.finish()
 }
 
+fn shape_table_cache_key(
+    rows: &[TableRowDisplay],
+    avail_table_w: f32,
+    style_sig: u64,
+    block_focused: bool,
+    focus_mode: bool,
+) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    rows.len().hash(&mut h);
+    for row in rows {
+        row.is_header.hash(&mut h);
+        row.is_delimiter.hash(&mut h);
+        row.cells.len().hash(&mut h);
+        for cell in &row.cells {
+            cell.is_placeholder.hash(&mut h);
+            cell.default_weight.hash(&mut h);
+            match cell.align {
+                TableAlign::Left => 0u8,
+                TableAlign::Center => 1u8,
+                TableAlign::Right => 2u8,
+            }
+            .hash(&mut h);
+            cell.rel_raw_range.len().hash(&mut h);
+            cell.rel_src_range.start.saturating_sub(cell.rel_raw_range.start).hash(&mut h);
+            hash_map_and_spans(&mut h, &cell.map, &cell.spans);
+        }
+    }
+    avail_table_w.to_bits().hash(&mut h);
+    style_sig.hash(&mut h);
+    block_focused.hash(&mut h);
+    focus_mode.hash(&mut h);
+    h.finish()
+}
+
 fn evict_oldest_lru(map: &mut HashMap<u64, CachedBlockShape>) {
+    if let Some((&oldest_key, _)) = map.iter().min_by_key(|(_, v)| v.last_used_frame) {
+        map.remove(&oldest_key);
+    }
+}
+
+fn evict_oldest_table_lru(map: &mut HashMap<u64, CachedTableShape>) {
     if let Some((&oldest_key, _)) = map.iter().min_by_key(|(_, v)| v.last_used_frame) {
         map.remove(&oldest_key);
     }
@@ -2197,5 +3457,210 @@ mod tests {
             "second link hit mapped to {off}, expected within {:?}",
             blocks[2].range
         );
+    }
+
+    #[test]
+    fn test_wysiwyg_table_grid_rendering_delimiter_collapse_hit_test_and_vertical_nav() {
+        let doc = concat!(
+            "Intro paragraph\n\n",
+            "| Name | Role | Score |\n",
+            "| :--- | :---: | ---: |\n",
+            "| Alice | **Lead** | 100 |\n",
+            "| 中文 | Dev | 95 |\n\n",
+            "Outro paragraph"
+        );
+        let blocks = parse_blocks(doc);
+        assert_eq!(blocks.len(), 5);
+        assert_eq!(blocks[2].kind, BlockKind::Table);
+
+        let style = ResolvedThemeStyle::default();
+        let mut cache = ShapedDocumentCache::new();
+        let view = EditorViewState {
+            mode: ViewMode::Wysiwyg,
+            selection: Selection::caret(0),
+            ..Default::default()
+        };
+        let vp = EditorViewport {
+            doc_rect: Rect::new(0.0, 0.0, 900.0, 720.0),
+            content_left_x: 60.0,
+            content_width_px: 780.0,
+            scroll_y: 0.0,
+            overscan_px: 120.0,
+            scale_factor: 1.0,
+            source_rev: 1,
+            source_len: doc.len(),
+            view: &view,
+            focus_mode: false,
+            show_caret: true,
+            find_matches: &[],
+            active_find: None,
+        };
+        let scene = cache.build_editor_scene(&blocks, &style, &vp, |r| doc[r.start..r.end].to_string());
+
+        // Table renders outer border, header background, row & column dividers using theme table styles.
+        let header_bg_count = scene
+            .draw
+            .rects
+            .iter()
+            .filter(|r| r.color == style.table_header_bg)
+            .count();
+        assert_eq!(header_bg_count, 1, "expected 1 header row background fill");
+        let border_rects = scene
+            .draw
+            .rects
+            .iter()
+            .filter(|r| r.color == style.table_border || r.border_color == style.table_border)
+            .count();
+        assert!(
+            border_rects >= 5,
+            "expected outer border + row dividers + col dividers, got {border_rects}"
+        );
+
+        let table_rec = cache.last_hit_blocks[2];
+        assert!(table_rec.is_table);
+        let shaped_tbl = cache.table_lru.get(&table_rec.shape_hash).unwrap();
+        // Delimiter row is collapsed in WYSIWYG mode when caret is not on it -> 3 visible rows (1 header + 2 body).
+        assert_eq!(shaped_tbl.rows.len(), 3);
+        assert!(shaped_tbl.rows[0].is_header);
+        assert!(!shaped_tbl.rows[1].is_delimiter);
+
+        // Clicking middle cell (`**Lead**`) hits inside exact `**Lead**` cell byte range without showing `**`.
+        let body0 = &shaped_tbl.rows[1];
+        let mid_cell = &body0.cells[1];
+        assert_eq!(mid_cell.map.display_text, "Lead");
+        let click_x = table_rec.text_origin_x + mid_cell.text_x_rel + 12.0;
+        let click_y = table_rec.text_origin_y + body0.y_rel + body0.h * 0.5;
+        let hit = cache.hit_test(click_x, click_y).expect("table cell hit");
+        let EditorHitTarget::Text(hit_off) = hit else {
+            panic!("expected text hit in table cell");
+        };
+        let lead_start = doc.find("**Lead**").unwrap();
+        assert!(
+            hit_off >= lead_start && hit_off <= lead_start + "**Lead**".len(),
+            "hit offset {hit_off} expected inside **Lead** ({}..={})",
+            lead_start,
+            lead_start + "**Lead**".len()
+        );
+
+        // Moving caret onto the delimiter row keeps it hidden in WYSIWYG mode (never renders `:---:` as cells).
+        let delim_pos = doc.find(":---:").unwrap();
+        let delim_view = EditorViewState {
+            mode: ViewMode::Wysiwyg,
+            selection: Selection::caret(delim_pos),
+            ..Default::default()
+        };
+        let delim_vp = EditorViewport {
+            view: &delim_view,
+            ..vp
+        };
+        let _ = cache.build_editor_scene(&blocks, &style, &delim_vp, |r| doc[r.start..r.end].to_string());
+        let delim_tbl = cache.table_lru.get(&cache.last_hit_blocks[2].shape_hash).unwrap();
+        assert_eq!(delim_tbl.rows.len(), 3);
+        assert!(delim_tbl.rows.iter().all(|r| !r.is_delimiter));
+        assert!(
+            delim_tbl
+                .rows
+                .iter()
+                .flat_map(|r| r.cells.iter())
+                .all(|c| !c.map.display_text.contains("---")),
+            "delimiter row must never render as visible cells"
+        );
+
+        // Standalone delimiter lines (`|--|`, `|:---|`) remain plain Paragraphs, never table grids.
+        for standalone in ["|--|", "|:---|"] {
+            let s_blocks = parse_blocks(standalone);
+            let s_view = EditorViewState {
+                mode: ViewMode::Wysiwyg,
+                selection: Selection::caret(standalone.len()),
+                ..Default::default()
+            };
+            let s_vp = EditorViewport {
+                view: &s_view,
+                ..vp
+            };
+            let _ = cache.build_editor_scene(&s_blocks, &style, &s_vp, |r| {
+                standalone[r.start..r.end].to_string()
+            });
+            assert!(
+                !cache.last_hit_blocks[0].is_table,
+                "`{standalone}` must not render as a WYSIWYG table"
+            );
+        }
+
+        // Vertical navigation: from header column 1 (`Role`) Down goes to body0 column 1 (`**Lead**`),
+        // skipping collapsed delimiter row; Down again goes to body1 column 1 (`Dev`); Down exits to Outro paragraph.
+        let role_pos = doc.find("Role").unwrap() + 1;
+        let nav_view = EditorViewState {
+            mode: ViewMode::Wysiwyg,
+            selection: Selection::caret(role_pos),
+            ..Default::default()
+        };
+        let (down1, px1) = cache.move_caret_vertical(
+            role_pos,
+            1,
+            None,
+            &blocks,
+            &nav_view,
+            &style,
+            vp.content_width_px,
+            |r| doc[r.start..r.end].to_string(),
+        );
+        assert!(
+            down1 >= lead_start && down1 <= lead_start + "**Lead**".len(),
+            "Down from header col 1 landed at {down1}, expected inside **Lead**"
+        );
+        let (down2, px2) = cache.move_caret_vertical(
+            down1,
+            1,
+            px1,
+            &blocks,
+            &nav_view,
+            &style,
+            vp.content_width_px,
+            |r| doc[r.start..r.end].to_string(),
+        );
+        let dev_start = doc.find("| Dev |").unwrap() + 2;
+        assert!(
+            down2 >= dev_start && down2 <= dev_start + 3,
+            "Down from body0 col 1 landed at {down2}, expected inside Dev"
+        );
+        let (down3, px3) = cache.move_caret_vertical(
+            down2,
+            1,
+            px2,
+            &blocks,
+            &nav_view,
+            &style,
+            vp.content_width_px,
+            |r| doc[r.start..r.end].to_string(),
+        );
+        assert_eq!(down3, blocks[3].range.start, "Down from table exited to blank line block");
+        let (down4, _) = cache.move_caret_vertical(
+            down3,
+            1,
+            px3,
+            &blocks,
+            &nav_view,
+            &style,
+            vp.content_width_px,
+            |r| doc[r.start..r.end].to_string(),
+        );
+        assert!(
+            down4 >= blocks[4].range.start,
+            "Down past blank line landed at {down4}, expected Outro ({:?})",
+            blocks[4].range
+        );
+
+        // Source mode keeps non-table plain monospace rendering
+        let src_view = EditorViewState {
+            mode: ViewMode::Source,
+            ..Default::default()
+        };
+        let src_vp = EditorViewport {
+            view: &src_view,
+            ..vp
+        };
+        let _ = cache.build_editor_scene(&blocks, &style, &src_vp, |r| doc[r.start..r.end].to_string());
+        assert!(!cache.last_hit_blocks[2].is_table);
     }
 }

@@ -20,33 +20,11 @@ fn next_recovery_session_tag() -> String {
     format!("pid{}-{nanos}-wb{seq}", std::process::id())
 }
 
-fn normalize_line_endings(text: &str, target: LineEnding) -> String {
-    if !text.contains('\n') && !text.contains('\r') {
-        return text.to_string();
-    }
-    let target_str = target.as_str();
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-                out.push_str(target_str);
-            }
-            '\n' => out.push_str(target_str),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
 use vellmark_core::{
     AutoMergeOutcome, ByteOffset, ConflictActionOutcome, DEFAULT_ORPHAN_GRACE_SECS, DocState,
     DocumentSession, DocumentStats, EditorAction, EditorContext, EditorViewState,
     ExternalSyncResult, FileTreeNode, HISTORICAL_BACKUPS_DIR_NAME, HistoricalBackupEntry,
-    HistoricalBackupPolicy, HistoricalBackupReason, LineEnding, MergeConflictHunk,
+    HistoricalBackupPolicy, HistoricalBackupReason, MergeConflictHunk,
     PendingRecoveryEntry, RecentFilesList, RecoveryMaintenanceReport, SaveOutcome, Selection,
     SessionError, archive_pending_recovery_to_history, clear_conflict_backups_for_path,
     clear_historical_backups_for_path, delete_historical_backup, discard_pending_recovery_entry,
@@ -196,13 +174,6 @@ impl DocumentTab {
         copy_selection(&self.session.buffer.to_string(), self.view.selection)
     }
 
-    fn target_line_ending(&self) -> LineEnding {
-        LineEnding::detect_dominant_or(
-            &self.session.buffer.to_string(),
-            self.session.format.dominant_line_ending,
-        )
-    }
-
     /// Paste rich clipboard content (`text/html`, Excel/CSV spreadsheet text, or plain text, PRD 4.6 X-06 & 4.3 T-04).
     pub fn paste_rich_clipboard(
         &mut self,
@@ -216,8 +187,7 @@ impl DocumentTab {
         } else {
             plain_text.to_string()
         };
-        let normalized = normalize_line_endings(&converted, self.target_line_ending());
-        self.edit(|ctx| ctx.insert_text(&normalized))
+        self.edit(|ctx| ctx.insert_text(&converted))
     }
 
     /// Sync and borrow cached incremental AST blocks without allocating on unchanged frames (10 MB fast path).

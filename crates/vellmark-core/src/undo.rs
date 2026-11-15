@@ -120,6 +120,38 @@ impl UndoHistory {
         });
     }
 
+    /// Execute and record multiple non-overlapping replacement operations in original-buffer offsets
+    /// as a single atomic transaction (applied in descending offset order so undo/redo stay exact).
+    pub fn apply_ops(
+        &mut self,
+        buf: &mut TextBuffer,
+        mut edits: Vec<(ByteRange, String)>,
+        selection_before: Selection,
+        selection_after: Selection,
+        kind: EditKind,
+    ) {
+        edits.sort_by(|a, b| {
+            b.0.start
+                .cmp(&a.0.start)
+                .then_with(|| b.0.end.cmp(&a.0.end))
+        });
+        let mut ops = Vec::with_capacity(edits.len());
+        for (range, replacement) in edits {
+            let deleted = buf.replace_bytes(range, &replacement);
+            ops.push(EditOp {
+                range,
+                deleted,
+                inserted: replacement,
+            });
+        }
+        self.record_transaction(Transaction {
+            ops,
+            selection_before,
+            selection_after,
+            kind,
+        });
+    }
+
     /// Record a marker-only syntax conversion (where no extra text was auto-inserted, e.g. `## ` or `**bold**`)
     /// so that pressing `Cmd/Ctrl + Z` immediately escapes the trigger marker per PRD 4.1.1 B.1.
     pub fn record_syntax_trigger(

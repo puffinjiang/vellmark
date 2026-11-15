@@ -228,6 +228,29 @@ pub fn detect_and_decode(raw: &[u8]) -> Result<(String, FileFormatMeta), Encodin
     Ok((preview, meta))
 }
 
+/// Normalize `\r\n`, standalone `\r`, and standalone `\n` line breaks in `text` to `target`.
+pub fn normalize_line_endings(text: &str, target: LineEnding) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\n') && !text.contains('\r') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let target_str = target.as_str();
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push_str(target_str);
+            }
+            '\n' => out.push_str(target_str),
+            other => out.push(other),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Encode buffer text back to bytes for saving, preserving BOM and exact content (PRD 5.2).
 pub fn encode_for_save(text: &str, meta: &FileFormatMeta) -> Result<Vec<u8>, EncodingError> {
     match meta.decision {
@@ -333,5 +356,17 @@ mod tests {
             LineEnding::Lf
         );
         assert_eq!(LineEnding::detect_dominant("a\nb\r\nc"), LineEnding::Lf);
+    }
+
+    #[test]
+    fn test_normalize_line_endings_handles_all_styles_and_borrows_single_line() {
+        let single = "plain text without breaks";
+        assert!(matches!(
+            normalize_line_endings(single, LineEnding::CrLf),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(normalize_line_endings("a\nb\r\nc\rd", LineEnding::CrLf), "a\r\nb\r\nc\r\nd");
+        assert_eq!(normalize_line_endings("a\r\nb\rc\nd", LineEnding::Lf), "a\nb\nc\nd");
+        assert_eq!(normalize_line_endings("a\r\nb\nc", LineEnding::Cr), "a\rb\rc");
     }
 }

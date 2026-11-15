@@ -6,7 +6,7 @@
 //!   task lists, blockquotes, fenced code blocks, and tables (4.1.1 C & G)
 
 use crate::buffer::{ByteOffset, ByteRange, Selection, TextBuffer};
-use crate::encoding::LineEnding;
+use crate::encoding::{LineEnding, normalize_line_endings};
 use crate::undo::{EditKind, EditOp, Transaction, UndoHistory};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,23 +352,29 @@ impl EditorContext<'_> {
     pub fn ime_commit(&mut self, committed: &str) {
         *self.ime_preedit = None;
         *self.expansion_frozen = false;
-        let orig_selection = self
+        self.normalize_selection_out_of_crlf();
+        let raw_orig = self
             .ime_composition_selection
             .take()
             .unwrap_or(*self.selection);
+        let orig_selection = Selection::new(
+            self.buffer.snap_out_of_crlf(raw_orig.anchor),
+            self.buffer.snap_out_of_crlf(raw_orig.head),
+        );
         let target_range = orig_selection.range();
         if committed.is_empty() {
             return;
         }
+        let normalized = self.normalize_newlines(committed);
         let cursor_moved_away = *self.selection != orig_selection;
         let sel_before = orig_selection;
-        let commit_end = target_range.start + committed.len();
+        let commit_end = target_range.start + normalized.len();
         let sel_after = if cursor_moved_away {
             let shift_point = |pt: ByteOffset| -> ByteOffset {
                 if pt <= target_range.start {
                     pt
                 } else if pt >= target_range.end {
-                    pt - target_range.len() + committed.len()
+                    pt - target_range.len() + normalized.len()
                 } else {
                     commit_end
                 }
@@ -383,7 +389,7 @@ impl EditorContext<'_> {
         self.undo.apply_edit(
             self.buffer,
             target_range,
-            committed,
+            &normalized,
             sel_before,
             sel_after,
             EditKind::ImeCommit,
@@ -391,9 +397,20 @@ impl EditorContext<'_> {
         *self.selection = sel_after;
     }
 
-    fn dominant_line_ending(&self) -> &'static str {
+    fn dominant_line_ending_kind(&self) -> LineEnding {
         let full = self.buffer.to_string();
-        LineEnding::detect_dominant_or(&full, self.preferred_line_ending).as_str()
+        LineEnding::detect_dominant_or(&full, self.preferred_line_ending)
+    }
+
+    fn dominant_line_ending(&self) -> &'static str {
+        self.dominant_line_ending_kind().as_str()
+    }
+
+    fn normalize_newlines<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        if !text.contains('\n') && !text.contains('\r') {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        normalize_line_endings(text, self.dominant_line_ending_kind())
     }
 
     /// Snap caret/selection endpoints out of the middle of `\r\n` so user edits never split CRLF.
@@ -412,13 +429,14 @@ impl EditorContext<'_> {
         if text.is_empty() && self.selection.is_caret() {
             return;
         }
+        let normalized = self.normalize_newlines(text);
         let range = self.selection.range();
         let sel_before = *self.selection;
-        let sel_after = Selection::caret(range.start + text.len());
+        let sel_after = Selection::caret(range.start + normalized.len());
         self.undo.apply_edit(
             self.buffer,
             range,
-            text,
+            &normalized,
             sel_before,
             sel_after,
             EditKind::Structural,
@@ -429,6 +447,7 @@ impl EditorContext<'_> {
     /// Toggle inline Markdown formatting markers (`**`, `*`, `` ` ``, `~~`) around the current selection (PRD 4.10).
     pub fn toggle_inline_wrap(&mut self, marker: &str) {
         self.abort_ime_preedit();
+        self.normalize_selection_out_of_crlf();
         if marker.is_empty() {
             return;
         }
@@ -540,6 +559,8 @@ impl EditorContext<'_> {
     /// Insert or wrap selection as a Markdown hyperlink `[label](url)` (PRD 4.10 `Cmd/Ctrl+K`).
     pub fn insert_link(&mut self, url: &str) {
         self.abort_ime_preedit();
+        self.normalize_selection_out_of_crlf();
+        let url = self.normalize_newlines(url);
         let range = self.selection.range();
         let sel_before = *self.selection;
         let selected = self.buffer.slice_to_string(range);
@@ -564,6 +585,7 @@ impl EditorContext<'_> {
     /// Convert current line to Paragraph (`level == 0`) or Heading 1–6 (`1..=6`, PRD 4.10 `Cmd/Ctrl + 0..6`).
     pub fn set_heading_level(&mut self, level: u8) {
         self.abort_ime_preedit();
+        self.normalize_selection_out_of_crlf();
         let (line_start, line_end) = self.current_line_bounds();
         if *self.mode == ViewMode::Wysiwyg && self.is_offset_inside_fenced_code_block(line_start) {
             return;
@@ -601,6 +623,7 @@ impl EditorContext<'_> {
     /// Toggle task-list checkbox (`- [ ] ` <-> `- [x] `, or `- ` -> `- [ ] `) on current line.
     pub fn toggle_task_checkbox(&mut self) -> bool {
         self.abort_ime_preedit();
+        self.normalize_selection_out_of_crlf();
         let (line_start, line_end) = self.current_line_bounds();
         if *self.mode == ViewMode::Wysiwyg && self.is_offset_inside_fenced_code_block(line_start) {
             return false;
@@ -910,7 +933,10 @@ impl EditorContext<'_> {
                 *self.selection = sel_after;
                 return;
             }
-            if self.is_caret_in_table_row() {
+            if self.is_caret_in_table_row()
+                && (self.has_adjacent_table_row(line_start, line_end)
+                    || !is_table_delimiter_row(&line))
+            {
                 self.tab_in_table(line_start, line_end, &line);
                 return;
             }
@@ -1075,17 +1101,32 @@ impl EditorContext<'_> {
                             *self.selection = sel_after;
                         }
                         return;
-                    } else if caret == content_end {
-                        // Continue list on next line
-                        let nl = self.dominant_line_ending();
-                        let prefix = &line[..indent_bytes + marker_bytes];
-                        let insertion = format!("{nl}{prefix}");
+                    } else if caret >= line_start + indent_bytes + marker_bytes {
+                        // Continue list on next line (incrementing & renumbering ordered lists in one atomic tx)
+                        let full = self.buffer.to_string();
+                        let nl = detect_line_ending_str(&full, self.preferred_line_ending);
+                        let indent = &line[..indent_bytes];
+                        let (next_prefix, mut edits) =
+                            if let Some((_, _, _, num)) = ordered_list_prefix(&line) {
+                                let next_num = num.saturating_add(1);
+                                let next_prefix = format!("{indent}{next_num}. ");
+                                let renumber = collect_ordered_list_renumber_edits(
+                                    &full,
+                                    line_end,
+                                    indent_bytes,
+                                    next_num.saturating_add(1),
+                                );
+                                (next_prefix, renumber)
+                            } else {
+                                (line[..indent_bytes + marker_bytes].to_string(), Vec::new())
+                            };
+                        let insertion = format!("{nl}{next_prefix}");
                         let sel_before = *self.selection;
                         let sel_after = Selection::caret(caret + insertion.len());
-                        self.undo.apply_edit(
+                        edits.push((ByteRange::empty(caret), insertion));
+                        self.undo.apply_ops(
                             self.buffer,
-                            ByteRange::empty(caret),
-                            &insertion,
+                            edits,
                             sel_before,
                             sel_after,
                             EditKind::Structural,
@@ -1096,13 +1137,15 @@ impl EditorContext<'_> {
                 }
 
                 // PRD 4.1.1 G #6 & 4.3 T-01 / T-02: Table Enter handling
-                if self.is_caret_in_table_row() {
+                if self.is_caret_in_table_row()
+                    && (self.has_adjacent_table_row(line_start, line_end)
+                        || !is_table_delimiter_row(&line))
+                {
                     let pipes = unescaped_pipe_offsets(&line);
                     if pipes.len() >= 2 {
                         let cols = pipes.len() - 1;
                         let empty_row = build_empty_table_row(cols);
-                        let is_standalone_header = !self.has_adjacent_table_row(line_start, line_end)
-                            && !is_table_delimiter_row(&line);
+                        let is_standalone_header = !self.has_adjacent_table_row(line_start, line_end);
 
                         let full = self.buffer.to_string();
                         let nl = detect_line_ending_str(&full, self.preferred_line_ending);
@@ -1352,6 +1395,7 @@ impl EditorContext<'_> {
     /// undoable transaction. Returns `true` if a table was found and its source changed.
     pub fn align_current_table(&mut self) -> bool {
         self.abort_ime_preedit();
+        self.normalize_selection_out_of_crlf();
         let (line_start, _) = self.current_line_bounds();
         if self.is_offset_inside_fenced_code_block(line_start) || !self.is_caret_in_table_row() {
             return false;
@@ -1370,6 +1414,12 @@ impl EditorContext<'_> {
             .len()
             .min(sel_before.head.saturating_sub(table_range.start));
         while rel_after > 0 && !aligned.is_char_boundary(rel_after) {
+            rel_after -= 1;
+        }
+        if rel_after > 0
+            && aligned.as_bytes().get(rel_after) == Some(&b'\n')
+            && aligned.as_bytes().get(rel_after - 1) == Some(&b'\r')
+        {
             rel_after -= 1;
         }
         let sel_after = Selection::caret(table_range.start + rel_after);
@@ -2111,6 +2161,73 @@ fn heading_prefix_len(line: &str) -> Option<usize> {
     }
 }
 
+fn ordered_list_prefix(line: &str) -> Option<(usize, usize, usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut indent = 0usize;
+    while indent < bytes.len() && bytes[indent] == b' ' {
+        indent += 1;
+    }
+    let rest = &line[indent..];
+    let mut digits = 0usize;
+    while digits < rest.len() && rest.as_bytes()[digits].is_ascii_digit() {
+        digits += 1;
+    }
+    if digits > 0 && rest[digits..].starts_with(". ") {
+        let num = rest[..digits].parse::<usize>().ok()?;
+        return Some((indent, digits + 2, digits, num));
+    }
+    None
+}
+
+fn collect_ordered_list_renumber_edits(
+    source: &str,
+    current_line_lf_end: usize,
+    target_indent: usize,
+    start_num: usize,
+) -> Vec<(ByteRange, String)> {
+    let bytes = source.as_bytes();
+    if current_line_lf_end >= bytes.len() || bytes[current_line_lf_end] != b'\n' {
+        return Vec::new();
+    }
+    let mut edits = Vec::new();
+    let mut expected_num = start_num;
+    let mut pos = current_line_lf_end + 1;
+    while pos < bytes.len() {
+        let l_start = pos;
+        let mut l_end = pos;
+        while l_end < bytes.len() && bytes[l_end] != b'\n' {
+            l_end += 1;
+        }
+        let next_pos = if l_end < bytes.len() { l_end + 1 } else { l_end };
+        let raw_line = &source[l_start..l_end];
+        let s_line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if s_line.trim().is_empty() {
+            break;
+        }
+        let s_indent = s_line.bytes().take_while(|&b| b == b' ').count();
+        if s_indent > target_indent {
+            pos = next_pos;
+            continue;
+        }
+        if s_indent < target_indent {
+            break;
+        }
+        if let Some((_, _, digits_len, existing_num)) = ordered_list_prefix(s_line) {
+            if existing_num != expected_num {
+                edits.push((
+                    ByteRange::new(l_start + s_indent, l_start + s_indent + digits_len),
+                    expected_num.to_string(),
+                ));
+            }
+            expected_num = expected_num.saturating_add(1);
+            pos = next_pos;
+        } else {
+            break;
+        }
+    }
+    edits
+}
+
 fn list_prefix_parts(line: &str) -> Option<(usize, usize)> {
     let bytes = line.as_bytes();
     let mut indent = 0usize;
@@ -2123,15 +2240,7 @@ fn list_prefix_parts(line: &str) -> Option<(usize, usize)> {
             return Some((indent, marker.len()));
         }
     }
-    // Ordered list `1. `
-    let mut digits = 0usize;
-    while digits < rest.len() && rest.as_bytes()[digits].is_ascii_digit() {
-        digits += 1;
-    }
-    if digits > 0 && rest[digits..].starts_with(". ") {
-        return Some((indent, digits + 2));
-    }
-    None
+    ordered_list_prefix(line).map(|(indent, marker_len, _, _)| (indent, marker_len))
 }
 
 fn unescaped_pipe_offsets(line: &str) -> Vec<usize> {
@@ -2192,8 +2301,9 @@ fn is_table_delimiter_row(line: &str) -> bool {
     }
     for idx in 0..pipes.len() - 1 {
         let cell = line[pipes[idx] + 1..pipes[idx + 1]].trim();
-        let stripped = cell.trim_start_matches(':').trim_end_matches(':');
-        if stripped.len() < 3 || !stripped.bytes().all(|b| b == b'-') {
+        let after_left = cell.strip_prefix(':').unwrap_or(cell);
+        let dashes = after_left.strip_suffix(':').unwrap_or(after_left);
+        if dashes.is_empty() || !dashes.bytes().all(|b| b == b'-') {
             return false;
         }
     }
@@ -3057,5 +3167,161 @@ mod tests {
         del_last.enter();
         assert_eq!(del_last.buffer.to_string(), "A\r\nB");
         assert_strict_crlf(&del_last.buffer.to_string());
+    }
+
+    #[test]
+    fn test_ordered_list_enter_increments_renumbers_same_list_and_undo_atomicity() {
+        // Appending after item 5 (Quick Shortcuts scenario) produces 6., then exits on 2nd Enter.
+        let mut ed = EditorController::from_str(
+            "### Quick Shortcuts\r\n\r\n4. Switch mode\r\n5. Open files",
+        );
+        ed.set_caret(ed.buffer.len_bytes());
+        ed.enter();
+        assert_eq!(
+            ed.buffer.to_string(),
+            "### Quick Shortcuts\r\n\r\n4. Switch mode\r\n5. Open files\r\n6. "
+        );
+        assert_eq!(ed.selection, Selection::caret(ed.buffer.len_bytes()));
+        assert_strict_crlf(&ed.buffer.to_string());
+
+        ed.enter();
+        assert_eq!(
+            ed.buffer.to_string(),
+            "### Quick Shortcuts\r\n\r\n4. Switch mode\r\n5. Open files\r\n"
+        );
+
+        // Mid-list Enter inserts incremented item and renumbers subsequent items (including 9 -> 10 digit growth),
+        // skips deeper nested items cleanly, leaves separate list after blank line untouched,
+        // and undoes/redoes atomically in one step.
+        let initial = "1. First\n2. Second\n  - nested\n3. Nine\n4. Ten\n\n1. Other list\n2. Untouched";
+        let mut mid = EditorController::from_str(initial);
+        mid.set_caret("1. First".len());
+        mid.enter();
+        assert_eq!(
+            mid.buffer.to_string(),
+            "1. First\n2. \n3. Second\n  - nested\n4. Nine\n5. Ten\n\n1. Other list\n2. Untouched"
+        );
+        assert_eq!(mid.selection, Selection::caret("1. First\n2. ".len()));
+
+        // Undo restores exact original document in one step
+        mid.undo();
+        assert_eq!(mid.buffer.to_string(), initial);
+        assert_eq!(mid.selection, Selection::caret("1. First".len()));
+
+        // Redo restores the inserted + renumbered list cleanly
+        mid.redo();
+        assert_eq!(
+            mid.buffer.to_string(),
+            "1. First\n2. \n3. Second\n  - nested\n4. Nine\n5. Ten\n\n1. Other list\n2. Untouched"
+        );
+
+        // Digit-width growth test (8 -> 9 -> 10) + atomic undo
+        let growth_init = "8. Eight\n9. Nine\n10. Ten";
+        let mut growth = EditorController::from_str(growth_init);
+        growth.set_caret("8. Eight".len());
+        growth.enter();
+        assert_eq!(growth.buffer.to_string(), "8. Eight\n9. \n10. Nine\n11. Ten");
+        growth.undo();
+        assert_eq!(growth.buffer.to_string(), growth_init);
+    }
+
+    #[test]
+    fn test_standalone_delimiter_enter_and_short_gfm_delimiter_alignment() {
+        // Standalone delimiter lines (`|--|`, `|:---|`) + Enter must insert a plain newline, not table rows.
+        for sample in ["|--|", "|:---|", "| --- |"] {
+            let mut ed = EditorController::from_str(sample);
+            ed.set_caret(sample.len());
+            ed.enter();
+            assert_eq!(ed.buffer.to_string(), format!("{sample}\n"));
+        }
+
+        // Standalone delimiter lines (`|--|`, `|:---|`) + Tab must perform normal indent, not table nav.
+        let mut tab_standalone = EditorController::from_str("|--|");
+        tab_standalone.set_caret(0);
+        tab_standalone.tab();
+        assert_eq!(tab_standalone.buffer.to_string(), "  |--|");
+
+        // Real standalone header `| a | b |` + Enter still triggers T-01 scaffold.
+        let mut hdr = EditorController::from_str("| a | b |");
+        hdr.set_caret("| a | b |".len());
+        hdr.enter();
+        assert_eq!(
+            hdr.buffer.to_string(),
+            "| a | b |\n| --- | --- |\n|  |  |"
+        );
+
+        // Short GFM delimiter `|--|` inside a real table is skipped cleanly on Tab.
+        let mut tbl = EditorController::from_str("| Header |\n|--|\n| cell |");
+        tbl.set_caret("| Header".len());
+        tbl.tab();
+        assert!(
+            tbl.selection.head >= "| Header |\n|--|\n| ".len(),
+            "Tab from header should skip over short `|--|` delimiter to body row cell, got caret {}",
+            tbl.selection.head
+        );
+    }
+
+    #[test]
+    fn test_insert_text_ime_commit_and_inline_actions_normalize_newlines_and_protect_crlf() {
+        // 1. Direct `insert_text` normalizes LF -> CRLF in CRLF docs and advances caret by normalized len.
+        let mut crlf = EditorController::from_str("# Title\r\n\r\nBody\r\n");
+        let mid = "# Title".len();
+        crlf.set_caret(mid);
+        crlf.insert_text("a\nb");
+        assert_eq!(crlf.buffer.to_string(), "# Titlea\r\nb\r\n\r\nBody\r\n");
+        assert_eq!(crlf.selection, Selection::caret(mid + "a\r\nb".len()));
+        assert_strict_crlf(&crlf.buffer.to_string());
+
+        // 2. Direct `insert_text` normalizes CRLF -> LF in LF docs.
+        let mut lf = EditorController::from_str("# T\n\nB\n");
+        let lf_mid = "# T".len();
+        lf.set_caret(lf_mid);
+        lf.insert_text("a\r\nb");
+        assert_eq!(lf.buffer.to_string(), "# Ta\nb\n\nB\n");
+        assert_eq!(lf.selection, Selection::caret(lf_mid + "a\nb".len()));
+        assert!(!lf.buffer.to_string().contains('\r'));
+
+        // 3. No-newline buffer preserves `preferred_line_ending == CrLf` on `insert_text`.
+        let mut empty_pref = EditorController::with_line_ending("", LineEnding::CrLf);
+        empty_pref.insert_text("Line1\nLine2");
+        assert_eq!(empty_pref.buffer.to_string(), "Line1\r\nLine2");
+        assert_eq!(empty_pref.selection, Selection::caret("Line1\r\nLine2".len()));
+        assert_strict_crlf(&empty_pref.buffer.to_string());
+
+        // 4. `ime_commit` normalizes embedded newlines, snaps both `ime_composition_selection` and active
+        //    selection out of `\r|\n`, and avoids false `cursor_moved_away` when composition started at midpoint.
+        let mut ime = EditorController::from_str("A\r\nB");
+        ime.set_caret(2); // deliberately at `\r|\n` midpoint!
+        ime.ime_update("ni");
+        ime.ime_commit("你\n好");
+        assert_eq!(ime.buffer.to_string(), "A你\r\n好\r\nB");
+        assert_eq!(ime.selection, Selection::caret(1 + "你\r\n好".len()));
+        assert_strict_crlf(&ime.buffer.to_string());
+
+        // Moved cursor away during composition with CRLF midpoint on `ime_composition_selection`
+        let mut ime_moved = EditorController::from_str("A\r\nB");
+        ime_moved.set_caret(2); // `\r|\n` midpoint captured at `ime_update`
+        ime_moved.ime_update("x");
+        ime_moved.set_caret("A\r\nB".len());
+        ime_moved.ime_commit("甲\n乙");
+        assert_eq!(ime_moved.buffer.to_string(), "A甲\r\n乙\r\nB");
+        assert_eq!(
+            ime_moved.selection,
+            Selection::caret("A甲\r\n乙\r\nB".len())
+        );
+        assert_strict_crlf(&ime_moved.buffer.to_string());
+
+        // 5. `toggle_inline_wrap` and `insert_link` snap CRLF midpoint out of `\r|\n`.
+        let mut wrap = EditorController::from_str("hello\r\nworld");
+        wrap.set_selection(2, 6); // end at `\r|\n` midpoint (byte 6)
+        wrap.toggle_inline_wrap("**");
+        assert_strict_crlf(&wrap.buffer.to_string());
+        assert_eq!(wrap.buffer.to_string(), "he**llo**\r\nworld");
+
+        let mut link = EditorController::from_str("click\r\nhere");
+        link.set_caret(6); // `\r|\n` midpoint
+        link.insert_link("https://example.com\n");
+        assert_strict_crlf(&link.buffer.to_string());
+        assert_eq!(link.buffer.to_string(), "click[](https://example.com\r\n)\r\nhere");
     }
 }
