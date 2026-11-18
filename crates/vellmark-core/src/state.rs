@@ -351,6 +351,30 @@ impl SaveWorker {
         }
         guard.completed.drain(..).collect()
     }
+
+    fn cancel_pending_and_wait_in_flight(&self) -> Vec<FinishedWrite> {
+        let (lock, cv) = &*self.queue;
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        guard.pending = None;
+        while !guard.shutdown && guard.in_flight {
+            guard = match cv.wait(guard) {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+        }
+        guard.unreconciled_base = None;
+        guard.completed.drain(..).collect()
+    }
+
+    fn clear_unreconciled_base(&self) {
+        let (lock, _) = &*self.queue;
+        if let Ok(mut guard) = lock.lock() {
+            guard.unreconciled_base = None;
+        }
+    }
 }
 
 impl Drop for SaveWorker {
@@ -1368,6 +1392,15 @@ impl DocumentSession {
                 written_base,
                 disk_stat,
             } => {
+                if matches!(self.state, DocState::Missing { .. })
+                    && fs::symlink_metadata(&finished.path).is_err()
+                {
+                    self.disk_stat = None;
+                    self.on_external_deleted();
+                    return SaveOutcome::WriteFailed(
+                        "target file disappeared before write".to_string(),
+                    );
+                }
                 self.base = written_base;
                 self.disk_stat = disk_stat;
                 self.theirs = None;
@@ -1409,6 +1442,14 @@ impl DocumentSession {
         }
     }
 
+    fn apply_finished_writes(&mut self, finished: Vec<FinishedWrite>) -> Option<SaveOutcome> {
+        let mut last = None;
+        for item in finished {
+            last = Some(self.apply_finished_write(item, false));
+        }
+        last
+    }
+
     /// True if a background serialized save is currently executing or queued.
     pub fn is_async_save_in_flight(&self) -> bool {
         self.save_worker.as_ref().is_some_and(SaveWorker::is_busy)
@@ -1446,11 +1487,7 @@ impl DocumentSession {
             .as_ref()
             .map(SaveWorker::drain_completions)
             .unwrap_or_default();
-        let mut last = None;
-        for item in finished {
-            last = Some(self.apply_finished_write(item, false));
-        }
-        last
+        self.apply_finished_writes(finished)
     }
 
     /// Wait for any in-flight or queued serialized save to finish and reconcile its outcome.
@@ -1460,11 +1497,31 @@ impl DocumentSession {
             .as_ref()
             .map(SaveWorker::wait_and_drain)
             .unwrap_or_default();
-        let mut last = None;
-        for item in finished {
-            last = Some(self.apply_finished_write(item, false));
+        self.apply_finished_writes(finished)
+    }
+
+    /// Discard any unstarted queued save and await any executing disk write before deleting a file.
+    pub fn cancel_and_drain_async_save(&mut self) -> Option<SaveOutcome> {
+        let finished = self
+            .save_worker
+            .as_ref()
+            .map(SaveWorker::cancel_pending_and_wait_in_flight)
+            .unwrap_or_default();
+        self.apply_finished_writes(finished)
+    }
+
+    /// Synchronize path, stat cache, and on-disk crash-recovery metadata after an explicit workspace rename.
+    pub fn apply_renamed_path(&mut self, new_path: impl AsRef<Path>) {
+        if let Some(worker) = &self.save_worker {
+            worker.clear_unreconciled_base();
         }
-        last
+        self.path = Some(normalize_session_path(new_path.as_ref()));
+        self.disk_stat = None;
+        if self.has_unsaved_content() {
+            let _ = self.flush_current_recovery_snapshot();
+        } else {
+            self.clear_recovery_snapshot_if_present();
+        }
     }
 
     /// Poll/synchronize this open session against external changes on disk (PRD 4.5.1 C & G).
@@ -5206,6 +5263,51 @@ mod tests {
         assert!(atomic_write_internal_file(&link_path, b"internal").is_err());
         assert_eq!(fs::read_to_string(&real_target).unwrap(), "real v1\nreal v2\n");
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_cancel_and_drain_async_save_and_apply_renamed_path_updates_recovery_meta() {
+        let root = unique_temp_dir("async-cancel-rename-meta");
+        let rec_root = root.join("rec");
+        let rec_dir = rec_root.join("tab1");
+        let file_a = root.join("a.md");
+        let file_b = root.join("b.md");
+        fs::create_dir_all(&rec_root).unwrap();
+        fs::write(&file_a, "v0\n").unwrap();
+
+        let mut session = DocumentSession::open_file(&file_a, Some(rec_dir.clone())).unwrap();
+        let mut view = EditorViewState::default();
+        session
+            .with_editor_view(&mut view, |ctx| ctx.insert_text("draft-edit\n"))
+            .unwrap();
+        assert_eq!(session.state, DocState::Dirty);
+        assert!(session.schedule_async_save());
+
+        // Cancelling/draining async save before file deletion ensures no background write recreates file_a afterwards
+        let _ = session.cancel_and_drain_async_save();
+        if file_a.exists() {
+            fs::remove_file(&file_a).unwrap();
+        }
+        session.on_external_deleted();
+        assert!(!session.is_async_save_in_flight());
+        assert!(!file_a.exists());
+
+        // Recreate & rename dirty file -> apply_renamed_path flushes RecoveryMeta immediately with new path
+        fs::write(&file_b, "v0\n").unwrap();
+        session.apply_renamed_path(&file_b);
+        assert_eq!(
+            fs::canonicalize(session.path.as_ref().unwrap()).unwrap(),
+            fs::canonicalize(&file_b).unwrap()
+        );
+        let scanned = scan_recovery_root(&rec_root);
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(
+            scanned[0].source_path.as_ref().map(|p| fs::canonicalize(p).unwrap()),
+            Some(fs::canonicalize(&file_b).unwrap())
+        );
+
+        drop(session);
         let _ = fs::remove_dir_all(&root);
     }
 }

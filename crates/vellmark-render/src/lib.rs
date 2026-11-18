@@ -12,7 +12,8 @@ pub mod syntax;
 pub use shaper::{
     CodeBlockButtonHit, CodeBlockButtonKind, DrawList, EditorHitTarget, EditorSceneResult,
     EditorViewport, ImageLoadStatus, ImageStatusResolver, Rect, SceneGlyph, SceneImage,
-    SceneRect, ShapedDocumentCache, VisualTextMap, shape_ui_text_into,
+    SceneRect, ShapedDocumentCache, TableButtonHit, TableButtonKind, VisualTextMap,
+    shape_ui_text_into,
 };
 pub use style::{HeadingStyle, ResolvedThemeStyle, RgbaColor, UiChromeColors};
 pub use syntax::{

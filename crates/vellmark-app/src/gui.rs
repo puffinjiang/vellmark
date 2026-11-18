@@ -6,13 +6,14 @@ use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vellmark_core::{
     AutoMergeOutcome, ByteRange, ConflictActionOutcome, ConflictDiffKind, DocState, DocumentStats,
     EditorAction, EncodingDecision, ExternalSyncResult, FindMatch, FindOptions, SaveOutcome,
-    Selection, ViewMode,
+    Selection, TableAlign, ViewMode, count_text_metrics,
 };
 use vellmark_parser::{
     BlockKind, InlineKind, OutlineItem, active_outline_index, extract_link_destination,
@@ -21,8 +22,8 @@ use vellmark_parser::{
 use vellmark_render::{
     CodeBlockButtonKind, CodeLanguageEntry, DrawList, EditorHitTarget, EditorSceneResult,
     EditorViewport, ImageLoadStatus, Rect, ResolvedThemeStyle, SceneRect, ShapedDocumentCache,
-    code_language_catalog, code_language_display_label, normalize_fence_language_token,
-    shape_ui_text_into,
+    TableButtonKind, code_language_catalog, code_language_display_label,
+    normalize_fence_language_token, shape_ui_text_into,
 };
 use vellmark_theme::BuiltinTheme;
 use winit::application::ApplicationHandler;
@@ -30,13 +31,18 @@ use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
-use winit::window::{CursorIcon, Theme as WindowTheme, Window, WindowAttributes, WindowId};
+use winit::window::{
+    CursorIcon, Fullscreen, Theme as WindowTheme, Window, WindowAttributes, WindowId,
+};
 
 use crate::assets::is_supported_image_extension;
 use crate::clipboard::{ClipboardBackend, NativeClipboard};
 use crate::gpu::WgpuRenderer;
 use crate::images::ImageCache;
-use crate::search::QuickOpenMatch;
+use crate::search::{
+    GLOBAL_SEARCH_MAX_RESULTS, QuickOpenMatch, WorkspaceSearchMatch, WorkspaceSearchRequest,
+    WorkspaceSearchWorker,
+};
 use crate::workbench::{AppWorkbench, DocumentTab, WorkbenchRuntimeEvent};
 
 const TAB_BAR_H: f32 = 36.0;
@@ -47,6 +53,7 @@ const ALERT_BANNER_H: f32 = 42.0;
 const CLEANUP_BANNER_H: f32 = 30.0;
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const EXTERNAL_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+const GLOBAL_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// Persistent warning displayed when the recovery directory cannot be written (PRD 4.5.1 F).
 pub const RECOVERY_DEGRADED_NOTICE: &str =
@@ -676,6 +683,7 @@ Start typing anywhere in Chinese IME or English to try live editing.\n";
 pub enum SidebarSection {
     Outline,
     Files,
+    Recent,
 }
 
 #[derive(Debug, Clone)]
@@ -685,11 +693,20 @@ enum UiAction {
     NewTab,
     ToggleMode,
     ToggleFocusMode,
+    ToggleTypewriterMode,
     CycleTheme,
     ToggleSidebar,
     SwitchSidebarSection(SidebarSection),
     JumpOutline(usize),
     OpenWorkspaceFile(PathBuf),
+    OpenRecentFile(PathBuf),
+    OpenFolderPrompt,
+    OpenNewFilePrompt,
+    OpenRenameFilePrompt,
+    ArmOrConfirmDeleteFile,
+    ConfirmSimplePrompt,
+    CloseSimplePrompt,
+    FocusSimplePromptInput,
     ToggleFindCase,
     ToggleFindRegex,
     FindPrev,
@@ -721,6 +738,11 @@ enum UiAction {
     CloseCodeLangPicker,
     SelectCodeLangMatch(usize),
     FocusCodeLangInput,
+    TableToolbarAction(TableButtonKind),
+    CloseGlobalSearch,
+    SelectGlobalSearchMatch(usize),
+    FocusGlobalSearchInput,
+    ToggleGlobalSearchCase,
 }
 
 #[derive(Debug, Clone)]
@@ -736,6 +758,12 @@ struct FlatTreeRow {
     name: String,
     path: PathBuf,
     is_dir: bool,
+}
+
+#[derive(Debug, Clone)]
+enum FilePromptMode {
+    CreateFile { parent_dir: PathBuf },
+    RenameFile { source_path: PathBuf },
 }
 
 #[derive(Debug, Clone)]
@@ -769,6 +797,7 @@ struct LayoutRegions {
 struct CachedTabMeta {
     tab_id: u64,
     rev: u64,
+    selection_range: ByteRange,
     stats: DocumentStats,
     outline: Vec<OutlineItem>,
     matches_query: String,
@@ -785,6 +814,9 @@ enum ImeTarget {
     LinkPromptBox,
     QuickOpenBox,
     CodeLangBox,
+    GlobalSearchBox,
+    InsertTableBox,
+    FileNameBox,
 }
 
 /// Warning shown in the status bar whenever protected crash snapshots exceed the 500 MB budget.
@@ -811,6 +843,23 @@ pub struct GuiController {
     pub quick_open_query: String,
     pub quick_open_matches: Vec<QuickOpenMatch>,
     pub quick_open_selected: usize,
+    pub global_search_open: bool,
+    pub global_search_query: String,
+    pub global_search_case_sensitive: bool,
+    pub global_search_matches: Vec<WorkspaceSearchMatch>,
+    pub global_search_selected: usize,
+    pub global_search_searching: bool,
+    global_search_debounce_deadline: Option<Instant>,
+    global_search_req_id: u64,
+    global_search_cancel: Option<Arc<AtomicBool>>,
+    global_search_worker: Option<WorkspaceSearchWorker>,
+    redraw_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
+    insert_table_open: bool,
+    insert_table_input: String,
+    file_prompt_mode: Option<FilePromptMode>,
+    file_prompt_input: String,
+    selected_workspace_path: Option<PathBuf>,
+    delete_confirm_path: Option<PathBuf>,
     pub preferred_caret_x: Option<f32>,
     pub dragging_selection: bool,
     pub pointer_pos: (f32, f32),
@@ -889,6 +938,23 @@ impl GuiController {
             quick_open_query: String::new(),
             quick_open_matches: Vec::new(),
             quick_open_selected: 0,
+            global_search_open: false,
+            global_search_query: String::new(),
+            global_search_case_sensitive: false,
+            global_search_matches: Vec::new(),
+            global_search_selected: 0,
+            global_search_searching: false,
+            global_search_debounce_deadline: None,
+            global_search_req_id: 0,
+            global_search_cancel: None,
+            global_search_worker: None,
+            redraw_notifier: None,
+            insert_table_open: false,
+            insert_table_input: String::new(),
+            file_prompt_mode: None,
+            file_prompt_input: String::new(),
+            selected_workspace_path: None,
+            delete_confirm_path: None,
             preferred_caret_x: None,
             dragging_selection: false,
             pointer_pos: (0.0, 0.0),
@@ -926,6 +992,10 @@ impl GuiController {
         &mut self,
         notifier: Option<Arc<dyn Fn() + Send + Sync>>,
     ) {
+        self.redraw_notifier = notifier.clone();
+        if let Some(worker) = &self.global_search_worker {
+            worker.set_notifier(notifier.clone());
+        }
         self.image_cache = ImageCache::new(notifier);
     }
 
@@ -1107,10 +1177,11 @@ impl GuiController {
         changed
     }
 
-    /// Drive 2s idle auto-save, 5s/15s/60s failure retry backoff, and periodic external disk polling.
+    /// Drive 2s idle auto-save, 5s/15s/60s failure retry backoff, global search debounce/poll, and periodic external disk polling.
     pub fn tick_runtime_at(&mut self, now: Instant) -> bool {
         let auto_events = self.workbench.tick_auto_save_at(now);
         let mut changed = self.apply_runtime_events(auto_events);
+        changed |= self.poll_global_search(now);
         if now.duration_since(self.last_external_poll) >= EXTERNAL_POLL_INTERVAL {
             self.last_external_poll = now;
             let poll_events = self.workbench.poll_external_changes(false);
@@ -1119,12 +1190,15 @@ impl GuiController {
         changed
     }
 
-    /// Earliest wake deadline for the event loop combining caret blink, external poll, and auto-save.
+    /// Earliest wake deadline for the event loop combining caret blink, search debounce, external poll, and auto-save.
     pub fn next_wake_deadline(&self) -> Instant {
         let mut next = self.last_caret_blink + BLINK_INTERVAL;
         next = next.min(self.last_external_poll + EXTERNAL_POLL_INTERVAL);
         if let Some(auto_dl) = self.workbench.next_auto_save_deadline() {
             next = next.min(auto_dl);
+        }
+        if let Some(search_dl) = self.global_search_debounce_deadline {
+            next = next.min(search_dl);
         }
         next
     }
@@ -1290,6 +1364,12 @@ impl GuiController {
         if self.code_lang_open {
             self.build_code_lang_modal(&mut chrome_layer, layout.editor);
         }
+        if self.global_search_open {
+            self.build_global_search_modal(&mut chrome_layer, layout.editor);
+        }
+        if self.insert_table_open || self.file_prompt_mode.is_some() {
+            self.build_simple_prompt_modal(&mut chrome_layer, layout.editor);
+        }
         self.build_status_bar(&mut chrome_layer, layout.status_bar);
 
         (editor_layer, chrome_layer)
@@ -1310,6 +1390,8 @@ impl GuiController {
         };
         let tab_id = tab.id;
         let rev = tab.session.buffer.revision();
+        let selection = tab.view.selection;
+        let selection_range = selection.range();
 
         let needs_doc_recompute = self
             .cached_meta
@@ -1320,6 +1402,11 @@ impl GuiController {
                 .cached_meta
                 .as_ref()
                 .is_none_or(|m| m.matches_query != query || m.matches_opts != opts);
+        let needs_selection_recompute = !needs_doc_recompute
+            && self
+                .cached_meta
+                .as_ref()
+                .is_some_and(|m| m.selection_range != selection_range);
 
         if needs_doc_recompute {
             let stats = tab.stats();
@@ -1332,22 +1419,42 @@ impl GuiController {
             self.cached_meta = Some(CachedTabMeta {
                 tab_id,
                 rev,
+                selection_range,
                 stats,
                 outline,
                 matches_query: query,
                 matches_opts: opts,
                 find_matches,
             });
-        } else if needs_find_recompute {
-            let find_matches = if find_active {
-                tab.find_all(&query, opts).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            if let Some(m) = self.cached_meta.as_mut() {
-                m.matches_query = query;
-                m.matches_opts = opts;
-                m.find_matches = find_matches;
+        } else {
+            if needs_find_recompute {
+                let find_matches = if find_active {
+                    tab.find_all(&query, opts).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if let Some(m) = self.cached_meta.as_mut() {
+                    m.matches_query = query;
+                    m.matches_opts = opts;
+                    m.find_matches = find_matches;
+                }
+            }
+            if needs_selection_recompute {
+                let (sel_words, sel_chars) = if selection.is_caret() {
+                    (0, 0)
+                } else {
+                    let total = tab.session.buffer.len_bytes();
+                    let end = selection_range.end.min(total);
+                    let start = selection_range.start.min(end);
+                    let sel_text = tab.session.buffer.slice_to_string(ByteRange::new(start, end));
+                    let (w, c, _) = count_text_metrics(&sel_text);
+                    (w, c)
+                };
+                if let Some(m) = self.cached_meta.as_mut() {
+                    m.selection_range = selection_range;
+                    m.stats.selection_word_count = sel_words;
+                    m.stats.selection_char_count = sel_chars;
+                }
             }
         }
     }
@@ -1537,6 +1644,15 @@ impl GuiController {
                 });
             }
         }
+        for btn in &scene.table_buttons {
+            if let Some(rect) = intersect_rect(btn.rect, editor_rect) {
+                self.ui_hit_zones.push(UiHitZone {
+                    rect,
+                    action: UiAction::TableToolbarAction(btn.kind),
+                    pointer_cursor: true,
+                });
+            }
+        }
 
         scene.draw
     }
@@ -1565,19 +1681,21 @@ impl GuiController {
             pointer_cursor: true,
         });
 
-        // Right-side action pills (Theme, Focus, WYSIWYG/Source)
+        // Right-side action pills (Theme, TW, Focus, WYSIWYG/Source)
         let mode_label = match self.workbench.active_tab().map(|t| t.view.mode) {
             Some(ViewMode::Source) => "Source",
             _ => "WYSIWYG",
         };
         let mode_w = 78.0;
         let focus_w = 64.0;
+        let tw_w = 38.0;
         let theme_w = 68.0;
         let right_margin = 10.0;
 
         let mode_rect = Rect::new(bar.w - right_margin - mode_w, 6.0, mode_w, 24.0);
         let focus_rect = Rect::new(mode_rect.x - 6.0 - focus_w, 6.0, focus_w, 24.0);
-        let theme_rect = Rect::new(focus_rect.x - 6.0 - theme_w, 6.0, theme_w, 24.0);
+        let tw_rect = Rect::new(focus_rect.x - 6.0 - tw_w, 6.0, tw_w, 24.0);
+        let theme_rect = Rect::new(tw_rect.x - 6.0 - theme_w, 6.0, theme_w, 24.0);
 
         let mode_bg = if matches!(
             self.workbench.active_tab().map(|t| t.view.mode),
@@ -1627,6 +1745,30 @@ impl GuiController {
         self.ui_hit_zones.push(UiHitZone {
             rect: focus_rect,
             action: UiAction::ToggleFocusMode,
+            pointer_cursor: true,
+        });
+
+        let tw_bg = if self.workbench.config.typewriter_mode {
+            chrome.accent.with_alpha(45)
+        } else {
+            chrome.panel_bg
+        };
+        dl.rects
+            .push(SceneRect::rounded(tw_rect, tw_bg, 5.0).with_border(1.0, chrome.border));
+        self.push_ui_text(
+            dl,
+            "TW",
+            tw_rect.x + 9.0,
+            tw_rect.y + 4.0,
+            11.5,
+            500,
+            chrome.text,
+            Some(tw_w - 6.0),
+            Some(bar),
+        );
+        self.ui_hit_zones.push(UiHitZone {
+            rect: tw_rect,
+            action: UiAction::ToggleTypewriterMode,
             pointer_cursor: true,
         });
 
@@ -1752,15 +1894,17 @@ impl GuiController {
             chrome.border,
         ));
 
-        // Header switch: Outline | Files
+        // Header switch: Outline | Files | Recent
         let header_h = 32.0;
-        let half_w = (sb.w - 20.0) * 0.5;
-        let outline_btn = Rect::new(sb.x + 8.0, sb.y + 6.0, half_w, 22.0);
-        let files_btn = Rect::new(outline_btn.x + half_w + 4.0, sb.y + 6.0, half_w, 22.0);
+        let third_w = (sb.w - 24.0) / 3.0;
+        let outline_btn = Rect::new(sb.x + 8.0, sb.y + 6.0, third_w, 22.0);
+        let files_btn = Rect::new(outline_btn.x + third_w + 4.0, sb.y + 6.0, third_w, 22.0);
+        let recent_btn = Rect::new(files_btn.x + third_w + 4.0, sb.y + 6.0, third_w, 22.0);
 
         for (btn, sec, label) in [
             (outline_btn, SidebarSection::Outline, "Outline"),
             (files_btn, SidebarSection::Files, "Files"),
+            (recent_btn, SidebarSection::Recent, "Recent"),
         ] {
             let active = self.sidebar_section == sec;
             dl.rects.push(SceneRect::rounded(
@@ -1771,7 +1915,7 @@ impl GuiController {
             self.push_ui_text(
                 dl,
                 label,
-                btn.x + 14.0,
+                btn.x + 10.0,
                 btn.y + 3.0,
                 11.5,
                 if active { 600 } else { 400 },
@@ -1853,10 +1997,76 @@ impl GuiController {
                 }
             }
             SidebarSection::Files => {
+                let delete_armed = self.delete_confirm_path.is_some();
+                let del_label = if delete_armed { "Del?" } else { "Del" };
+                let bar_y = row_y;
+                let mut btn_x = sb.x + 8.0;
+                for (bw, label, action, is_danger) in [
+                    (48.0, "+File", UiAction::OpenNewFilePrompt, false),
+                    (38.0, "Ren", UiAction::OpenRenameFilePrompt, false),
+                    (42.0, del_label, UiAction::ArmOrConfirmDeleteFile, delete_armed),
+                ] {
+                    let rect = Rect::new(btn_x, bar_y, bw, 22.0);
+                    let bg = if is_danger {
+                        chrome.danger.with_alpha(48)
+                    } else {
+                        chrome.panel_bg
+                    };
+                    let border = if is_danger { chrome.danger } else { chrome.border };
+                    dl.rects.push(
+                        SceneRect::rounded(rect, bg, 4.0)
+                            .with_border(1.0, border)
+                            .with_clip(Some(list_clip)),
+                    );
+                    self.push_ui_text(
+                        dl,
+                        label,
+                        rect.x + 7.0,
+                        rect.y + 4.0,
+                        11.0,
+                        600,
+                        if is_danger { chrome.danger } else { chrome.text },
+                        Some(bw - 8.0),
+                        Some(list_clip),
+                    );
+                    self.ui_hit_zones.push(UiHitZone {
+                        rect,
+                        action,
+                        pointer_cursor: true,
+                    });
+                    btn_x += bw + 4.0;
+                }
+                let folder_w = 56.0;
+                let folder_rect = Rect::new(sb.x + sb.w - folder_w - 9.0, bar_y, folder_w, 22.0);
+                if folder_rect.x >= btn_x {
+                    dl.rects.push(
+                        SceneRect::rounded(folder_rect, chrome.panel_bg, 4.0)
+                            .with_border(1.0, chrome.border)
+                            .with_clip(Some(list_clip)),
+                    );
+                    self.push_ui_text(
+                        dl,
+                        "Folder",
+                        folder_rect.x + 8.0,
+                        folder_rect.y + 4.0,
+                        11.0,
+                        500,
+                        chrome.text,
+                        Some(folder_w - 10.0),
+                        Some(list_clip),
+                    );
+                    self.ui_hit_zones.push(UiHitZone {
+                        rect: folder_rect,
+                        action: UiAction::OpenFolderPrompt,
+                        pointer_cursor: true,
+                    });
+                }
+                row_y += 28.0;
+
                 let Some(tree) = self.workbench.file_tree.clone() else {
                     self.push_ui_text(
                         dl,
-                        "Pass a folder arg to browse files",
+                        "Open a folder to browse files",
                         sb.x + 14.0,
                         row_y + 4.0,
                         11.5,
@@ -1874,6 +2084,7 @@ impl GuiController {
                     .active_tab()
                     .and_then(|t| t.session.path.as_ref())
                     .cloned();
+                let selected_path = self.selected_workspace_path.clone();
 
                 for row in rows {
                     if row_y + row_h > sb.y + sb.h {
@@ -1881,9 +2092,16 @@ impl GuiController {
                     }
                     let row_rect = Rect::new(sb.x + 6.0, row_y, sb.w - 13.0, row_h);
                     let is_open = active_path.as_ref() == Some(&row.path);
+                    let is_selected = selected_path.as_ref() == Some(&row.path);
                     if is_open {
                         dl.rects.push(
                             SceneRect::rounded(row_rect, chrome.accent.with_alpha(38), 4.0)
+                                .with_clip(Some(list_clip)),
+                        );
+                    } else if is_selected {
+                        dl.rects.push(
+                            SceneRect::rounded(row_rect, chrome.hover_bg, 4.0)
+                                .with_border(1.0, chrome.accent.with_alpha(120))
                                 .with_clip(Some(list_clip)),
                         );
                     }
@@ -1912,6 +2130,68 @@ impl GuiController {
                     self.ui_hit_zones.push(UiHitZone {
                         rect: row_rect,
                         action: UiAction::OpenWorkspaceFile(row.path),
+                        pointer_cursor: true,
+                    });
+                    row_y += row_h + 2.0;
+                }
+            }
+            SidebarSection::Recent => {
+                let entries = self.workbench.recent_files.entries.clone();
+                if entries.is_empty() {
+                    self.push_ui_text(
+                        dl,
+                        "No recent files",
+                        sb.x + 14.0,
+                        row_y + 4.0,
+                        12.0,
+                        400,
+                        chrome.muted_text,
+                        Some(sb.w - 24.0),
+                        Some(list_clip),
+                    );
+                    return;
+                }
+                let active_path = self
+                    .workbench
+                    .active_tab()
+                    .and_then(|t| t.session.path.as_ref())
+                    .cloned();
+                for path in entries {
+                    if row_y + row_h > sb.y + sb.h {
+                        break;
+                    }
+                    let row_rect = Rect::new(sb.x + 6.0, row_y, sb.w - 13.0, row_h);
+                    let is_open = active_path.as_ref() == Some(&path);
+                    if is_open {
+                        dl.rects.push(
+                            SceneRect::rounded(row_rect, chrome.accent.with_alpha(38), 4.0)
+                                .with_clip(Some(list_clip)),
+                        );
+                    }
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| path.display().to_string());
+                    let display = if path.is_dir() {
+                        format!("[dir] {name}")
+                    } else {
+                        name
+                    };
+                    self.push_ui_text(
+                        dl,
+                        &display,
+                        row_rect.x + 8.0,
+                        row_y + 4.0,
+                        12.0,
+                        if is_open { 600 } else { 400 },
+                        if is_open { chrome.accent } else { chrome.text },
+                        Some((row_rect.w - 16.0).max(30.0)),
+                        Some(list_clip),
+                    );
+                    self.ui_hit_zones.push(UiHitZone {
+                        rect: row_rect,
+                        action: UiAction::OpenRecentFile(path),
                         pointer_cursor: true,
                     });
                     row_y += row_h + 2.0;
@@ -2137,6 +2417,54 @@ impl GuiController {
             selected,
             UiAction::FocusQuickOpenInput,
             UiAction::CloseQuickOpen,
+            None,
+            rows,
+        );
+    }
+
+    fn build_global_search_modal(&mut self, dl: &mut DrawList, editor_rect: Rect) {
+        let query = self.global_search_query.clone();
+        let selected = self.global_search_selected;
+        let empty_msg = if self.workbench.workspace_root.is_none() {
+            "No workspace folder open — press Cmd/Ctrl+Shift+O to open a folder"
+        } else if query.trim().is_empty() {
+            "Type text to search across workspace files..."
+        } else if self.global_search_searching {
+            "Searching workspace..."
+        } else {
+            "No matching lines in workspace"
+        };
+        let root_opt = self.workbench.workspace_root.as_ref();
+        let rows: Vec<ListPickerRow> = self
+            .global_search_matches
+            .iter()
+            .enumerate()
+            .map(|(idx, m)| {
+                let rel = root_opt
+                    .and_then(|root| m.path.strip_prefix(root).ok())
+                    .unwrap_or(&m.path)
+                    .to_string_lossy();
+                ListPickerRow {
+                    label: format!("{rel}  —  {}", m.line_preview.trim()),
+                    badge: Some(format!("L{}", m.line_number)),
+                    action: UiAction::SelectGlobalSearchMatch(idx),
+                }
+            })
+            .collect();
+        self.draw_list_picker_modal(
+            dl,
+            editor_rect,
+            &query,
+            "Global Search — type text across workspace...",
+            empty_msg,
+            selected,
+            UiAction::FocusGlobalSearchInput,
+            UiAction::CloseGlobalSearch,
+            Some((
+                "Aa",
+                self.global_search_case_sensitive,
+                UiAction::ToggleGlobalSearchCase,
+            )),
             rows,
         );
     }
@@ -2175,7 +2503,101 @@ impl GuiController {
             selected,
             UiAction::FocusCodeLangInput,
             UiAction::CloseCodeLangPicker,
+            None,
             rows,
+        );
+    }
+
+    fn build_simple_prompt_modal(&mut self, dl: &mut DrawList, editor_rect: Rect) {
+        let (title, value, placeholder, confirm_label) = if self.insert_table_open {
+            (
+                "Insert Table (rows x cols)",
+                self.insert_table_input.clone(),
+                "3x4",
+                "Insert",
+            )
+        } else if let Some(mode) = &self.file_prompt_mode {
+            match mode {
+                FilePromptMode::CreateFile { .. } => (
+                    "New Document File",
+                    self.file_prompt_input.clone(),
+                    "note.md",
+                    "Create",
+                ),
+                FilePromptMode::RenameFile { .. } => (
+                    "Rename File",
+                    self.file_prompt_input.clone(),
+                    "renamed.md",
+                    "Rename",
+                ),
+            }
+        } else {
+            return;
+        };
+
+        let chrome = self.style.chrome;
+        let bar_w = 430.0_f32.min((editor_rect.w - 24.0).max(240.0));
+        let modal = Rect::new(
+            editor_rect.x + ((editor_rect.w - bar_w) * 0.5).max(8.0),
+            editor_rect.y + 18.0,
+            bar_w,
+            64.0,
+        );
+        dl.rects.push(
+            SceneRect::rounded(modal, chrome.panel_bg, 8.0).with_border(1.0, chrome.accent),
+        );
+        self.ui_hit_zones.push(UiHitZone {
+            rect: modal,
+            action: UiAction::FocusSimplePromptInput,
+            pointer_cursor: false,
+        });
+        self.push_ui_text(
+            dl,
+            title,
+            modal.x + 10.0,
+            modal.y + 6.0,
+            11.0,
+            600,
+            chrome.muted_text,
+            Some(modal.w - 20.0),
+            Some(modal),
+        );
+
+        let mut right_edge = modal.x + modal.w - 8.0;
+        let input_y = modal.y + 28.0;
+        right_edge = self.push_action_button(
+            dl,
+            right_edge,
+            input_y + 1.0,
+            24.0,
+            "×",
+            chrome.tab_bar_bg,
+            chrome.border,
+            chrome.text,
+            UiAction::CloseSimplePrompt,
+            modal,
+        );
+        right_edge = self.push_action_button(
+            dl,
+            right_edge,
+            input_y + 1.0,
+            24.0,
+            confirm_label,
+            chrome.accent.with_alpha(48),
+            chrome.accent,
+            chrome.text,
+            UiAction::ConfirmSimplePrompt,
+            modal,
+        );
+        let input_w = (right_edge - (modal.x + 8.0)).max(90.0);
+        let input_rect = Rect::new(modal.x + 8.0, input_y, input_w, 26.0);
+        self.draw_overlay_text_input(
+            dl,
+            input_rect,
+            &value,
+            placeholder,
+            true,
+            UiAction::FocusSimplePromptInput,
         );
     }
 
@@ -2190,6 +2612,7 @@ impl GuiController {
         selected: usize,
         focus_action: UiAction,
         close_action: UiAction,
+        header_toggle: Option<(&str, bool, UiAction)>,
         rows: Vec<ListPickerRow>,
     ) {
         let chrome = self.style.chrome;
@@ -2227,10 +2650,46 @@ impl GuiController {
             pointer_cursor: true,
         });
 
+        let input_right = if let Some((toggle_label, toggle_on, toggle_action)) = header_toggle {
+            let toggle_w = 28.0;
+            let toggle_rect = Rect::new(close_rect.x - toggle_w - 6.0, modal.y + 8.0, toggle_w, 24.0);
+            dl.rects.push(
+                SceneRect::rounded(
+                    toggle_rect,
+                    if toggle_on {
+                        chrome.accent.with_alpha(48)
+                    } else {
+                        chrome.tab_bar_bg
+                    },
+                    4.0,
+                )
+                .with_border(1.0, if toggle_on { chrome.accent } else { chrome.border }),
+            );
+            self.push_ui_text(
+                dl,
+                toggle_label,
+                toggle_rect.x + 6.0,
+                toggle_rect.y + 4.0,
+                11.0,
+                600,
+                chrome.text,
+                None,
+                Some(modal),
+            );
+            self.ui_hit_zones.push(UiHitZone {
+                rect: toggle_rect,
+                action: toggle_action,
+                pointer_cursor: true,
+            });
+            toggle_rect.x - 6.0
+        } else {
+            close_rect.x - 6.0
+        };
+
         let input_rect = Rect::new(
             modal.x + 8.0,
             modal.y + 7.0,
-            (modal.w - close_w - 22.0).max(120.0),
+            (input_right - (modal.x + 8.0)).max(120.0),
             26.0,
         );
         self.draw_overlay_text_input(
@@ -2662,6 +3121,30 @@ impl GuiController {
             state_col,
             4.0,
         ));
+        let right_stats = if let Some(m) = &self.cached_meta {
+            let sel_part = if m.stats.selection_char_count > 0 {
+                format!(
+                    " (sel {}w / {}c)",
+                    m.stats.selection_word_count, m.stats.selection_char_count
+                )
+            } else {
+                String::new()
+            };
+            let read_part = format_reading_time(m.stats.reading_time_secs);
+            format!(
+                "{} words • {} chars • {} lines{sel_part} • {read_part}   |   {}   |   {}%   |   {}",
+                m.stats.word_count,
+                m.stats.char_count,
+                m.stats.line_count,
+                eol_text,
+                self.workbench.config.zoom_percent,
+                ime_badge,
+            )
+        } else {
+            format!("{}%", self.workbench.config.zoom_percent)
+        };
+        let rx = (sb.w - right_stats.len() as f32 * 6.4 - 18.0).max(sb.w * 0.38);
+
         let left_str = match active_notice {
             Some(note) => format!("{state_text}   |   {note}"),
             None => state_text,
@@ -2674,24 +3157,10 @@ impl GuiController {
             11.0,
             500,
             chrome.text,
-            Some((sb.w * 0.45).max(120.0)),
+            Some((rx - 32.0).max(100.0)),
             Some(sb),
         );
 
-        let right_stats = if let Some(m) = &self.cached_meta {
-            format!(
-                "{} words • {} chars • {} lines   |   {}   |   {}%   |   {}",
-                m.stats.word_count,
-                m.stats.char_count,
-                m.stats.line_count,
-                eol_text,
-                self.workbench.config.zoom_percent,
-                ime_badge,
-            )
-        } else {
-            format!("{}%", self.workbench.config.zoom_percent)
-        };
-        let rx = (sb.w - right_stats.len() as f32 * 6.4 - 18.0).max(sb.w * 0.48);
         self.push_ui_text(
             dl,
             &right_stats,
@@ -2737,6 +3206,12 @@ impl GuiController {
     fn focused_overlay_ime_target(&self) -> Option<ImeTarget> {
         if self.code_lang_open {
             Some(ImeTarget::CodeLangBox)
+        } else if self.insert_table_open {
+            Some(ImeTarget::InsertTableBox)
+        } else if self.file_prompt_mode.is_some() {
+            Some(ImeTarget::FileNameBox)
+        } else if self.global_search_open {
+            Some(ImeTarget::GlobalSearchBox)
         } else if self.quick_open_open {
             Some(ImeTarget::QuickOpenBox)
         } else if self.link_prompt_open {
@@ -2755,6 +3230,9 @@ impl GuiController {
     fn overlay_target_still_open(&self, target: ImeTarget) -> bool {
         match target {
             ImeTarget::CodeLangBox => self.code_lang_open,
+            ImeTarget::InsertTableBox => self.insert_table_open,
+            ImeTarget::FileNameBox => self.file_prompt_mode.is_some(),
+            ImeTarget::GlobalSearchBox => self.global_search_open,
             ImeTarget::QuickOpenBox => self.quick_open_open,
             ImeTarget::LinkPromptBox => self.link_prompt_open,
             ImeTarget::FindBox => self.find_open,
@@ -2781,6 +3259,19 @@ impl GuiController {
             ImeTarget::CodeLangBox => {
                 self.code_lang_query.push_str(text);
                 self.refresh_code_lang_matches();
+                true
+            }
+            ImeTarget::GlobalSearchBox => {
+                self.global_search_query.push_str(text);
+                self.schedule_global_search(false);
+                true
+            }
+            ImeTarget::InsertTableBox => {
+                self.insert_table_input.push_str(text);
+                true
+            }
+            ImeTarget::FileNameBox => {
+                self.file_prompt_input.push_str(text);
                 true
             }
             ImeTarget::None | ImeTarget::Tab(_) => false,
@@ -2815,7 +3306,10 @@ impl GuiController {
                         ImeTarget::FindBox
                         | ImeTarget::LinkPromptBox
                         | ImeTarget::QuickOpenBox
-                        | ImeTarget::CodeLangBox => {}
+                        | ImeTarget::CodeLangBox
+                        | ImeTarget::GlobalSearchBox
+                        | ImeTarget::InsertTableBox
+                        | ImeTarget::FileNameBox => {}
                         ImeTarget::Tab(target_id) => {
                             if let Some(tab) =
                                 self.workbench.tabs.iter_mut().find(|t| t.id == target_id)
@@ -2867,7 +3361,10 @@ impl GuiController {
                     ImeTarget::FindBox
                     | ImeTarget::LinkPromptBox
                     | ImeTarget::QuickOpenBox
-                    | ImeTarget::CodeLangBox => {
+                    | ImeTarget::CodeLangBox
+                    | ImeTarget::GlobalSearchBox
+                    | ImeTarget::InsertTableBox
+                    | ImeTarget::FileNameBox => {
                         self.commit_overlay_text(target, committed);
                     }
                     ImeTarget::Tab(target_id) => {
@@ -3036,19 +3533,58 @@ impl GuiController {
         let active_id = self.workbench.active_tab().map(|t| t.id);
         self.cancel_abandoned_tab_ime(active_id);
 
-        // Code block insert/language-picker shortcut (`Cmd+Option+C` on macOS; Option+C may report `ç` in logical_key)
-        if primary
-            && alt
+        // macOS native Fullscreen shortcut (`Cmd+Ctrl+F`, PRD 4.10)
+        if cfg!(target_os = "macos")
+            && mods.super_key()
+            && ctrl
+            && !alt
             && !shift
-            && !ctrl
-            && (physical_key == Some(PhysicalKey::Code(KeyCode::KeyC))
+            && (physical_key == Some(PhysicalKey::Code(KeyCode::KeyF))
+                || matches!(logical_key, Key::Character(ch) if ch.eq_ignore_ascii_case("f")))
+        {
+            self.toggle_fullscreen();
+            return true;
+        }
+
+        // Code block / Table shortcuts (`Cmd+Option+C` / `Cmd+Option+T`)
+        if primary && alt && !shift && !ctrl {
+            if physical_key == Some(PhysicalKey::Code(KeyCode::KeyC))
                 || matches!(
                     logical_key,
                     Key::Character(ch) if matches!(ch.as_str(), "c" | "C" | "ç" | "Ç")
-                ))
-        {
-            self.insert_or_pick_code_block();
-            return true;
+                )
+            {
+                self.insert_or_pick_code_block();
+                return true;
+            }
+            if physical_key == Some(PhysicalKey::Code(KeyCode::KeyT))
+                || matches!(
+                    logical_key,
+                    Key::Character(ch) if matches!(ch.as_str(), "t" | "T" | "†")
+                )
+            {
+                self.open_insert_table_prompt();
+                return true;
+            }
+        }
+
+        // Function key view toggles (`F8` Focus Mode, `F9` Typewriter Mode, `F11` Fullscreen, PRD 4.7 / 4.10)
+        if !primary && !alt && !ctrl {
+            match logical_key {
+                Key::Named(NamedKey::F8) => {
+                    self.toggle_focus_mode();
+                    return true;
+                }
+                Key::Named(NamedKey::F9) => {
+                    self.toggle_typewriter_mode();
+                    return true;
+                }
+                Key::Named(NamedKey::F11) => {
+                    self.toggle_fullscreen();
+                    return true;
+                }
+                _ => {}
+            }
         }
 
         // Primary shortcuts
@@ -3153,9 +3689,7 @@ impl GuiController {
                         return true;
                     }
                     "f" if shift => {
-                        self.workbench.config.focus_mode = !self.workbench.config.focus_mode;
-                        let on = self.workbench.config.focus_mode;
-                        self.set_notice(if on { "Focus Mode: ON" } else { "Focus Mode: OFF" });
+                        self.open_global_search();
                         return true;
                     }
                     "f" => {
@@ -3175,6 +3709,10 @@ impl GuiController {
                     }
                     "t" if shift => {
                         self.cycle_theme();
+                        return true;
+                    }
+                    "t" => {
+                        self.open_insert_table_prompt();
                         return true;
                     }
                     "=" | "+" => {
@@ -3336,6 +3874,59 @@ impl GuiController {
                 ListModalAction::QueryAppend(txt) => {
                     self.code_lang_query.push_str(&txt);
                     self.refresh_code_lang_matches();
+                }
+                ListModalAction::None => {}
+            }
+            return true;
+        }
+
+        if self.insert_table_open || self.file_prompt_mode.is_some() {
+            match logical_key {
+                Key::Named(NamedKey::Escape) => self.close_simple_prompt(),
+                Key::Named(NamedKey::Enter) => self.confirm_simple_prompt(),
+                Key::Named(NamedKey::Backspace) => {
+                    if self.insert_table_open {
+                        self.insert_table_input.pop();
+                    } else {
+                        self.file_prompt_input.pop();
+                    }
+                }
+                _ => {
+                    if let Some(txt) = (!primary && !ctrl)
+                        .then(|| overlay_printable_key_text(logical_key, text))
+                        .flatten()
+                    {
+                        if self.insert_table_open {
+                            self.insert_table_input.push_str(&txt);
+                        } else {
+                            self.file_prompt_input.push_str(&txt);
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
+        if self.global_search_open {
+            match decode_list_modal_key(logical_key, text, primary, ctrl) {
+                ListModalAction::Close => self.close_global_search(),
+                ListModalAction::MoveSelection(delta) => {
+                    move_list_selection(
+                        &mut self.global_search_selected,
+                        self.global_search_matches.len(),
+                        delta,
+                    );
+                }
+                ListModalAction::Confirm => {
+                    self.confirm_global_search_match(self.global_search_selected);
+                }
+                ListModalAction::QueryBackspace => {
+                    self.global_search_query.pop();
+                    self.schedule_global_search(false);
+                }
+                ListModalAction::QueryAppend(txt) => {
+                    self.global_search_query.push_str(&txt);
+                    self.schedule_global_search(false);
                 }
                 ListModalAction::None => {}
             }
@@ -3567,6 +4158,9 @@ impl GuiController {
 
     fn execute_ui_action(&mut self, action: UiAction) -> bool {
         self.close_confirm_armed = false;
+        if !matches!(action, UiAction::ArmOrConfirmDeleteFile) {
+            self.delete_confirm_path = None;
+        }
         match action {
             UiAction::SelectTab(idx) => {
                 if idx < self.workbench.tabs.len() {
@@ -3597,7 +4191,11 @@ impl GuiController {
                 true
             }
             UiAction::ToggleFocusMode => {
-                self.workbench.config.focus_mode = !self.workbench.config.focus_mode;
+                self.toggle_focus_mode();
+                true
+            }
+            UiAction::ToggleTypewriterMode => {
+                self.toggle_typewriter_mode();
                 true
             }
             UiAction::CycleTheme => {
@@ -3627,6 +4225,7 @@ impl GuiController {
                 true
             }
             UiAction::OpenWorkspaceFile(path) => {
+                self.selected_workspace_path = Some(path.clone());
                 if path.is_dir() {
                     if !self.collapsed_dirs.remove(&path) {
                         self.collapsed_dirs.insert(path);
@@ -3637,12 +4236,76 @@ impl GuiController {
                         Ok(_) => {
                             self.find_focused = false;
                             self.close_transient_prompts();
+                            self.preferred_caret_x = None;
+                            self.pending_scroll_ensure_caret = true;
                         }
                         Err(e) => self.set_notice(format!("Open failed: {e}")),
                     }
                 }
                 true
             }
+            UiAction::OpenRecentFile(path) => {
+                self.close_transient_prompts();
+                self.find_focused = false;
+                if path.is_dir() {
+                    let normalized: PathBuf = path.components().collect();
+                    match self.workbench.open_folder(&normalized) {
+                        Ok(()) => {
+                            self.workbench.config.sidebar_visible = true;
+                            self.sidebar_section = SidebarSection::Files;
+                            self.collapsed_dirs.clear();
+                            self.selected_workspace_path = None;
+                            let name = normalized
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("folder");
+                            self.set_notice(format!("Opened folder: {name}"));
+                        }
+                        Err(e) => self.set_notice(format!("Open folder failed: {e}")),
+                    }
+                } else {
+                    self.flush_active_tab_before_switch();
+                    match self.workbench.open_document(&path) {
+                        Ok(_) => {
+                            self.ime_target = ImeTarget::None;
+                            self.preferred_caret_x = None;
+                            self.pending_scroll_ensure_caret = true;
+                            let name = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("file");
+                            self.set_notice(format!("Opened {name}"));
+                        }
+                        Err(e) => self.set_notice(format!("Open failed: {e}")),
+                    }
+                }
+                true
+            }
+            UiAction::OpenFolderPrompt => {
+                self.open_folder_dialog();
+                true
+            }
+            UiAction::OpenNewFilePrompt => {
+                self.open_new_file_prompt();
+                true
+            }
+            UiAction::OpenRenameFilePrompt => {
+                self.open_rename_file_prompt();
+                true
+            }
+            UiAction::ArmOrConfirmDeleteFile => {
+                self.arm_or_confirm_delete_file();
+                true
+            }
+            UiAction::ConfirmSimplePrompt => {
+                self.confirm_simple_prompt();
+                true
+            }
+            UiAction::CloseSimplePrompt => {
+                self.close_simple_prompt();
+                true
+            }
+            UiAction::FocusSimplePromptInput => true,
             UiAction::ToggleFindCase => {
                 self.find_options.case_sensitive = !self.find_options.case_sensitive;
                 self.run_find_next(false);
@@ -3746,7 +4409,8 @@ impl GuiController {
             }
             UiAction::FocusLinkInput
             | UiAction::FocusQuickOpenInput
-            | UiAction::FocusCodeLangInput => true,
+            | UiAction::FocusCodeLangInput
+            | UiAction::FocusGlobalSearchInput => true,
             UiAction::CloseQuickOpen => {
                 self.close_quick_open();
                 true
@@ -3779,6 +4443,23 @@ impl GuiController {
             }
             UiAction::SelectCodeLangMatch(idx) => {
                 self.confirm_code_lang_match(idx);
+                true
+            }
+            UiAction::TableToolbarAction(kind) => {
+                self.execute_table_toolbar_action(kind);
+                true
+            }
+            UiAction::CloseGlobalSearch => {
+                self.close_global_search();
+                true
+            }
+            UiAction::SelectGlobalSearchMatch(idx) => {
+                self.confirm_global_search_match(idx);
+                true
+            }
+            UiAction::ToggleGlobalSearchCase => {
+                self.global_search_case_sensitive = !self.global_search_case_sensitive;
+                self.schedule_global_search(true);
                 true
             }
         }
@@ -4110,9 +4791,12 @@ impl GuiController {
         self.find_focused = false;
         self.close_transient_prompts();
         self.close_confirm_armed = false;
+        self.delete_confirm_path = None;
         let active_id = self.workbench.active_tab().map(|t| t.id);
         self.cancel_abandoned_tab_ime(active_id);
+        let auto_align = self.workbench.config.table_auto_align;
         if let Some(tab) = self.workbench.active_tab_mut() {
+            tab.view.table_auto_align = auto_align;
             if let Err(e) = tab.dispatch(action) {
                 self.set_notice(format!("Read-only or blocked: {e}"));
             } else {
@@ -4340,7 +5024,12 @@ impl GuiController {
             ImeTarget::FindBox => self.run_find_next(false),
             ImeTarget::QuickOpenBox => self.refresh_quick_open_matches(),
             ImeTarget::CodeLangBox => self.refresh_code_lang_matches(),
-            ImeTarget::LinkPromptBox | ImeTarget::None | ImeTarget::Tab(_) => {}
+            ImeTarget::GlobalSearchBox => self.schedule_global_search(false),
+            ImeTarget::LinkPromptBox
+            | ImeTarget::InsertTableBox
+            | ImeTarget::FileNameBox
+            | ImeTarget::None
+            | ImeTarget::Tab(_) => {}
         }
     }
 
@@ -4350,6 +5039,9 @@ impl GuiController {
             ImeTarget::LinkPromptBox => &self.link_prompt_url,
             ImeTarget::QuickOpenBox => &self.quick_open_query,
             ImeTarget::CodeLangBox => &self.code_lang_query,
+            ImeTarget::GlobalSearchBox => &self.global_search_query,
+            ImeTarget::InsertTableBox => &self.insert_table_input,
+            ImeTarget::FileNameBox => &self.file_prompt_input,
             ImeTarget::None | ImeTarget::Tab(_) => "",
         }
     }
@@ -4360,6 +5052,9 @@ impl GuiController {
             ImeTarget::LinkPromptBox => self.link_prompt_url.clear(),
             ImeTarget::QuickOpenBox => self.quick_open_query.clear(),
             ImeTarget::CodeLangBox => self.code_lang_query.clear(),
+            ImeTarget::GlobalSearchBox => self.global_search_query.clear(),
+            ImeTarget::InsertTableBox => self.insert_table_input.clear(),
+            ImeTarget::FileNameBox => self.file_prompt_input.clear(),
             ImeTarget::None | ImeTarget::Tab(_) => {}
         }
     }
@@ -4461,9 +5156,12 @@ impl GuiController {
         if let Some(target) = self.focused_overlay_ime_target() {
             let clean = match target {
                 ImeTarget::FindBox => plain.as_str(),
-                ImeTarget::LinkPromptBox | ImeTarget::QuickOpenBox | ImeTarget::CodeLangBox => {
-                    plain.trim_matches(&['\r', '\n'][..])
-                }
+                ImeTarget::LinkPromptBox
+                | ImeTarget::QuickOpenBox
+                | ImeTarget::CodeLangBox
+                | ImeTarget::GlobalSearchBox
+                | ImeTarget::InsertTableBox
+                | ImeTarget::FileNameBox => plain.trim_matches(&['\r', '\n'][..]),
                 ImeTarget::None | ImeTarget::Tab(_) => "",
             };
             if !clean.is_empty() {
@@ -4485,9 +5183,18 @@ impl GuiController {
         self.quick_open_open = false;
         self.code_lang_open = false;
         self.code_lang_block_range = None;
+        self.global_search_open = false;
+        self.cancel_active_global_search();
+        self.insert_table_open = false;
+        self.file_prompt_mode = None;
         if matches!(
             self.ime_target,
-            ImeTarget::LinkPromptBox | ImeTarget::QuickOpenBox | ImeTarget::CodeLangBox
+            ImeTarget::LinkPromptBox
+                | ImeTarget::QuickOpenBox
+                | ImeTarget::CodeLangBox
+                | ImeTarget::GlobalSearchBox
+                | ImeTarget::InsertTableBox
+                | ImeTarget::FileNameBox
         ) {
             self.ime_target = ImeTarget::None;
         }
@@ -4542,6 +5249,8 @@ impl GuiController {
                 self.workbench.config.sidebar_visible = true;
                 self.sidebar_section = SidebarSection::Files;
                 self.collapsed_dirs.clear();
+                self.selected_workspace_path = None;
+                self.delete_confirm_path = None;
                 self.find_focused = false;
                 let name = normalized
                     .file_name()
@@ -4594,6 +5303,381 @@ impl GuiController {
             }
             Err(e) => self.set_notice(format!("Open failed: {e}")),
         }
+    }
+
+    /// Show Global Workspace Search modal (`Cmd/Ctrl + Shift + F`, PRD 4.5 F-07).
+    pub fn open_global_search(&mut self) {
+        self.close_confirm_armed = false;
+        self.close_transient_prompts();
+        self.find_focused = false;
+        let active_id = self.workbench.active_tab().map(|t| t.id);
+        self.cancel_abandoned_tab_ime(active_id);
+        self.global_search_open = true;
+        self.global_search_query.clear();
+        self.schedule_global_search(false);
+    }
+
+    fn close_global_search(&mut self) {
+        self.global_search_open = false;
+        self.cancel_active_global_search();
+        if self.ime_target == ImeTarget::GlobalSearchBox {
+            self.ime_target = ImeTarget::None;
+        }
+    }
+
+    fn cancel_active_global_search(&mut self) {
+        if let Some(cancel) = self.global_search_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        self.global_search_debounce_deadline = None;
+        self.global_search_searching = false;
+    }
+
+    fn schedule_global_search(&mut self, immediate: bool) {
+        self.global_search_req_id = self.global_search_req_id.wrapping_add(1);
+        self.cancel_active_global_search();
+        self.global_search_matches.clear();
+        self.global_search_selected = 0;
+
+        if self.global_search_query.trim().is_empty() || self.workbench.workspace_root.is_none() {
+            return;
+        }
+        self.global_search_searching = true;
+        if immediate {
+            self.dispatch_global_search_worker();
+        } else {
+            self.global_search_debounce_deadline = Some(Instant::now() + GLOBAL_SEARCH_DEBOUNCE);
+        }
+    }
+
+    fn dispatch_global_search_worker(&mut self) {
+        self.global_search_debounce_deadline = None;
+        if !self.global_search_open || self.global_search_query.trim().is_empty() {
+            self.global_search_searching = false;
+            return;
+        }
+        let Some(root) = self.workbench.workspace_root.clone() else {
+            self.global_search_searching = false;
+            return;
+        };
+        if self
+            .global_search_worker
+            .as_ref()
+            .is_some_and(|w| !w.is_alive())
+        {
+            self.global_search_worker = None;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.global_search_cancel = Some(Arc::clone(&cancel));
+        let notifier = self.redraw_notifier.clone();
+        let scheduled = {
+            let worker = self.global_search_worker.get_or_insert_with(|| {
+                WorkspaceSearchWorker::spawn(notifier, GLOBAL_SEARCH_MAX_RESULTS)
+            });
+            worker.schedule(WorkspaceSearchRequest {
+                req_id: self.global_search_req_id,
+                root,
+                query: self.global_search_query.clone(),
+                case_sensitive: self.global_search_case_sensitive,
+                cancel,
+            })
+        };
+        if !scheduled {
+            self.global_search_worker = None;
+            self.global_search_searching = false;
+            self.global_search_cancel = None;
+            self.set_notice("Workspace search unavailable (failed to start worker thread)");
+        }
+    }
+
+    fn poll_global_search(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        if let Some(dl) = self.global_search_debounce_deadline
+            && now >= dl
+        {
+            self.dispatch_global_search_worker();
+            changed = true;
+        }
+        let outcome = self.global_search_worker.as_ref().map(|w| w.drain_responses());
+        if let Some(outcome) = outcome {
+            for resp in outcome.responses {
+                if self.global_search_open && resp.req_id == self.global_search_req_id {
+                    self.global_search_searching = false;
+                    self.global_search_cancel = None;
+                    changed = true;
+                    match resp.result {
+                        Ok(matches) => {
+                            self.global_search_matches = matches;
+                            self.global_search_selected = 0;
+                        }
+                        Err(e) => {
+                            self.global_search_matches.clear();
+                            self.global_search_selected = 0;
+                            self.set_notice(format!("Workspace search failed: {e}"));
+                        }
+                    }
+                }
+            }
+            if outcome.disconnected {
+                self.global_search_worker = None;
+                if self.global_search_searching {
+                    self.global_search_searching = false;
+                    self.global_search_cancel = None;
+                    changed = true;
+                    self.set_notice("Workspace search worker stopped unexpectedly");
+                }
+            }
+        }
+        changed
+    }
+
+    fn confirm_global_search_match(&mut self, idx: usize) {
+        if self.global_search_matches.is_empty() && self.global_search_searching {
+            if self.global_search_debounce_deadline.is_some() {
+                self.dispatch_global_search_worker();
+            }
+            return;
+        }
+        let Some(picked) = self.global_search_matches.get(idx).cloned() else {
+            self.close_global_search();
+            return;
+        };
+        self.close_global_search();
+        self.find_focused = false;
+        self.flush_active_tab_before_switch();
+        match self.workbench.open_document(&picked.path) {
+            Ok(_) => {
+                self.ime_target = ImeTarget::None;
+                self.preferred_caret_x = None;
+                if let Some(tab) = self.workbench.active_tab_mut() {
+                    let safe = tab
+                        .session
+                        .buffer
+                        .snap_out_of_crlf(picked.line_byte_offset.min(tab.session.buffer.len_bytes()));
+                    let _ = tab.edit(|ctx| ctx.set_caret(safe));
+                }
+                self.pending_scroll_ensure_caret = true;
+                let name = picked
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file");
+                self.set_notice(format!("Opened {name}:{}", picked.line_number));
+            }
+            Err(e) => self.set_notice(format!("Open failed: {e}")),
+        }
+    }
+
+    /// Show Insert Table dimensions prompt (`Cmd+Option+T` / `Cmd/Ctrl+T`, PRD 4.3 T-01).
+    pub fn open_insert_table_prompt(&mut self) {
+        if self.workbench.active_tab().is_none() {
+            self.set_notice("No active document");
+            return;
+        }
+        self.close_confirm_armed = false;
+        self.close_transient_prompts();
+        self.find_focused = false;
+        let active_id = self.workbench.active_tab().map(|t| t.id);
+        self.cancel_abandoned_tab_ime(active_id);
+        self.insert_table_input = "3x4".to_string();
+        self.insert_table_open = true;
+    }
+
+    fn target_for_workspace_entry(&self) -> Option<PathBuf> {
+        self.selected_workspace_path
+            .clone()
+            .or_else(|| self.workbench.active_tab().and_then(|t| t.session.path.clone()))
+    }
+
+    fn open_new_file_prompt(&mut self) {
+        let parent_dir = match self.target_for_workspace_entry() {
+            Some(p) if p.is_dir() => Some(p),
+            Some(p) => p.parent().map(Path::to_path_buf),
+            None => None,
+        }
+        .or_else(|| self.workbench.workspace_root.clone())
+        .or_else(|| self.active_dialog_dir());
+        let Some(parent_dir) = parent_dir else {
+            self.set_notice("Open a folder first to create files");
+            return;
+        };
+        self.close_confirm_armed = false;
+        self.close_transient_prompts();
+        self.find_focused = false;
+        let active_id = self.workbench.active_tab().map(|t| t.id);
+        self.cancel_abandoned_tab_ime(active_id);
+        self.file_prompt_input.clear();
+        self.file_prompt_mode = Some(FilePromptMode::CreateFile { parent_dir });
+    }
+
+    fn open_rename_file_prompt(&mut self) {
+        let Some(src) = self.target_for_workspace_entry() else {
+            self.set_notice("Select a file in the sidebar first");
+            return;
+        };
+        if self.workbench.workspace_root.as_ref() == Some(&src) {
+            self.set_notice("Cannot rename workspace root folder here");
+            return;
+        }
+        self.close_confirm_armed = false;
+        self.close_transient_prompts();
+        self.find_focused = false;
+        let active_id = self.workbench.active_tab().map(|t| t.id);
+        self.cancel_abandoned_tab_ime(active_id);
+        self.file_prompt_input = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        self.file_prompt_mode = Some(FilePromptMode::RenameFile { source_path: src });
+    }
+
+    fn arm_or_confirm_delete_file(&mut self) {
+        let Some(target) = self.target_for_workspace_entry() else {
+            self.set_notice("Select a file in the sidebar first");
+            return;
+        };
+        if target.is_dir() {
+            self.delete_confirm_path = None;
+            self.set_notice("Only files can be deleted from the sidebar");
+            return;
+        }
+        let name = target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        if self.delete_confirm_path.as_ref() == Some(&target) {
+            self.delete_confirm_path = None;
+            match self.workbench.delete_workspace_file(&target) {
+                Ok(()) => {
+                    if self.selected_workspace_path.as_ref() == Some(&target) {
+                        self.selected_workspace_path = None;
+                    }
+                    self.set_notice(format!("Deleted {name}"));
+                }
+                Err(e) => self.set_notice(format!("Delete failed: {e}")),
+            }
+        } else {
+            self.delete_confirm_path = Some(target);
+            self.set_notice(format!("Click Del again to delete {name}"));
+        }
+    }
+
+    fn close_simple_prompt(&mut self) {
+        self.insert_table_open = false;
+        self.file_prompt_mode = None;
+        if matches!(
+            self.ime_target,
+            ImeTarget::InsertTableBox | ImeTarget::FileNameBox
+        ) {
+            self.ime_target = ImeTarget::None;
+        }
+    }
+
+    fn confirm_simple_prompt(&mut self) {
+        if self.insert_table_open {
+            let Some((rows, cols)) = parse_table_dimensions(&self.insert_table_input) else {
+                self.set_notice("Enter table dimensions as rows x cols (e.g. 3x4)");
+                return;
+            };
+            self.close_simple_prompt();
+            self.dispatch_editor(EditorAction::InsertTable { rows, cols });
+            self.set_notice(format!("Inserted {rows}×{cols} table"));
+            return;
+        }
+
+        if let Some(mode) = self.file_prompt_mode.clone() {
+            let trimmed = self.file_prompt_input.trim().to_string();
+            if trimmed.is_empty() {
+                self.set_notice("Filename cannot be empty");
+                return;
+            }
+            match mode {
+                FilePromptMode::CreateFile { parent_dir } => {
+                    let final_name = if trimmed.contains('.') {
+                        trimmed
+                    } else {
+                        format!("{trimmed}.md")
+                    };
+                    self.close_simple_prompt();
+                    match self
+                        .workbench
+                        .create_workspace_document(&parent_dir, &final_name)
+                    {
+                        Ok(created) => {
+                            self.flush_active_tab_before_switch();
+                            self.selected_workspace_path = Some(created.clone());
+                            match self.workbench.open_document(&created) {
+                                Ok(_) => {
+                                    self.find_focused = false;
+                                    self.ime_target = ImeTarget::None;
+                                    self.preferred_caret_x = None;
+                                    self.pending_scroll_ensure_caret = true;
+                                    self.set_notice(format!("Created {final_name}"));
+                                }
+                                Err(e) => self.set_notice(format!("Created {final_name} (open err: {e})")),
+                            }
+                        }
+                        Err(e) => self.set_notice(format!("Create failed: {e}")),
+                    }
+                }
+                FilePromptMode::RenameFile { source_path } => {
+                    self.close_simple_prompt();
+                    match self
+                        .workbench
+                        .rename_workspace_entry(&source_path, &trimmed)
+                    {
+                        Ok(dest) => {
+                            self.selected_workspace_path = Some(dest);
+                            self.set_notice(format!("Renamed -> {trimmed}"));
+                        }
+                        Err(e) => self.set_notice(format!("Rename failed: {e}")),
+                    }
+                }
+            }
+        }
+    }
+
+    fn execute_table_toolbar_action(&mut self, kind: TableButtonKind) {
+        let action = match kind {
+            TableButtonKind::AddRowAbove => EditorAction::InsertTableRowAbove,
+            TableButtonKind::AddRowBelow => EditorAction::InsertTableRowBelow,
+            TableButtonKind::DeleteRow => EditorAction::DeleteCurrentTableRow,
+            TableButtonKind::AddColLeft => EditorAction::InsertTableColLeft,
+            TableButtonKind::AddColRight => EditorAction::InsertTableColRight,
+            TableButtonKind::DeleteCol => EditorAction::DeleteCurrentTableCol,
+            TableButtonKind::AlignLeft => EditorAction::SetTableColumnAlign(TableAlign::Left),
+            TableButtonKind::AlignCenter => EditorAction::SetTableColumnAlign(TableAlign::Center),
+            TableButtonKind::AlignRight => EditorAction::SetTableColumnAlign(TableAlign::Right),
+            TableButtonKind::AlignFormat => EditorAction::AlignCurrentTable,
+        };
+        self.dispatch_editor(action);
+    }
+
+    pub fn toggle_focus_mode(&mut self) {
+        self.workbench.config.focus_mode = !self.workbench.config.focus_mode;
+        let on = self.workbench.config.focus_mode;
+        self.set_notice(if on { "Focus Mode: ON" } else { "Focus Mode: OFF" });
+    }
+
+    pub fn toggle_typewriter_mode(&mut self) {
+        self.workbench.config.typewriter_mode = !self.workbench.config.typewriter_mode;
+        let on = self.workbench.config.typewriter_mode;
+        if on {
+            self.pending_scroll_ensure_caret = true;
+        }
+        self.set_notice(if on {
+            "Typewriter Mode: ON"
+        } else {
+            "Typewriter Mode: OFF"
+        });
+    }
+
+    pub fn toggle_fullscreen(&mut self) {
+        self.workbench.config.fullscreen = !self.workbench.config.fullscreen;
+        let on = self.workbench.config.fullscreen;
+        self.set_notice(if on { "Fullscreen: ON" } else { "Fullscreen: OFF" });
     }
 
     /// Insert a fenced code block, or open the Code Language Picker if the caret is already inside one.
@@ -4992,20 +6076,60 @@ impl GuiController {
 }
 
 /// Active native `winit` + `wgpu` application handler.
+fn format_reading_time(secs: usize) -> String {
+    if secs == 0 {
+        "0m read".to_string()
+    } else if secs < 60 {
+        "< 1 min read".to_string()
+    } else {
+        format!("{} min read", secs.div_ceil(60))
+    }
+}
+
+fn parse_table_dimensions(input: &str) -> Option<(usize, usize)> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = trimmed
+        .split(['x', 'X', '×', ',', ' ', '*'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let rows = parts[0].parse::<usize>().ok()?.clamp(1, 50);
+    let cols = parts[1].parse::<usize>().ok()?.clamp(1, 20);
+    Some((rows, cols))
+}
+
 pub struct VellmarkApp {
     controller: GuiController,
     window: Option<Arc<Window>>,
     gpu: Option<WgpuRenderer>,
     modifiers: ModifiersState,
+    last_fullscreen_config: bool,
 }
 
 impl VellmarkApp {
     pub fn new(controller: GuiController) -> Self {
+        let last_fullscreen_config = controller.workbench.config.fullscreen;
         Self {
             controller,
             window: None,
             gpu: None,
             modifiers: ModifiersState::default(),
+            last_fullscreen_config,
+        }
+    }
+
+    fn sync_window_fullscreen(&mut self) {
+        let desired = self.controller.workbench.config.fullscreen;
+        if desired != self.last_fullscreen_config {
+            self.last_fullscreen_config = desired;
+            if let Some(win) = &self.window {
+                win.set_fullscreen(desired.then_some(Fullscreen::Borderless(None)));
+            }
         }
     }
 
@@ -5097,6 +6221,9 @@ impl ApplicationHandler for VellmarkApp {
                             phys.width as f32 / scale.max(0.5),
                             phys.height as f32 / scale.max(0.5),
                         );
+                        if self.last_fullscreen_config {
+                            arc.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                        }
                         self.window = Some(arc);
                         self.gpu = Some(gpu);
                         self.request_redraw();
@@ -5157,6 +6284,7 @@ impl ApplicationHandler for VellmarkApp {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.controller.handle_key_press(&event, self.modifiers) {
+                    self.sync_window_fullscreen();
                     self.request_redraw();
                 }
             }
@@ -5176,6 +6304,7 @@ impl ApplicationHandler for VellmarkApp {
                             .controller
                             .handle_pointer_down_with_mods(px, py, self.modifiers)
                         {
+                            self.sync_window_fullscreen();
                             self.request_redraw();
                         }
                     }
@@ -5231,6 +6360,7 @@ impl ApplicationHandler for VellmarkApp {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
         let _ = self.controller.image_cache.drain_completed();
+        let _ = self.controller.poll_global_search(Instant::now());
         self.request_redraw();
     }
 
@@ -7427,5 +8557,345 @@ Second duplicate body\n";
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_insert_table_prompt_and_toolbar_pill_clicks_sync_auto_align() {
+        let mut wb = AppWorkbench::new(AppConfig::default(), None);
+        wb.new_document();
+        let mut gui = GuiController::new(wb);
+        let mods = test_primary_modifier();
+
+        // Trigger Insert Table prompt with Cmd/Ctrl+T, replace default "3x4" with "2x3", press Enter
+        assert!(gui.handle_key_input(&Key::Character("t".into()), Some("t"), mods));
+        assert!(gui.insert_table_open);
+        assert_eq!(gui.insert_table_input, "3x4");
+        for _ in 0..3 {
+            assert!(gui.handle_key_input(&Key::Named(NamedKey::Backspace), None, ModifiersState::empty()));
+        }
+        for ch in ["2", "x", "3"] {
+            assert!(gui.handle_key_input(&Key::Character(ch.into()), Some(ch), ModifiersState::empty()));
+        }
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert!(!gui.insert_table_open);
+
+        let doc = gui.workbench.active_tab().unwrap().session.buffer.to_string();
+        let lines: Vec<&str> = doc.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].matches('|').count(), 4);
+
+        // Build frame in WYSIWYG mode with caret inside a table cell -> table toolbar pills appear
+        let _ = gui.build_frame();
+        let add_row_rect = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::TableToolbarAction(TableButtonKind::AddRowBelow)))
+            .map(|z| z.rect)
+            .expect("expected +Row↓ table toolbar pill");
+        assert!(gui.handle_pointer_down(add_row_rect.x + 2.0, add_row_rect.y + 2.0));
+        let doc_after_row = gui.workbench.active_tab().unwrap().session.buffer.to_string();
+        assert_eq!(doc_after_row.lines().count(), doc.lines().count() + 1);
+
+        let _ = gui.build_frame();
+        let align_right_rect = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::TableToolbarAction(TableButtonKind::AlignRight)))
+            .map(|z| z.rect)
+            .expect("expected R alignment pill");
+        assert!(gui.handle_pointer_down(align_right_rect.x + 2.0, align_right_rect.y + 2.0));
+        let doc_aligned = gui.workbench.active_tab().unwrap().session.buffer.to_string();
+        let delim = doc_aligned.lines().nth(1).unwrap();
+        assert!(delim.contains(":"));
+
+        let _ = gui.build_frame();
+        let del_row_rect = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::TableToolbarAction(TableButtonKind::DeleteRow)))
+            .map(|z| z.rect)
+            .expect("expected -Row pill");
+        assert!(gui.handle_pointer_down(del_row_rect.x + 2.0, del_row_rect.y + 2.0));
+        assert!(gui.workbench.active_tab().unwrap().session.buffer.to_string().lines().count() < doc_after_row.lines().count());
+
+        // Changing config.table_auto_align dynamically syncs into tab.view on dispatch_editor
+        gui.workbench.config.table_auto_align = false;
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert!(!gui.workbench.active_tab().unwrap().view.table_auto_align);
+    }
+
+    #[test]
+    fn test_global_workspace_search_modal_case_toggle_and_jump_to_line_offset() {
+        let dir = std::env::temp_dir().join(format!(
+            "vellmark-gui-gsearch-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let alpha = dir.join("alpha.md");
+        let beta = dir.join("beta.md");
+        fs::write(&alpha, "# Title\nSecond CaseMatch line\n").unwrap();
+        fs::write(&beta, "Hello\ncasematch here\n").unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(dir.clone()));
+        wb.open_folder(&dir).unwrap();
+        let mut gui = GuiController::new(wb);
+
+        // Cmd/Ctrl+Shift+F opens Global Search without enabling Focus Mode
+        let shift_primary = test_primary_modifier() | ModifiersState::SHIFT;
+        assert!(gui.handle_key_input(&Key::Character("f".into()), None, shift_primary));
+        assert!(gui.global_search_open);
+        assert!(!gui.workbench.config.focus_mode);
+
+        for ch in "CaseMatch".chars() {
+            let s = ch.to_string();
+            assert!(gui.handle_key_input(&Key::Character(s.as_str().into()), Some(&s), ModifiersState::empty()));
+        }
+        // Key input must stay non-blocking & debounced (not scanned synchronously per keystroke)
+        assert!(gui.global_search_searching);
+        assert!(gui.global_search_debounce_deadline.is_some());
+        assert!(gui.global_search_matches.is_empty());
+
+        // Advance past debounce window and wait for background search worker to deliver matches
+        let deadline = Instant::now() + Duration::from_secs(5);
+        gui.tick_runtime_at(Instant::now() + GLOBAL_SEARCH_DEBOUNCE + Duration::from_millis(5));
+        while gui.global_search_searching {
+            assert!(Instant::now() < deadline, "global search worker timed out");
+            std::thread::sleep(Duration::from_millis(5));
+            let _ = gui.tick_runtime_at(Instant::now());
+        }
+        assert_eq!(gui.global_search_matches.len(), 2);
+
+        // Simulate worker exit/panic while searching -> poll_global_search clears `global_search_searching`
+        gui.global_search_worker = Some(WorkspaceSearchWorker::disconnected_for_test());
+        gui.global_search_searching = true;
+        assert!(gui.tick_runtime_at(Instant::now()));
+        assert!(!gui.global_search_searching);
+        assert!(gui.global_search_worker.is_none());
+
+        // Click "Aa" pill to toggle case sensitivity -> respawns worker & searches immediately -> only alpha.md remains
+        let _ = gui.build_frame();
+        let case_rect = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::ToggleGlobalSearchCase))
+            .map(|z| z.rect)
+            .expect("expected Aa case-sensitivity toggle pill");
+        assert!(gui.handle_pointer_down(case_rect.x + 2.0, case_rect.y + 2.0));
+        assert!(gui.global_search_case_sensitive);
+        while gui.global_search_searching {
+            assert!(Instant::now() < deadline, "case-sensitive search timed out");
+            std::thread::sleep(Duration::from_millis(5));
+            let _ = gui.tick_runtime_at(Instant::now());
+        }
+        assert_eq!(gui.global_search_matches.len(), 1);
+        assert_eq!(gui.global_search_matches[0].line_number, 2);
+
+        // Confirm with Enter -> opens alpha.md and moves caret to matching offset
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert!(!gui.global_search_open);
+        assert!(!gui.global_search_searching);
+        let tab = gui.workbench.active_tab().unwrap();
+        assert_eq!(
+            fs::canonicalize(tab.session.path.as_ref().unwrap()).unwrap(),
+            fs::canonicalize(&alpha).unwrap()
+        );
+        assert_eq!(tab.view.selection.head, "# Title\nSecond ".len());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sidebar_recent_tab_and_file_create_rename_delete_flow() {
+        let dir = std::env::temp_dir().join(format!(
+            "vellmark-gui-files-recent-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("existing.md");
+        fs::write(&existing, "# Existing\n").unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(dir.clone()));
+        wb.open_folder(&dir).unwrap();
+        let existing_id = wb.open_document(&existing).unwrap();
+        assert!(wb.close_tab(existing_id, false));
+        let mut gui = GuiController::new(wb);
+        gui.workbench.config.sidebar_visible = true;
+
+        // Switch to Recent sidebar tab and reopen existing.md by clicking it
+        let _ = gui.build_frame();
+        let recent_tab_rect = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::SwitchSidebarSection(SidebarSection::Recent)))
+            .map(|z| z.rect)
+            .expect("expected Recent sidebar tab");
+        assert!(gui.handle_pointer_down(recent_tab_rect.x + 2.0, recent_tab_rect.y + 2.0));
+        assert_eq!(gui.sidebar_section, SidebarSection::Recent);
+
+        let _ = gui.build_frame();
+        let canonical_existing = fs::canonicalize(&existing).unwrap();
+        let recent_item_rect = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(&z.action, UiAction::OpenRecentFile(p) if p == &canonical_existing))
+            .map(|z| z.rect)
+            .expect("expected existing.md entry in Recent");
+        assert!(gui.handle_pointer_down(recent_item_rect.x + 2.0, recent_item_rect.y + 2.0));
+        assert_eq!(
+            fs::canonicalize(gui.workbench.active_tab().unwrap().session.path.as_ref().unwrap()).unwrap(),
+            canonical_existing
+        );
+
+        // Switch to Files, create "draft" -> creates draft.md and opens it
+        let _ = gui.build_frame();
+        let files_tab_rect = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::SwitchSidebarSection(SidebarSection::Files)))
+            .map(|z| z.rect)
+            .expect("expected Files sidebar tab");
+        assert!(gui.handle_pointer_down(files_tab_rect.x + 2.0, files_tab_rect.y + 2.0));
+
+        let _ = gui.build_frame();
+        let new_btn_rect = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::OpenNewFilePrompt))
+            .map(|z| z.rect)
+            .expect("expected +File button");
+        assert!(gui.handle_pointer_down(new_btn_rect.x + 2.0, new_btn_rect.y + 2.0));
+        for ch in "draft".chars() {
+            let s = ch.to_string();
+            assert!(gui.handle_key_input(&Key::Character(s.as_str().into()), Some(&s), ModifiersState::empty()));
+        }
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        let draft_path = dir.join("draft.md");
+        assert!(draft_path.exists());
+        assert_eq!(
+            fs::canonicalize(gui.workbench.active_tab().unwrap().session.path.as_ref().unwrap()).unwrap(),
+            fs::canonicalize(&draft_path).unwrap()
+        );
+
+        // Rename draft.md -> notes.md via Ren prompt
+        let _ = gui.build_frame();
+        let ren_btn_rect = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::OpenRenameFilePrompt))
+            .map(|z| z.rect)
+            .expect("expected Ren button");
+        assert!(gui.handle_pointer_down(ren_btn_rect.x + 2.0, ren_btn_rect.y + 2.0));
+        assert_eq!(gui.file_prompt_input, "draft.md");
+        for _ in 0..8 {
+            assert!(gui.handle_key_input(&Key::Named(NamedKey::Backspace), None, ModifiersState::empty()));
+        }
+        for ch in "notes.md".chars() {
+            let s = ch.to_string();
+            assert!(gui.handle_key_input(&Key::Character(s.as_str().into()), Some(&s), ModifiersState::empty()));
+        }
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        let notes_path = dir.join("notes.md");
+        assert!(!draft_path.exists());
+        assert!(notes_path.exists());
+        assert_eq!(
+            fs::canonicalize(gui.workbench.active_tab().unwrap().session.path.as_ref().unwrap()).unwrap(),
+            fs::canonicalize(&notes_path).unwrap()
+        );
+
+        // Two-click delete safety: first click arms Del?, second click deletes file & marks open tab Missing
+        let _ = gui.build_frame();
+        let del_rect_1 = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::ArmOrConfirmDeleteFile))
+            .map(|z| z.rect)
+            .expect("expected Del button");
+        assert!(gui.handle_pointer_down(del_rect_1.x + 2.0, del_rect_1.y + 2.0));
+        assert!(notes_path.exists());
+        assert!(gui.delete_confirm_path.is_some());
+
+        let _ = gui.build_frame();
+        let del_rect_2 = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::ArmOrConfirmDeleteFile))
+            .map(|z| z.rect)
+            .expect("expected armed Del? button");
+        assert!(gui.handle_pointer_down(del_rect_2.x + 2.0, del_rect_2.y + 2.0));
+        assert!(!notes_path.exists());
+        assert!(matches!(
+            gui.workbench.active_tab().unwrap().session.state,
+            DocState::Missing { .. }
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_view_modes_shortcuts_typewriter_pill_and_status_bar_selection_stats() {
+        let mut wb = AppWorkbench::new(AppConfig::default(), None);
+        wb.new_document();
+        wb.active_tab_mut()
+            .unwrap()
+            .session
+            .buffer
+            .reset_content("hello world from vellmark\n");
+        let mut gui = GuiController::new(wb);
+
+        // Initial cached meta & reading time without selection
+        let _ = gui.build_frame();
+        let meta = gui.cached_meta.as_ref().unwrap();
+        assert_eq!(meta.stats.word_count, 4);
+        assert_eq!(meta.stats.reading_time_secs, 1);
+        assert_eq!(meta.stats.selection_word_count, 0);
+        assert_eq!(meta.stats.selection_char_count, 0);
+
+        // Update selection to "world from" without changing buffer revision -> selection stats update
+        gui.workbench
+            .active_tab_mut()
+            .unwrap()
+            .edit(|ctx| ctx.set_selection(6, 16))
+            .unwrap();
+        let _ = gui.build_frame();
+        let meta2 = gui.cached_meta.as_ref().unwrap();
+        assert_eq!(meta2.stats.selection_word_count, 2);
+        assert_eq!(meta2.stats.selection_char_count, 10);
+
+        // F8 Focus Mode, F9 & TW pill Typewriter Mode, F11 Fullscreen
+        assert!(!gui.workbench.config.focus_mode);
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::F8), None, ModifiersState::empty()));
+        assert!(gui.workbench.config.focus_mode);
+
+        assert!(!gui.workbench.config.typewriter_mode);
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::F9), None, ModifiersState::empty()));
+        assert!(gui.workbench.config.typewriter_mode);
+
+        let _ = gui.build_frame();
+        let tw_rect = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::ToggleTypewriterMode))
+            .map(|z| z.rect)
+            .expect("expected TW typewriter pill in tab bar");
+        assert!(gui.handle_pointer_down(tw_rect.x + 2.0, tw_rect.y + 2.0));
+        assert!(!gui.workbench.config.typewriter_mode);
+
+        assert!(!gui.workbench.config.fullscreen);
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::F11), None, ModifiersState::empty()));
+        assert!(gui.workbench.config.fullscreen);
+        if cfg!(target_os = "macos") {
+            assert!(gui.handle_key_input(
+                &Key::Character("f".into()),
+                None,
+                ModifiersState::SUPER | ModifiersState::CONTROL,
+            ));
+            assert!(!gui.workbench.config.fullscreen);
+        }
     }
 }

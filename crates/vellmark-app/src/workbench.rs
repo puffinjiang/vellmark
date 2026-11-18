@@ -46,7 +46,7 @@ use vellmark_theme::ThemeSheet;
 
 use crate::assets::{import_image_bytes_to_assets, import_image_to_assets};
 use crate::config::AppConfig;
-use crate::search::{QuickOpenMatch, WorkspaceSearchMatch, global_workspace_search, quick_open_fuzzy_search};
+use crate::search::{QuickOpenMatch, quick_open_fuzzy_search};
 
 pub const AUTO_SAVE_RETRY_BACKOFF_SECS: [u64; 3] = [5, 15, 60];
 
@@ -751,8 +751,14 @@ impl AppWorkbench {
             self.history_policy,
             std::time::Duration::from_millis(200),
         );
-        self.tabs
-            .push(DocumentTab::new(id, session, EditorViewState::default()));
+        self.tabs.push(DocumentTab::new(
+            id,
+            session,
+            EditorViewState {
+                table_auto_align: self.config.table_auto_align,
+                ..Default::default()
+            },
+        ));
         self.active_tab_idx = Some(self.tabs.len() - 1);
         id
     }
@@ -785,8 +791,14 @@ impl AppWorkbench {
             std::time::Duration::from_millis(200),
         )?;
         self.recent_files.record_open(canonical);
-        self.tabs
-            .push(DocumentTab::new(id, session, EditorViewState::default()));
+        self.tabs.push(DocumentTab::new(
+            id,
+            session,
+            EditorViewState {
+                table_auto_align: self.config.table_auto_align,
+                ..Default::default()
+            },
+        ));
         self.refresh_tab_conflict_backup_count(id);
         self.active_tab_idx = Some(self.tabs.len() - 1);
         Ok(id)
@@ -879,21 +891,138 @@ impl AppWorkbench {
         Ok(())
     }
 
+    /// Create a new document file inside `parent_dir`, refresh the file tree, and record MRU (PRD 4.5 F-03).
+    pub fn create_workspace_document(
+        &mut self,
+        parent_dir: &Path,
+        file_name: &str,
+    ) -> io::Result<PathBuf> {
+        let created = FileTreeNode::create_document(parent_dir, file_name)?;
+        let canonical = fs::canonicalize(&created).unwrap_or(created);
+        self.recent_files.record_open(canonical.clone());
+        let _ = self.refresh_file_tree();
+        Ok(canonical)
+    }
+
+    /// Rename a file or folder inside the workspace to `new_name` in its current parent directory,
+    /// keeping matching open tab paths and MRU entries synchronized (PRD 4.5 F-03).
+    pub fn rename_workspace_entry(&mut self, from: &Path, new_name: &str) -> io::Result<PathBuf> {
+        let mut comps = Path::new(new_name).components();
+        match (comps.next(), comps.next()) {
+            (Some(std::path::Component::Normal(_)), None) => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid filename: {new_name}"),
+                ));
+            }
+        }
+        let Some(parent) = from.parent() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot rename root path without parent directory",
+            ));
+        };
+        let to = parent.join(new_name);
+        if to == from {
+            return Ok(from.to_path_buf());
+        }
+
+        let canonical_from = fs::canonicalize(from).unwrap_or_else(|_| from.to_path_buf());
+        let mut affected_tabs: Vec<(usize, PathBuf)> = Vec::new();
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            let Some(tab_path) = tab.session.path.as_deref() else {
+                continue;
+            };
+            let tab_canon = fs::canonicalize(tab_path).unwrap_or_else(|_| tab_path.to_path_buf());
+            if tab_path == from || tab_canon == canonical_from {
+                affected_tabs.push((idx, PathBuf::new()));
+            } else if let Ok(rel) = tab_canon.strip_prefix(&canonical_from) {
+                affected_tabs.push((idx, rel.to_path_buf()));
+            } else if let Ok(rel) = tab_path.strip_prefix(from) {
+                affected_tabs.push((idx, rel.to_path_buf()));
+            }
+        }
+
+        let now = Instant::now();
+        for (idx, _) in &affected_tabs {
+            // Reconcile or await any background write to the old path before moving it on disk,
+            // preventing "document path changed while saving" errors and stale-base false conflicts.
+            if let Some(outcome) = self.tabs[*idx].session.drain_pending_async_save() {
+                self.tabs[*idx].apply_save_outcome_at(&outcome, now);
+            }
+        }
+
+        FileTreeNode::rename_or_move(from, &to)?;
+        let canonical_to = fs::canonicalize(&to).unwrap_or_else(|_| to.clone());
+
+        for (idx, rel) in affected_tabs {
+            let updated = if rel.as_os_str().is_empty() {
+                canonical_to.clone()
+            } else {
+                canonical_to.join(rel)
+            };
+            let tab_id = self.tabs[idx].id;
+            self.tabs[idx].session.apply_renamed_path(&updated);
+            self.tabs[idx].sync_edit_activity_at(now);
+            self.refresh_tab_conflict_backup_count(tab_id);
+            self.recent_files.record_open(updated);
+        }
+        if canonical_to.is_file() {
+            self.recent_files.record_open(canonical_to.clone());
+        }
+        self.recent_files.prune_missing();
+        let _ = self.refresh_file_tree();
+        Ok(canonical_to)
+    }
+
+    /// Delete a document file on disk, mark matching open tabs Missing, and refresh workspace state (PRD 4.5 F-03).
+    pub fn delete_workspace_file(&mut self, path: &Path) -> io::Result<()> {
+        if path.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only document files can be deleted",
+            ));
+        }
+        let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let affected_indices: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, tab)| {
+                let tab_path = tab.session.path.as_deref()?;
+                let tab_canon =
+                    fs::canonicalize(tab_path).unwrap_or_else(|_| tab_path.to_path_buf());
+                (tab_path == path
+                    || tab_canon == canonical
+                    || paths_refer_to_same_file(tab_path, path))
+                .then_some(idx)
+            })
+            .collect();
+
+        let now = Instant::now();
+        for &idx in &affected_indices {
+            // Cancel queued writes and wait for any executing SaveWorker write before deleting
+            // so a background write can never resurrect the deleted file or clear Missing state.
+            if let Some(outcome) = self.tabs[idx].session.cancel_and_drain_async_save() {
+                self.tabs[idx].apply_save_outcome_at(&outcome, now);
+            }
+        }
+
+        FileTreeNode::delete_document(path)?;
+        for idx in affected_indices {
+            self.tabs[idx].session.on_external_deleted();
+            self.tabs[idx].sync_edit_activity_at(now);
+        }
+        self.recent_files.prune_missing();
+        let _ = self.refresh_file_tree();
+        Ok(())
+    }
+
     pub fn quick_open(&self, query: &str) -> Vec<QuickOpenMatch> {
         match (&self.file_tree, &self.workspace_root) {
             (Some(tree), Some(root)) => quick_open_fuzzy_search(tree, root, query),
             _ => Vec::new(),
-        }
-    }
-
-    pub fn search_in_workspace(
-        &self,
-        query: &str,
-        case_sensitive: bool,
-    ) -> io::Result<Vec<WorkspaceSearchMatch>> {
-        match &self.workspace_root {
-            Some(root) => global_workspace_search(root, query, case_sensitive),
-            None => Ok(Vec::new()),
         }
     }
 
@@ -1076,6 +1205,7 @@ impl AppWorkbench {
                 session,
                 EditorViewState {
                     selection: Selection::caret(caret),
+                    table_auto_align: self.config.table_auto_align,
                     ..Default::default()
                 },
             ));
@@ -2250,6 +2380,114 @@ mod tests {
         let lf_buf = lf_tab.session.buffer.to_string();
         assert!(!lf_buf.contains('\r'), "unexpected CR in LF doc: {lf_buf:?}");
         assert!(lf_buf.contains("Clip 1\nClip 2\n"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_delete_and_rename_coordinate_async_save_queue_and_sync_recovery_meta() {
+        let root = unique_temp_dir("del-ren-async-coord");
+        let rec_root = root.join("recovery");
+        let ws = root.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let file_a = ws.join("a.md");
+        fs::write(&file_a, "v0\n").unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root.clone()));
+        wb.open_folder(&ws).unwrap();
+        wb.open_document(&file_a).unwrap();
+
+        // Issue 2 & 3 repro: background save finishes "v1\n" while unpolled, user edits "v2\n" (Dirty), then renames a.md -> b.md
+        {
+            let tab = wb.active_tab_mut().unwrap();
+            tab.edit(|ctx| {
+                ctx.set_selection(0, 3);
+                ctx.insert_text("v1\n");
+            })
+            .unwrap();
+            assert!(tab.session.schedule_async_save());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while tab.session.is_async_save_in_flight() {
+                assert!(Instant::now() < deadline, "W1 async save timed out");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Leave FinishedWrite unpolled! Edit buffer again so state stays Dirty after rename.
+            tab.edit(|ctx| {
+                ctx.set_selection(0, 3);
+                ctx.insert_text("v2\n");
+            })
+            .unwrap();
+        }
+
+        let renamed_canon = wb.rename_workspace_entry(&file_a, "b.md").unwrap();
+        let file_b = ws.join("b.md");
+        assert!(!file_a.exists());
+        assert!(file_b.exists());
+
+        // Polling after rename must NOT emit "document path changed while saving"
+        let post_poll_events = wb.poll_async_saves_at(Instant::now());
+        assert!(
+            !post_poll_events
+                .iter()
+                .any(|e| matches!(e, WorkbenchRuntimeEvent::WriteFailed { .. })),
+            "unexpected post-rename write failure: {post_poll_events:?}"
+        );
+
+        // External sync poll must NOT enter false Conflict
+        let sync_events = wb.poll_external_changes(true);
+        assert!(
+            !sync_events
+                .iter()
+                .any(|e| matches!(e, WorkbenchRuntimeEvent::EnteredConflict { .. })),
+            "unexpected false conflict after rename: {sync_events:?}"
+        );
+
+        // Issue 3: Dirty recovery metadata on disk must immediately reference b.md (not stale a.md)
+        let pending = vellmark_core::scan_recovery_root(&rec_root);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0]
+                .source_path
+                .as_ref()
+                .map(|p| fs::canonicalize(p).unwrap()),
+            Some(renamed_canon.clone())
+        );
+
+        // Saving after rename must cleanly save v2\n without entering Conflict
+        assert_eq!(wb.active_tab_mut().unwrap().save(), SaveOutcome::SavedClean);
+        assert_eq!(fs::read_to_string(&file_b).unwrap(), "v2\n");
+
+        // Issue 1 repro: schedule an async save on Dirty b.md, then immediately delete b.md via workbench
+        {
+            let tab = wb.active_tab_mut().unwrap();
+            tab.edit(|ctx| {
+                ctx.set_selection(0, 3);
+                ctx.insert_text("v3-unsaved\n");
+            })
+            .unwrap();
+            assert!(tab.session.schedule_async_save());
+        }
+        wb.delete_workspace_file(&file_b).unwrap();
+        assert!(!file_b.exists(), "deleted file must not exist on disk");
+        assert!(matches!(
+            wb.active_tab().unwrap().session.state,
+            DocState::Missing { .. }
+        ));
+
+        // Even after ticking auto-save / waiting briefly, background save must NEVER resurrect file_b or clear Missing
+        std::thread::sleep(Duration::from_millis(20));
+        let later_events = wb.tick_auto_save_at(Instant::now() + Duration::from_secs(10));
+        assert!(!file_b.exists(), "deleted file was resurrected by background save");
+        assert!(matches!(
+            wb.active_tab().unwrap().session.state,
+            DocState::Missing { .. }
+        ));
+        assert!(
+            !later_events
+                .iter()
+                .any(|e| matches!(e, WorkbenchRuntimeEvent::AutoSavedClean { .. })),
+            "deleted file transitioned back to Clean: {later_events:?}"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

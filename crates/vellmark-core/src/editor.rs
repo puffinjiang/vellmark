@@ -8,8 +8,8 @@
 use crate::buffer::{ByteOffset, ByteRange, Selection, TextBuffer};
 use crate::encoding::{LineEnding, normalize_line_endings};
 use crate::table::{
-    GfmTableContext, TableCellSpan, TableRowParsed, find_enclosing_gfm_table_at,
-    parse_table_delimiter_alignments, unescaped_pipe_offsets,
+    GfmTableContext, TableAlign, TableCellSpan, TableRowParsed, find_enclosing_gfm_table_at,
+    parse_table_cell_rel_ranges, parse_table_delimiter_alignments, unescaped_pipe_offsets,
 };
 use crate::undo::{EditKind, EditOp, Transaction, UndoHistory};
 
@@ -42,6 +42,17 @@ pub enum EditorAction {
     SetHeadingLevel(u8),
     ToggleTaskCheckbox,
     AlignCurrentTable,
+    InsertTable {
+        rows: usize,
+        cols: usize,
+    },
+    InsertTableRowAbove,
+    InsertTableRowBelow,
+    DeleteCurrentTableRow,
+    InsertTableColLeft,
+    InsertTableColRight,
+    DeleteCurrentTableCol,
+    SetTableColumnAlign(TableAlign),
     Undo,
     Redo,
 }
@@ -59,6 +70,8 @@ pub struct EditorViewState {
     pub ime_composition_selection: Option<Selection>,
     /// Tracks whether block expansion is frozen due to active IME composition.
     pub expansion_frozen: bool,
+    /// Whether structural table edits auto-align Markdown table columns (PRD 4.3 T-03).
+    pub table_auto_align: bool,
 }
 
 impl Default for EditorViewState {
@@ -69,6 +82,7 @@ impl Default for EditorViewState {
             ime_preedit: None,
             ime_composition_selection: None,
             expansion_frozen: false,
+            table_auto_align: false,
         }
     }
 }
@@ -97,6 +111,7 @@ impl EditorViewState {
             ime_composition_selection: &mut self.ime_composition_selection,
             expansion_frozen: &mut self.expansion_frozen,
             preferred_line_ending,
+            table_auto_align: self.table_auto_align,
         }
     }
 }
@@ -112,6 +127,7 @@ pub struct EditorContext<'a> {
     pub ime_composition_selection: &'a mut Option<Selection>,
     pub expansion_frozen: &'a mut bool,
     pub preferred_line_ending: LineEnding,
+    pub table_auto_align: bool,
 }
 
 /// Stateful standalone editor controller wrapping `TextBuffer`, `Selection`, `UndoHistory`,
@@ -132,6 +148,8 @@ pub struct EditorController {
     pub expansion_frozen: bool,
     /// Remembered document line-ending preference used as fallback when all line breaks are deleted.
     pub preferred_line_ending: LineEnding,
+    /// Whether structural table edits auto-align columns cleanly (PRD 4.3 T-03).
+    pub table_auto_align: bool,
 }
 
 impl Default for EditorController {
@@ -161,6 +179,7 @@ impl EditorController {
             ime_composition_selection: None,
             expansion_frozen: false,
             preferred_line_ending,
+            table_auto_align: false,
         }
     }
 
@@ -174,6 +193,7 @@ impl EditorController {
             ime_composition_selection: &mut self.ime_composition_selection,
             expansion_frozen: &mut self.expansion_frozen,
             preferred_line_ending: self.preferred_line_ending,
+            table_auto_align: self.table_auto_align,
         }
     }
 
@@ -277,6 +297,38 @@ impl EditorController {
     pub fn align_current_table(&mut self) -> bool {
         self.ctx().align_current_table()
     }
+
+    pub fn insert_table(&mut self, rows: usize, cols: usize) -> bool {
+        self.ctx().insert_table(rows, cols)
+    }
+
+    pub fn insert_table_row_above(&mut self) -> bool {
+        self.ctx().insert_table_row_above()
+    }
+
+    pub fn insert_table_row_below(&mut self) -> bool {
+        self.ctx().insert_table_row_below()
+    }
+
+    pub fn delete_current_table_row(&mut self) -> bool {
+        self.ctx().delete_current_table_row()
+    }
+
+    pub fn insert_table_col_left(&mut self) -> bool {
+        self.ctx().insert_table_col_left()
+    }
+
+    pub fn insert_table_col_right(&mut self) -> bool {
+        self.ctx().insert_table_col_right()
+    }
+
+    pub fn delete_current_table_col(&mut self) -> bool {
+        self.ctx().delete_current_table_col()
+    }
+
+    pub fn set_table_column_align(&mut self, align: TableAlign) -> bool {
+        self.ctx().set_table_column_align(align)
+    }
 }
 
 impl EditorContext<'_> {
@@ -308,6 +360,30 @@ impl EditorContext<'_> {
             }
             EditorAction::AlignCurrentTable => {
                 self.align_current_table();
+            }
+            EditorAction::InsertTable { rows, cols } => {
+                self.insert_table(rows, cols);
+            }
+            EditorAction::InsertTableRowAbove => {
+                self.insert_table_row_above();
+            }
+            EditorAction::InsertTableRowBelow => {
+                self.insert_table_row_below();
+            }
+            EditorAction::DeleteCurrentTableRow => {
+                self.delete_current_table_row();
+            }
+            EditorAction::InsertTableColLeft => {
+                self.insert_table_col_left();
+            }
+            EditorAction::InsertTableColRight => {
+                self.insert_table_col_right();
+            }
+            EditorAction::DeleteCurrentTableCol => {
+                self.delete_current_table_col();
+            }
+            EditorAction::SetTableColumnAlign(align) => {
+                self.set_table_column_align(align);
             }
             EditorAction::Undo => self.undo(),
             EditorAction::Redo => self.redo(),
@@ -1259,6 +1335,30 @@ impl EditorContext<'_> {
                 let full = self.buffer.to_string();
                 if let Some(ctx) = find_enclosing_gfm_table_at(&full, line_start) {
                     let nl = detect_line_ending_str(&full, self.preferred_line_ending);
+                    if self.table_auto_align {
+                        let insert_grid_row = if ctx.row_idx <= 1 { 1 } else { ctx.row_idx };
+                        let mut grid = ParsedTableGrid::from_context(&full, &ctx, nl);
+                        grid.insert_empty_row(insert_grid_row);
+                        let rendered = grid.render(true);
+                        let caret_rel = table_line_cell_caret_in_rendered(
+                            &rendered,
+                            insert_grid_row + 1,
+                            0,
+                            None,
+                        );
+                        let sel_before = *self.selection;
+                        let sel_after = Selection::caret(ctx.range.start + caret_rel);
+                        self.undo.apply_edit(
+                            self.buffer,
+                            ctx.range,
+                            &rendered,
+                            sel_before,
+                            sel_after,
+                            EditKind::Structural,
+                        );
+                        *self.selection = sel_after;
+                        return;
+                    }
                     let empty_row = build_empty_table_row(ctx.delim_cols);
                     let anchor_row = if ctx.row_idx == 0 {
                         &ctx.rows[1]
@@ -1285,6 +1385,43 @@ impl EditorContext<'_> {
                     let cols = pipes.len() - 1;
                     let nl = detect_line_ending_str(&full, self.preferred_line_ending);
                     let insert_pos = table_row_insert_pos(&full, line_start, line_end);
+                    if self.table_auto_align {
+                        let header_cells: Vec<String> = (0..cols)
+                            .map(|c| line[pipes[c] + 1..pipes[c + 1]].trim().to_string())
+                            .collect();
+                        let grid = ParsedTableGrid {
+                            alignments: vec![TableAlign::Left; cols],
+                            delim_colons: vec![(false, false); cols],
+                            delim_nl_after: nl,
+                            rows: vec![
+                                TableGridRow {
+                                    cells: header_cells,
+                                    extra_cells: Vec::new(),
+                                    nl_after: nl,
+                                },
+                                TableGridRow {
+                                    cells: vec![String::new(); cols],
+                                    extra_cells: Vec::new(),
+                                    nl_after: nl,
+                                },
+                            ],
+                            doc_nl: nl,
+                        };
+                        let rendered = grid.render(true);
+                        let caret_rel = table_line_cell_caret_in_rendered(&rendered, 2, 0, None);
+                        let sel_before = *self.selection;
+                        let sel_after = Selection::caret(line_start + caret_rel);
+                        self.undo.apply_edit(
+                            self.buffer,
+                            ByteRange::new(line_start, insert_pos),
+                            &rendered,
+                            sel_before,
+                            sel_after,
+                            EditKind::Structural,
+                        );
+                        *self.selection = sel_after;
+                        return;
+                    }
                     let sep_row = build_table_separator_row(cols);
                     let empty_row = build_empty_table_row(cols);
                     let insertion = format!("{nl}{sep_row}{nl}{empty_row}");
@@ -1544,6 +1681,275 @@ impl EditorContext<'_> {
         true
     }
 
+    /// Insert a GFM table with `rows` content rows (1 header + `rows - 1` body rows) and `cols` columns
+    /// at the current selection/caret as a single undoable structural edit (PRD 4.3 T-01).
+    pub fn insert_table(&mut self, rows: usize, cols: usize) -> bool {
+        self.abort_ime_preedit();
+        self.normalize_selection_out_of_crlf();
+        let total_rows = rows.clamp(1, 50);
+        let total_cols = cols.clamp(1, 20);
+        let range = self.selection.range();
+        let sel_before = *self.selection;
+        let nl = self.dominant_line_ending();
+
+        let lead_nl = if range.start > 0
+            && self
+                .buffer
+                .slice_to_string(ByteRange::new(range.start - 1, range.start))
+                != "\n"
+        {
+            nl
+        } else {
+            ""
+        };
+        let trail_nl = if range.end < self.buffer.len_bytes() {
+            let next = self
+                .buffer
+                .slice_to_string(ByteRange::new(range.end, range.end + 1));
+            if next != "\n" && next != "\r" { nl } else { "" }
+        } else {
+            ""
+        };
+
+        let grid_rows = (0..total_rows)
+            .map(|_| TableGridRow {
+                cells: vec![String::new(); total_cols],
+                extra_cells: Vec::new(),
+                nl_after: nl,
+            })
+            .collect();
+        let grid = ParsedTableGrid {
+            alignments: vec![TableAlign::Left; total_cols],
+            delim_colons: vec![(false, false); total_cols],
+            delim_nl_after: nl,
+            rows: grid_rows,
+            doc_nl: nl,
+        };
+        let table_str = grid.render(true);
+        let caret_in_table = table_line_cell_caret_in_rendered(&table_str, 0, 0, None);
+        let snippet = format!("{lead_nl}{table_str}{trail_nl}");
+        let sel_after = Selection::caret(range.start + lead_nl.len() + caret_in_table);
+        self.undo.apply_edit(
+            self.buffer,
+            range,
+            &snippet,
+            sel_before,
+            sel_after,
+            EditKind::Structural,
+        );
+        *self.selection = sel_after;
+        true
+    }
+
+    pub fn insert_table_row_above(&mut self) -> bool {
+        self.with_enclosing_table_grid_edit(|grid, ctx_row_idx, col_idx, _| {
+            let insert_at = if ctx_row_idx <= 1 {
+                usize::from(ctx_row_idx == 1)
+            } else {
+                ctx_row_idx - 1
+            };
+            grid.insert_empty_row(insert_at);
+            TableGridEditOutcome::Update {
+                target_raw_line: if insert_at == 0 { 0 } else { insert_at + 1 },
+                target_col: col_idx,
+                preserve_cell_rel: None,
+            }
+        })
+    }
+
+    pub fn insert_table_row_below(&mut self) -> bool {
+        self.with_enclosing_table_grid_edit(|grid, ctx_row_idx, col_idx, _| {
+            let insert_at = if ctx_row_idx <= 1 { 1 } else { ctx_row_idx };
+            grid.insert_empty_row(insert_at);
+            TableGridEditOutcome::Update {
+                target_raw_line: insert_at + 1,
+                target_col: col_idx,
+                preserve_cell_rel: None,
+            }
+        })
+    }
+
+    pub fn delete_current_table_row(&mut self) -> bool {
+        self.with_enclosing_table_grid_edit(|grid, ctx_row_idx, col_idx, _| {
+            if ctx_row_idx == 1 {
+                return TableGridEditOutcome::NoOp;
+            }
+            if grid.rows.len() <= 1 && ctx_row_idx == 0 {
+                return TableGridEditOutcome::DeleteWholeTable;
+            }
+            let grid_row_idx = if ctx_row_idx == 0 { 0 } else { ctx_row_idx - 1 };
+            grid.delete_row(grid_row_idx);
+            let target_grid_row = grid_row_idx.min(grid.rows.len().saturating_sub(1));
+            TableGridEditOutcome::Update {
+                target_raw_line: if target_grid_row == 0 {
+                    0
+                } else {
+                    target_grid_row + 1
+                },
+                target_col: col_idx,
+                preserve_cell_rel: None,
+            }
+        })
+    }
+
+    pub fn insert_table_col_left(&mut self) -> bool {
+        self.with_enclosing_table_grid_edit(|grid, ctx_row_idx, col_idx, delim_cols| {
+            if delim_cols >= 50 {
+                return TableGridEditOutcome::NoOp;
+            }
+            grid.insert_empty_col(col_idx);
+            TableGridEditOutcome::Update {
+                target_raw_line: ctx_row_idx,
+                target_col: col_idx,
+                preserve_cell_rel: None,
+            }
+        })
+    }
+
+    pub fn insert_table_col_right(&mut self) -> bool {
+        self.with_enclosing_table_grid_edit(|grid, ctx_row_idx, col_idx, delim_cols| {
+            if delim_cols >= 50 {
+                return TableGridEditOutcome::NoOp;
+            }
+            let insert_col = col_idx + 1;
+            grid.insert_empty_col(insert_col);
+            TableGridEditOutcome::Update {
+                target_raw_line: ctx_row_idx,
+                target_col: insert_col,
+                preserve_cell_rel: None,
+            }
+        })
+    }
+
+    pub fn delete_current_table_col(&mut self) -> bool {
+        self.with_enclosing_table_grid_edit(|grid, ctx_row_idx, col_idx, delim_cols| {
+            if delim_cols <= 1 {
+                return TableGridEditOutcome::DeleteWholeTable;
+            }
+            grid.delete_col(col_idx);
+            TableGridEditOutcome::Update {
+                target_raw_line: ctx_row_idx,
+                target_col: col_idx.min(grid.alignments.len().saturating_sub(1)),
+                preserve_cell_rel: None,
+            }
+        })
+    }
+
+    pub fn set_table_column_align(&mut self, align: TableAlign) -> bool {
+        self.with_enclosing_table_grid_edit(|grid, ctx_row_idx, col_idx, _| {
+            let Some(&cur) = grid.alignments.get(col_idx) else {
+                return TableGridEditOutcome::NoOp;
+            };
+            if cur == align {
+                return TableGridEditOutcome::NoOp;
+            }
+            grid.alignments[col_idx] = align;
+            grid.delim_colons[col_idx] = match align {
+                TableAlign::Left => (true, false),
+                TableAlign::Center => (true, true),
+                TableAlign::Right => (false, true),
+            };
+            TableGridEditOutcome::Update {
+                target_raw_line: ctx_row_idx,
+                target_col: col_idx,
+                preserve_cell_rel: Some(0),
+            }
+        })
+    }
+
+    fn with_enclosing_table_grid_edit<F>(&mut self, op: F) -> bool
+    where
+        F: FnOnce(&mut ParsedTableGrid, usize, usize, usize) -> TableGridEditOutcome,
+    {
+        self.abort_ime_preedit();
+        self.normalize_selection_out_of_crlf();
+        let (line_start, _) = self.current_line_bounds();
+        if self.is_offset_inside_fenced_code_block(line_start) {
+            return false;
+        }
+        let full = self.buffer.to_string();
+        let Some(ctx) = find_enclosing_gfm_table_at(&full, line_start) else {
+            return false;
+        };
+        if ctx.delim_cols == 0 || ctx.rows.len() < 2 {
+            return false;
+        }
+        let row = &ctx.rows[ctx.row_idx];
+        let col_idx = cell_index_for_offset(row, self.selection.head)
+            .unwrap_or(0)
+            .min(ctx.delim_cols.saturating_sub(1));
+        let rel_in_content = row
+            .cells
+            .get(col_idx)
+            .filter(|_| ctx.row_idx != 1)
+            .map(|c| {
+                self.selection
+                    .head
+                    .saturating_sub(c.content_range.start)
+                    .min(c.content_range.len())
+            });
+        let doc_nl = detect_line_ending_str(&full, self.preferred_line_ending);
+        let mut grid = ParsedTableGrid::from_context(&full, &ctx, doc_nl);
+        match op(&mut grid, ctx.row_idx, col_idx, ctx.delim_cols) {
+            TableGridEditOutcome::NoOp => false,
+            TableGridEditOutcome::DeleteWholeTable => {
+                let bytes = full.as_bytes();
+                let mut del_start = ctx.range.start;
+                let mut del_end = ctx.range.end;
+                if bytes.get(del_end) == Some(&b'\r') && bytes.get(del_end + 1) == Some(&b'\n') {
+                    del_end += 2;
+                } else if bytes.get(del_end) == Some(&b'\n') {
+                    del_end += 1;
+                } else if del_start >= 2
+                    && bytes[del_start - 2] == b'\r'
+                    && bytes[del_start - 1] == b'\n'
+                {
+                    del_start -= 2;
+                } else if del_start >= 1 && bytes[del_start - 1] == b'\n' {
+                    del_start -= 1;
+                }
+                let sel_before = *self.selection;
+                let sel_after = Selection::caret(del_start);
+                self.undo.apply_edit(
+                    self.buffer,
+                    ByteRange::new(del_start, del_end),
+                    "",
+                    sel_before,
+                    sel_after,
+                    EditKind::Structural,
+                );
+                *self.selection = sel_after;
+                true
+            }
+            TableGridEditOutcome::Update {
+                target_raw_line,
+                target_col,
+                preserve_cell_rel,
+            } => {
+                let rendered = grid.render(self.table_auto_align);
+                let preserve = preserve_cell_rel.and(rel_in_content);
+                let caret_rel = table_line_cell_caret_in_rendered(
+                    &rendered,
+                    target_raw_line,
+                    target_col,
+                    preserve,
+                );
+                let sel_before = *self.selection;
+                let sel_after = Selection::caret(ctx.range.start + caret_rel);
+                self.undo.apply_edit(
+                    self.buffer,
+                    ctx.range,
+                    &rendered,
+                    sel_before,
+                    sel_after,
+                    EditKind::Structural,
+                );
+                *self.selection = sel_after;
+                true
+            }
+        }
+    }
+
     fn tab_in_gfm_table(&mut self, full: &str, ctx: &GfmTableContext) {
         let row = &ctx.rows[ctx.row_idx];
         let Some(cell_idx) = cell_index_for_offset(row, self.selection.head) else {
@@ -1558,6 +1964,29 @@ impl EditorContext<'_> {
             }
             // Short body row (`row.cells.len() < ctx.delim_cols`): materialize missing cells
             // on the same row and move the caret into column `cell_idx + 1`.
+            if self.table_auto_align {
+                let nl = detect_line_ending_str(full, self.preferred_line_ending);
+                let grid = ParsedTableGrid::from_context(full, ctx, nl);
+                let rendered = grid.render(true);
+                let caret_rel = table_line_cell_caret_in_rendered(
+                    &rendered,
+                    ctx.row_idx,
+                    cell_idx + 1,
+                    None,
+                );
+                let sel_before = *self.selection;
+                let sel_after = Selection::caret(ctx.range.start + caret_rel);
+                self.undo.apply_edit(
+                    self.buffer,
+                    ctx.range,
+                    &rendered,
+                    sel_before,
+                    sel_after,
+                    EditKind::Structural,
+                );
+                *self.selection = sel_after;
+                return;
+            }
             let Some(last_cell) = row.cells.last() else {
                 return;
             };
@@ -1605,6 +2034,25 @@ impl EditorContext<'_> {
         }
 
         let nl = detect_line_ending_str(full, self.preferred_line_ending);
+        if self.table_auto_align {
+            let mut grid = ParsedTableGrid::from_context(full, ctx, nl);
+            let new_grid_row = grid.rows.len();
+            grid.insert_empty_row(new_grid_row);
+            let rendered = grid.render(true);
+            let caret_rel = table_line_cell_caret_in_rendered(&rendered, new_grid_row + 1, 0, None);
+            let sel_before = *self.selection;
+            let sel_after = Selection::caret(ctx.range.start + caret_rel);
+            self.undo.apply_edit(
+                self.buffer,
+                ctx.range,
+                &rendered,
+                sel_before,
+                sel_after,
+                EditKind::Structural,
+            );
+            *self.selection = sel_after;
+            return;
+        }
         let insert_pos = ctx
             .rows
             .last()
@@ -2494,82 +2942,325 @@ fn build_table_separator_row(cols: usize) -> String {
     out
 }
 
+#[derive(Debug, Clone)]
+struct TableGridRow {
+    cells: Vec<String>,
+    extra_cells: Vec<String>,
+    nl_after: &'static str,
+}
+
+enum TableGridEditOutcome {
+    NoOp,
+    DeleteWholeTable,
+    Update {
+        target_raw_line: usize,
+        target_col: usize,
+        preserve_cell_rel: Option<usize>,
+    },
+}
+
+struct ParsedTableGrid {
+    alignments: Vec<TableAlign>,
+    delim_colons: Vec<(bool, bool)>,
+    delim_nl_after: &'static str,
+    rows: Vec<TableGridRow>,
+    doc_nl: &'static str,
+}
+
+impl ParsedTableGrid {
+    fn row_nl_after(
+        full_source: &str,
+        row: &TableRowParsed,
+        range_end: usize,
+        doc_nl: &'static str,
+    ) -> &'static str {
+        if row.line_range.end < range_end {
+            if full_source.as_bytes().get(row.line_range.end) == Some(&b'\r') {
+                "\r\n"
+            } else {
+                "\n"
+            }
+        } else {
+            doc_nl
+        }
+    }
+
+    fn from_context(full_source: &str, ctx: &GfmTableContext, doc_nl: &'static str) -> Self {
+        let delim_cols = ctx.delim_cols;
+        let delim_row = &ctx.rows[1];
+        let mut delim_colons = Vec::with_capacity(delim_cols);
+        let mut alignments = Vec::with_capacity(delim_cols);
+        for col in 0..delim_cols {
+            let cell = delim_row
+                .cells
+                .get(col)
+                .map(|c| full_source[c.raw_range.start..c.raw_range.end].trim())
+                .unwrap_or("---");
+            let left_colon = cell.starts_with(':');
+            let right_colon = cell.ends_with(':');
+            delim_colons.push((left_colon, right_colon));
+            alignments.push(match (left_colon, right_colon) {
+                (true, true) => TableAlign::Center,
+                (false, true) => TableAlign::Right,
+                _ => TableAlign::Left,
+            });
+        }
+        let delim_nl_after = Self::row_nl_after(full_source, delim_row, ctx.range.end, doc_nl);
+        let mut rows = Vec::with_capacity(ctx.rows.len().saturating_sub(1));
+        for row in ctx.rows.iter().filter(|r| !r.is_delimiter) {
+            let cells = (0..delim_cols)
+                .map(|col| {
+                    row.cells
+                        .get(col)
+                        .map(|c| full_source[c.raw_range.start..c.raw_range.end].trim().to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+            let extra_cells = if row.cells.len() > delim_cols {
+                row.cells[delim_cols..]
+                    .iter()
+                    .map(|c| full_source[c.raw_range.start..c.raw_range.end].trim().to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            rows.push(TableGridRow {
+                cells,
+                extra_cells,
+                nl_after: Self::row_nl_after(full_source, row, ctx.range.end, doc_nl),
+            });
+        }
+        Self {
+            alignments,
+            delim_colons,
+            delim_nl_after,
+            rows,
+            doc_nl,
+        }
+    }
+
+    fn insert_empty_row(&mut self, at_row: usize) {
+        let cols = self.alignments.len();
+        let idx = at_row.min(self.rows.len());
+        let mut new_row = TableGridRow {
+            cells: vec![String::new(); cols],
+            extra_cells: Vec::new(),
+            nl_after: self.doc_nl,
+        };
+        if idx == 0 && !self.rows.is_empty() {
+            let header_nl = self.rows[0].nl_after;
+            new_row.nl_after = header_nl;
+            self.rows[0].nl_after = self.doc_nl;
+        }
+        self.rows.insert(idx, new_row);
+    }
+
+    fn delete_row(&mut self, grid_row: usize) {
+        if grid_row >= self.rows.len() || (grid_row == 0 && self.rows.len() <= 1) {
+            return;
+        }
+        if grid_row == 0 {
+            let header_nl = self.rows[0].nl_after;
+            self.rows.remove(0);
+            self.rows[0].nl_after = header_nl;
+            if !self.rows[0].extra_cells.is_empty() {
+                // Promoting a body row with surplus cells must keep header == delimiter column count
+                // so the edited block remains a valid GFM Table instead of collapsing into a Paragraph.
+                let extra = std::mem::take(&mut self.rows[0].extra_cells);
+                let add_cols = extra.len();
+                self.rows[0].cells.extend(extra);
+                for _ in 0..add_cols {
+                    self.alignments.push(TableAlign::Left);
+                    self.delim_colons.push((false, false));
+                }
+                for row in self.rows.iter_mut().skip(1) {
+                    let take = add_cols.min(row.extra_cells.len());
+                    row.cells.extend(row.extra_cells.drain(..take));
+                    for _ in take..add_cols {
+                        row.cells.push(String::new());
+                    }
+                }
+            }
+        } else {
+            self.rows.remove(grid_row);
+        }
+    }
+
+    fn insert_empty_col(&mut self, at_col: usize) {
+        let idx = at_col.min(self.alignments.len());
+        self.alignments.insert(idx, TableAlign::Left);
+        self.delim_colons.insert(idx, (false, false));
+        for row in &mut self.rows {
+            row.cells.insert(idx.min(row.cells.len()), String::new());
+        }
+    }
+
+    fn delete_col(&mut self, col_idx: usize) {
+        if col_idx >= self.alignments.len() || self.alignments.len() <= 1 {
+            return;
+        }
+        self.alignments.remove(col_idx);
+        self.delim_colons.remove(col_idx);
+        for row in &mut self.rows {
+            if col_idx < row.cells.len() {
+                row.cells.remove(col_idx);
+            }
+        }
+    }
+
+    fn format_delimiter_cell(left_colon: bool, right_colon: bool, width: usize) -> String {
+        let dash_count = width
+            .saturating_sub(usize::from(left_colon) + usize::from(right_colon))
+            .max(1);
+        let mut out = String::with_capacity(width + 2);
+        if left_colon {
+            out.push(':');
+        }
+        for _ in 0..dash_count {
+            out.push('-');
+        }
+        if right_colon {
+            out.push(':');
+        }
+        out
+    }
+
+    fn format_content_row(row: &TableGridRow, col_widths: Option<&[usize]>) -> String {
+        let mut line = String::from("|");
+        for (col, cell) in row.cells.iter().enumerate() {
+            if let Some(widths) = col_widths {
+                let width = widths.get(col).copied().unwrap_or(3);
+                let pad = width.saturating_sub(cell.chars().count());
+                line.push(' ');
+                line.push_str(cell);
+                for _ in 0..pad {
+                    line.push(' ');
+                }
+                line.push_str(" |");
+            } else if cell.is_empty() {
+                line.push_str("  |");
+            } else {
+                line.push(' ');
+                line.push_str(cell);
+                line.push_str(" |");
+            }
+        }
+        for extra in &row.extra_cells {
+            if extra.is_empty() {
+                line.push_str("  |");
+            } else {
+                line.push(' ');
+                line.push_str(extra);
+                line.push_str(" |");
+            }
+        }
+        line
+    }
+
+    fn render(&self, aligned: bool) -> String {
+        let delim_cols = self.alignments.len();
+        let col_widths = if aligned {
+            let mut widths = vec![3usize; delim_cols];
+            for row in &self.rows {
+                for (col, cell) in row.cells.iter().take(delim_cols).enumerate() {
+                    widths[col] = widths[col].max(cell.chars().count());
+                }
+            }
+            Some(widths)
+        } else {
+            None
+        };
+
+        let mut out = String::new();
+        if let Some(header) = self.rows.first() {
+            out.push_str(&Self::format_content_row(header, col_widths.as_deref()));
+            out.push_str(header.nl_after);
+        }
+
+        out.push('|');
+        for (col, &(left_colon, right_colon)) in self.delim_colons.iter().enumerate() {
+            let width = col_widths
+                .as_ref()
+                .and_then(|w| w.get(col).copied())
+                .unwrap_or(3);
+            out.push(' ');
+            out.push_str(&Self::format_delimiter_cell(left_colon, right_colon, width));
+            out.push_str(" |");
+        }
+
+        for (body_offset, row) in self.rows.iter().skip(1).enumerate() {
+            if body_offset == 0 {
+                out.push_str(self.delim_nl_after);
+            } else {
+                out.push_str(self.rows[body_offset].nl_after);
+            }
+            out.push_str(&Self::format_content_row(row, col_widths.as_deref()));
+        }
+
+        out
+    }
+}
+
+fn table_line_cell_caret_in_rendered(
+    rendered: &str,
+    target_raw_line: usize,
+    target_col: usize,
+    preserve_content_rel: Option<usize>,
+) -> ByteOffset {
+    let bytes = rendered.as_bytes();
+    let mut line_start = 0usize;
+    let mut cur_line = 0usize;
+    while line_start <= bytes.len() {
+        let mut line_end = line_start;
+        while line_end < bytes.len() && bytes[line_end] != b'\n' {
+            line_end += 1;
+        }
+        let mut content_end = line_end;
+        if content_end > line_start && bytes[content_end - 1] == b'\r' {
+            content_end -= 1;
+        }
+        if cur_line == target_raw_line {
+            let line = &rendered[line_start..content_end];
+            if let Some(ranges) = parse_table_cell_rel_ranges(line) {
+                let col = target_col.min(ranges.len().saturating_sub(1));
+                if let Some(&(rel_s, rel_e)) = ranges.get(col) {
+                    let raw = &line[rel_s..rel_e];
+                    if let Some(rel) = preserve_content_rel {
+                        let lead_ws = raw.bytes().take_while(|&b| b == b' ' || b == b'\t').count();
+                        if lead_ws < raw.len() {
+                            let trimmed_end = raw.trim_end_matches([' ', '\t']).len();
+                            let content_slice = &raw[lead_ws..trimmed_end];
+                            let mut inside = rel.min(content_slice.len());
+                            while inside > 0 && !content_slice.is_char_boundary(inside) {
+                                inside -= 1;
+                            }
+                            return line_start + rel_s + lead_ws + inside;
+                        }
+                    }
+                    return line_start + rel_s + table_cell_caret_offset(raw);
+                }
+            }
+            return line_start;
+        }
+        if line_end >= bytes.len() {
+            break;
+        }
+        line_start = line_end + 1;
+        cur_line += 1;
+    }
+    0
+}
+
 /// Format a GFM table using the delimiter row's canonical column count (`ctx.delim_cols`).
 ///
 /// Header and delimiter rows stay fixed at `delim_cols` so alignment never changes GFM table
 /// semantics or HTML export; short body rows pad to `delim_cols`, and excess body cells past
 /// `delim_cols` are preserved verbatim (trimmed) after the canonical columns to prevent data loss.
 fn format_gfm_table(raw_table: &str, full_source: &str, ctx: &GfmTableContext) -> String {
-    let delim_cols = ctx.delim_cols;
-    if delim_cols == 0 || ctx.rows.len() < 2 {
+    if ctx.delim_cols == 0 || ctx.rows.len() < 2 {
         return raw_table.to_string();
     }
-
-    let mut col_widths = vec![3usize; delim_cols];
-    for row in &ctx.rows {
-        if row.is_delimiter {
-            continue;
-        }
-        for (col, cell) in row.cells.iter().take(delim_cols).enumerate() {
-            let trimmed = full_source[cell.raw_range.start..cell.raw_range.end].trim();
-            col_widths[col] = col_widths[col].max(trimmed.chars().count());
-        }
-    }
-
-    let mut formatted_lines = Vec::with_capacity(ctx.rows.len());
-    for row in &ctx.rows {
-        let has_cr = row.line_range.end < ctx.range.end
-            && full_source.as_bytes().get(row.line_range.end) == Some(&b'\r');
-        let mut row_str = String::from("|");
-        for (col, &width) in col_widths.iter().enumerate() {
-            let cell = row
-                .cells
-                .get(col)
-                .map(|c| full_source[c.raw_range.start..c.raw_range.end].trim())
-                .unwrap_or("");
-            if row.is_delimiter {
-                let left_colon = cell.starts_with(':');
-                let right_colon = cell.ends_with(':');
-                let dash_count = width
-                    .saturating_sub(usize::from(left_colon) + usize::from(right_colon))
-                    .max(1);
-                row_str.push(' ');
-                if left_colon {
-                    row_str.push(':');
-                }
-                for _ in 0..dash_count {
-                    row_str.push('-');
-                }
-                if right_colon {
-                    row_str.push(':');
-                }
-                row_str.push_str(" |");
-            } else {
-                let char_len = cell.chars().count();
-                let pad = width.saturating_sub(char_len);
-                row_str.push(' ');
-                row_str.push_str(cell);
-                for _ in 0..pad {
-                    row_str.push(' ');
-                }
-                row_str.push_str(" |");
-            }
-        }
-        if !row.is_delimiter && row.cells.len() > delim_cols {
-            for extra in &row.cells[delim_cols..] {
-                let trimmed = full_source[extra.raw_range.start..extra.raw_range.end].trim();
-                row_str.push(' ');
-                row_str.push_str(trimmed);
-                row_str.push_str(" |");
-            }
-        }
-        if has_cr {
-            row_str.push('\r');
-        }
-        formatted_lines.push(row_str);
-    }
-
-    formatted_lines.join("\n")
+    ParsedTableGrid::from_context(full_source, ctx, "\n").render(true)
 }
 
 /// Escape backslash and square brackets in Markdown inline link text `[label](...)`.
@@ -3787,5 +4478,178 @@ mod tests {
         ed2.insert_code_block("ts`x");
         assert_eq!(ed2.buffer.to_string(), "hello\n```tsx\n\n```");
         assert_eq!(ed2.selection.head, "hello\n```tsx\n".len());
+    }
+
+    #[test]
+    fn test_table_insert_rows_cols_and_alignment_ops_undoable() {
+        // 1. Insert 3x2 table mid-document, navigate with Tab, and Undo cleanly
+        let mut ed = EditorController::from_str("BeforeAfter");
+        ed.set_caret("Before".len());
+        assert!(ed.insert_table(3, 2));
+        assert_eq!(
+            ed.buffer.to_string(),
+            "Before\n|     |     |\n| --- | --- |\n|     |     |\n|     |     |\nAfter"
+        );
+        assert_eq!(ed.selection.head, "Before\n| ".len());
+        ed.insert_text("H1");
+        ed.tab();
+        ed.insert_text("H2");
+        assert_eq!(
+            ed.buffer.to_string(),
+            "Before\n| H1    | H2    |\n| --- | --- |\n|     |     |\n|     |     |\nAfter"
+        );
+        assert!(ed.align_current_table());
+        assert_eq!(
+            ed.buffer.to_string(),
+            "Before\n| H1  | H2  |\n| --- | --- |\n|     |     |\n|     |     |\nAfter"
+        );
+        ed.undo();
+        ed.undo();
+        ed.undo();
+        ed.undo();
+        assert_eq!(ed.buffer.to_string(), "BeforeAfter");
+        assert_eq!(ed.selection.head, "Before".len());
+
+        // 2. Column alignment L/C/R with CJK preservation and idempotency
+        let mut align_ed =
+            EditorController::from_str("| 名称 | 值 |\n| --- | --- |\n| 苹果 | 42 |");
+        align_ed.table_auto_align = true;
+        let apple_pos = align_ed.buffer.to_string().find("苹").unwrap() + "苹".len();
+        align_ed.set_caret(apple_pos);
+        // Column 0 is already Left
+        assert!(!align_ed.set_table_column_align(TableAlign::Left));
+        assert!(align_ed.set_table_column_align(TableAlign::Center));
+        let centered = align_ed.buffer.to_string();
+        assert!(centered.contains(":-:"));
+        assert!(centered.is_char_boundary(align_ed.selection.head));
+        assert!(align_ed.set_table_column_align(TableAlign::Right));
+        assert!(align_ed.buffer.to_string().contains("--:"));
+        assert!(align_ed.set_table_column_align(TableAlign::Left));
+        assert!(align_ed.buffer.to_string().contains(":--"));
+        align_ed.undo();
+        align_ed.undo();
+        align_ed.undo();
+        assert_eq!(
+            align_ed.buffer.to_string(),
+            "| 名称 | 值 |\n| --- | --- |\n| 苹果 | 42 |"
+        );
+
+        // 3. Row +/- and Column +/- operations (including auto_align = true and overflow preservation)
+        let mut grid_ed =
+            EditorController::from_str("| A | B |\n| --- | --- |\n| 1 | 2 | extra |");
+        grid_ed.table_auto_align = true;
+        grid_ed.set_caret(grid_ed.buffer.to_string().find('1').unwrap());
+        assert!(grid_ed.insert_table_col_right());
+        assert_eq!(
+            grid_ed.buffer.to_string(),
+            "| A   |     | B   |\n| --- | --- | --- |\n| 1   |     | 2   | extra |"
+        );
+        assert!(grid_ed.insert_table_col_left());
+        assert_eq!(
+            grid_ed.buffer.to_string(),
+            "| A   |     |     | B   |\n| --- | --- | --- | --- |\n| 1   |     |     | 2   | extra |"
+        );
+        assert!(grid_ed.delete_current_table_col());
+        assert_eq!(
+            grid_ed.buffer.to_string(),
+            "| A   |     | B   |\n| --- | --- | --- |\n| 1   |     | 2   | extra |"
+        );
+        assert!(grid_ed.insert_table_row_above());
+        assert_eq!(grid_ed.buffer.to_string().lines().count(), 4);
+        assert!(grid_ed.delete_current_table_row());
+        assert_eq!(
+            grid_ed.buffer.to_string(),
+            "| A   |     | B   |\n| --- | --- | --- |\n| 1   |     | 2   | extra |"
+        );
+        assert!(grid_ed.insert_table_row_below());
+        assert_eq!(grid_ed.buffer.to_string().lines().count(), 4);
+        assert!(grid_ed.delete_current_table_row());
+        assert_eq!(
+            grid_ed.buffer.to_string(),
+            "| A   |     | B   |\n| --- | --- | --- |\n| 1   |     | 2   | extra |"
+        );
+
+        // 4. Deleting only column removes entire table cleanly (single undoable op)
+        let mut single_col = EditorController::from_str("Top\n| Only |\n| --- |\n| v |\nBottom");
+        single_col.set_caret(single_col.buffer.to_string().find('v').unwrap());
+        assert!(single_col.delete_current_table_col());
+        assert_eq!(single_col.buffer.to_string(), "Top\nBottom");
+        single_col.undo();
+        assert_eq!(
+            single_col.buffer.to_string(),
+            "Top\n| Only |\n| --- |\n| v |\nBottom"
+        );
+
+        // 5. CRLF + auto-align Enter/Tab & fenced code block guard
+        let mut crlf_auto =
+            EditorController::from_str("| h1 | header2 |\r\n| --- | --- |\r\n| x | y |");
+        crlf_auto.table_auto_align = true;
+        crlf_auto.set_caret(crlf_auto.buffer.to_string().rfind('y').unwrap());
+        crlf_auto.tab();
+        let crlf_out = crlf_auto.buffer.to_string();
+        assert_strict_crlf(&crlf_out);
+        assert_eq!(
+            crlf_out,
+            "| h1  | header2 |\r\n| --- | ------- |\r\n| x   | y       |\r\n|     |         |"
+        );
+        crlf_auto.undo();
+        assert_eq!(
+            crlf_auto.buffer.to_string(),
+            "| h1 | header2 |\r\n| --- | --- |\r\n| x | y |"
+        );
+
+        let mut fence = EditorController::from_str("```md\n| a | b |\n| --- | --- |\n| 1 | 2 |\n```");
+        fence.set_caret(fence.buffer.to_string().find('1').unwrap());
+        assert!(!fence.insert_table_row_below());
+        assert!(!fence.set_table_column_align(TableAlign::Right));
+    }
+
+    #[test]
+    fn test_deleting_table_header_with_extra_body_cells_keeps_valid_gfm_table() {
+        let src = "| A | B |\n| --- | :---: |\n| 1 | 2 | 3 |\n| x | y |";
+        let mut ed = EditorController::from_str(src);
+        ed.table_auto_align = true;
+        ed.set_caret(ed.buffer.to_string().find('A').unwrap());
+        assert!(ed.delete_current_table_row());
+
+        let out = ed.buffer.to_string();
+        let line0_end = out.find('\n').unwrap_or(out.len());
+        let parsed = crate::table::try_scan_gfm_table_from_line(
+            &out,
+            out.as_bytes(),
+            0,
+            line0_end,
+            line0_end + 1,
+        )
+        .expect("promoted table must remain a valid GFM table, not collapse to Paragraph");
+        assert_eq!(parsed.rows.len(), 3);
+        assert!(parsed.rows[1].is_delimiter);
+        assert_eq!(parsed.rows[0].cells.len(), 3);
+        assert_eq!(parsed.rows[1].cells.len(), 3);
+        assert_eq!(
+            out,
+            "| 1   | 2   | 3   |\n| --- | :-: | --- |\n| x   | y   |     |"
+        );
+
+        ed.undo();
+        assert_eq!(ed.buffer.to_string(), src);
+
+        // Also verify unaligned (`table_auto_align = false`) mode preserves valid 3-col table
+        let mut raw_ed = EditorController::from_str(src);
+        raw_ed.table_auto_align = false;
+        raw_ed.set_caret(raw_ed.buffer.to_string().find('B').unwrap());
+        assert!(raw_ed.delete_current_table_row());
+        let raw_out = raw_ed.buffer.to_string();
+        let raw_end = raw_out.find('\n').unwrap();
+        assert!(
+            crate::table::try_scan_gfm_table_from_line(
+                &raw_out,
+                raw_out.as_bytes(),
+                0,
+                raw_end,
+                raw_end + 1,
+            )
+            .is_some()
+        );
     }
 }

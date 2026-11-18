@@ -352,6 +352,29 @@ pub struct CodeBlockButtonHit {
     pub rect: Rect,
 }
 
+/// Interactive button inside the focused WYSIWYG table action toolbar (`PRD 4.3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableButtonKind {
+    AddRowAbove,
+    AddRowBelow,
+    DeleteRow,
+    AddColLeft,
+    AddColRight,
+    DeleteCol,
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
+    AlignFormat,
+}
+
+/// Positioned table action toolbar pill hit target returned per rendered frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableButtonHit {
+    pub kind: TableButtonKind,
+    pub block_range: ByteRange,
+    pub rect: Rect,
+}
+
 /// Inputs describing the active editor viewport for one virtualized frame render.
 pub struct EditorViewport<'a> {
     pub doc_rect: Rect,
@@ -393,6 +416,7 @@ pub struct EditorSceneResult {
     pub ime_cursor_area: Option<Rect>,
     pub visible_block_count: usize,
     pub code_block_buttons: Vec<CodeBlockButtonHit>,
+    pub table_buttons: Vec<TableButtonHit>,
     pub requested_images: Vec<String>,
 }
 
@@ -616,6 +640,7 @@ impl ShapedDocumentCache {
                 ime_cursor_area: Some(cursor_area),
                 visible_block_count: 0,
                 code_block_buttons: Vec::new(),
+                table_buttons: Vec::new(),
                 requested_images: Vec::new(),
             };
         }
@@ -652,6 +677,7 @@ impl ShapedDocumentCache {
         let mut any_height_changed = false;
         let mut first_changed_idx = usize::MAX;
         let mut code_block_buttons: Vec<CodeBlockButtonHit> = Vec::new();
+        let mut table_buttons: Vec<TableButtonHit> = Vec::new();
         let mut requested_images: Vec<String> = Vec::new();
 
         // Determine if caret sits at a trailing empty line past the final block (e.g., after `\n`).
@@ -679,12 +705,17 @@ impl ShapedDocumentCache {
                     vp.focus_mode,
                 ) {
                     let avail_table_w = (vp.content_width_px - 8.0).max(120.0);
+                    let show_toolbar = block_focused
+                        && vp.view.ime_preedit.is_none()
+                        && vp.view.selection.is_caret()
+                        && !caret_after_last_block;
                     let table_key = shape_table_cache_key(
                         &table_display,
                         avail_table_w,
                         style_sig,
                         block_focused,
                         vp.focus_mode,
+                        show_toolbar,
                     );
                     let frame_seq = self.frame_seq;
                     if let Some(cached) = self.table_lru.get_mut(&table_key) {
@@ -696,6 +727,7 @@ impl ShapedDocumentCache {
                             avail_table_w,
                             style,
                             frame_seq,
+                            show_toolbar,
                         );
                         if self.table_lru.len() >= MAX_SHAPED_TABLE_CACHE {
                             evict_oldest_table_lru(&mut self.table_lru);
@@ -721,6 +753,7 @@ impl ShapedDocumentCache {
                     let table_top_y = screen_top_y + table.top_pad_px;
 
                     emit_table_scene(
+                        &mut self.font_system,
                         table,
                         node,
                         block_y,
@@ -733,10 +766,12 @@ impl ShapedDocumentCache {
                         vp,
                         style,
                         block_focused,
+                        show_toolbar,
                         &mut draw,
                         &mut caret_doc_y,
                         &mut caret_line_height,
                         &mut ime_cursor_area,
+                        &mut table_buttons,
                     );
 
                     self.last_hit_blocks.push(HitBlockRecord {
@@ -1057,6 +1092,7 @@ impl ShapedDocumentCache {
             ime_cursor_area,
             visible_block_count: vis_end_idx.saturating_sub(vis_start_idx),
             code_block_buttons,
+            table_buttons,
             requested_images,
         }
     }
@@ -1294,7 +1330,7 @@ impl ShapedDocumentCache {
         )?;
         let avail_table_w = (ctx.content_width_px - 8.0).max(120.0);
         let style_sig = style_signature(ctx.style);
-        let key = shape_table_cache_key(&rows_display, avail_table_w, style_sig, true, false);
+        let key = shape_table_cache_key(&rows_display, avail_table_w, style_sig, true, false, false);
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let frame_seq = self.frame_seq;
         if let Some(cached) = self.table_lru.get_mut(&key) {
@@ -1306,6 +1342,7 @@ impl ShapedDocumentCache {
                 avail_table_w,
                 ctx.style,
                 frame_seq,
+                false,
             );
             if self.table_lru.len() >= MAX_SHAPED_TABLE_CACHE {
                 evict_oldest_table_lru(&mut self.table_lru);
@@ -1979,6 +2016,7 @@ fn render_text_buffer_contents(
 
 #[allow(clippy::too_many_arguments)]
 fn emit_table_scene(
+    font_system: &mut FontSystem,
     table: &CachedTableShape,
     node: &BlockNode,
     block_y: f32,
@@ -1991,11 +2029,133 @@ fn emit_table_scene(
     vp: &EditorViewport<'_>,
     style: &ResolvedThemeStyle,
     block_focused: bool,
+    show_toolbar: bool,
     draw: &mut DrawList,
     caret_doc_y: &mut f32,
     caret_line_height: &mut f32,
     ime_cursor_area: &mut Option<Rect>,
+    table_buttons: &mut Vec<TableButtonHit>,
 ) {
+    let target_cell = if !caret_after_last_block {
+        let ime_loc = find_table_ime_cell(table);
+        ime_loc.or_else(|| {
+            if !node.range.contains_inclusive(base_caret) {
+                return None;
+            }
+            let rel_caret = base_caret - node.range.start;
+            find_table_cell_for_rel_caret(table, rel_caret).map(|(r, c)| {
+                let cell = &table.rows[r].cells[c];
+                let vis = cell
+                    .map
+                    .source_to_visual_rebased(base_caret, node.range.start + cell.rel_src_range.start);
+                (r, c, vis)
+            })
+        })
+    } else {
+        None
+    };
+
+    if show_toolbar
+        && let Some((_, active_col, _)) = target_cell
+        && table_top_y > vp.doc_rect.y
+        && screen_top_y < vp.doc_rect.y + vp.doc_rect.h
+    {
+        let active_align = table
+            .rows
+            .first()
+            .and_then(|r| r.cells.get(active_col))
+            .map(|c| c.align);
+        let pill_h = (table.top_pad_px - 6.0 * style.zoom_scale).max(16.0);
+        let pill_y = table_top_y - pill_h - 4.0 * style.zoom_scale;
+        let ui_font = (style.base_font_size_px * 0.72).clamp(10.0, 13.0);
+        let ui_lh = (pill_h - 2.0).max(12.0);
+        let text_y = pill_y + (pill_h - ui_lh) * 0.5;
+        let pill_pad_x = 6.0 * style.zoom_scale;
+        let gap_x = 4.0 * style.zoom_scale;
+        let max_x = table_left_x + table.table_w;
+        let mut cur_x = table_left_x;
+
+        let specs = [
+            (TableButtonKind::AddRowAbove, "+Row↑", false, false),
+            (TableButtonKind::AddRowBelow, "+Row↓", false, false),
+            (TableButtonKind::DeleteRow, "-Row", false, false),
+            (TableButtonKind::AddColLeft, "+Col←", false, false),
+            (TableButtonKind::AddColRight, "+Col→", false, false),
+            (TableButtonKind::DeleteCol, "-Col", false, true),
+            (
+                TableButtonKind::AlignLeft,
+                "L",
+                active_align == Some(TableAlign::Left),
+                false,
+            ),
+            (
+                TableButtonKind::AlignCenter,
+                "C",
+                active_align == Some(TableAlign::Center),
+                false,
+            ),
+            (
+                TableButtonKind::AlignRight,
+                "R",
+                active_align == Some(TableAlign::Right),
+                true,
+            ),
+            (TableButtonKind::AlignFormat, "Align", false, false),
+        ];
+
+        for (kind, label, active, extra_gap) in specs {
+            let weight = if active { 600 } else { 500 };
+            let tw = measure_ui_text_width(font_system, label, ui_font, ui_lh, weight, false);
+            let pill_w = (tw + pill_pad_x * 2.0).ceil();
+            if cur_x + pill_w > max_x {
+                break;
+            }
+            let pill_rect = Rect::new(cur_x, pill_y, pill_w, pill_h);
+            let (bg, border, fg) = if active {
+                (
+                    style.chrome.accent.with_alpha(38),
+                    style.chrome.accent,
+                    style.chrome.accent,
+                )
+            } else {
+                (
+                    style.code_block_border.with_alpha(70),
+                    style.code_block_border,
+                    style.text_color,
+                )
+            };
+            draw.rects.push(
+                SceneRect::rounded(pill_rect, bg, 4.0 * style.zoom_scale)
+                    .with_border(1.0, border)
+                    .with_clip(Some(vp.doc_rect)),
+            );
+            let text_clip = intersect_rects(pill_rect, vp.doc_rect);
+            shape_ui_text_family_into(
+                font_system,
+                label,
+                cur_x + pill_pad_x,
+                text_y,
+                ui_font,
+                ui_lh,
+                weight,
+                false,
+                fg,
+                Some(pill_w),
+                text_clip,
+                vp.scale_factor,
+                &mut draw.glyphs,
+            );
+            if let Some(hit_r) = text_clip {
+                table_buttons.push(TableButtonHit {
+                    kind,
+                    block_range: node.range,
+                    rect: hit_r,
+                });
+            }
+            cur_x += pill_w + gap_x + if extra_gap { 4.0 * style.zoom_scale } else { 0.0 };
+        }
+    }
+
     let outer_rect = Rect::new(table_left_x, table_top_y, table.table_w, table.table_h);
     draw.rects.push(
         SceneRect::rounded(outer_rect, style.bg_color, 4.0 * style.zoom_scale)
@@ -2132,22 +2292,8 @@ fn emit_table_scene(
     }
 
     // Active caret / IME anchor inside this table
-    if !caret_after_last_block && ime_cursor_area.is_none() {
-        let ime_loc = find_table_ime_cell(table);
-        let target_cell = ime_loc.or_else(|| {
-            if !node.range.contains_inclusive(base_caret) {
-                return None;
-            }
-            let rel_caret = base_caret - node.range.start;
-            find_table_cell_for_rel_caret(table, rel_caret).map(|(r, c)| {
-                let cell = &table.rows[r].cells[c];
-                let vis = cell
-                    .map
-                    .source_to_visual_rebased(base_caret, node.range.start + cell.rel_src_range.start);
-                (r, c, vis)
-            })
-        });
-        if let Some((r_idx, c_idx, target_vis)) = target_cell {
+    if ime_cursor_area.is_none()
+        && let Some((r_idx, c_idx, target_vis)) = target_cell {
             let cur_rect = table_cell_caret_rect(
                 table,
                 r_idx,
@@ -2165,7 +2311,6 @@ fn emit_table_scene(
                     .push(SceneRect::solid(cur_rect, style.caret_color).with_clip(Some(vp.doc_rect)));
             }
         }
-    }
 }
 
 fn find_table_ime_cell(table: &CachedTableShape) -> Option<(usize, usize, usize)> {
@@ -3654,10 +3799,15 @@ fn shape_table_block(
     avail_table_w: f32,
     style: &ResolvedThemeStyle,
     frame_seq: u64,
+    show_toolbar: bool,
 ) -> CachedTableShape {
     let cell_pad_x = 12.0 * style.zoom_scale;
     let cell_pad_y = 7.0 * style.zoom_scale;
-    let top_pad_px = 6.0 * style.zoom_scale;
+    let top_pad_px = if show_toolbar {
+        28.0 * style.zoom_scale
+    } else {
+        6.0 * style.zoom_scale
+    };
     let bottom_pad_px = 6.0 * style.zoom_scale;
 
     let num_cols = rows_display
@@ -3969,6 +4119,7 @@ fn shape_table_cache_key(
     style_sig: u64,
     block_focused: bool,
     focus_mode: bool,
+    show_toolbar: bool,
 ) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     rows.len().hash(&mut h);
@@ -3994,6 +4145,7 @@ fn shape_table_cache_key(
     style_sig.hash(&mut h);
     block_focused.hash(&mut h);
     focus_mode.hash(&mut h);
+    show_toolbar.hash(&mut h);
     h.finish()
 }
 
@@ -4698,6 +4850,7 @@ mod tests {
             ime_composition_selection: Some(Selection::caret(body_caret)),
             ime_preedit: Some("zhongwen".to_string()),
             expansion_frozen: true,
+            ..Default::default()
         };
         let vp_ime = EditorViewport {
             source_rev: 3,
@@ -4841,5 +4994,127 @@ mod tests {
             "![Arch Diagram](./assets/arch.png)"
         );
         assert!(scene_inside.draw.images[0].rect.y > rec_img.text_origin_y + 12.0);
+    }
+
+    #[test]
+    fn test_focused_table_emits_toolbar_pills_above_table_only_for_wysiwyg_caret() {
+        let doc = "Before\n\n| Left | Mid | Right |\n| :--- | :---: | ---: |\n| a | b | c |";
+        let blocks = parse_blocks(doc);
+        let style = ResolvedThemeStyle::default();
+        let mut cache = ShapedDocumentCache::new();
+
+        // 1. Outside table -> no table buttons
+        let outside_view = EditorViewState {
+            mode: ViewMode::Wysiwyg,
+            selection: Selection::caret(0),
+            ..Default::default()
+        };
+        let vp_out = EditorViewport {
+            doc_rect: Rect::new(0.0, 0.0, 900.0, 720.0),
+            content_left_x: 60.0,
+            content_width_px: 780.0,
+            scroll_y: 0.0,
+            overscan_px: 120.0,
+            scale_factor: 1.0,
+            source_rev: 1,
+            source_len: doc.len(),
+            view: &outside_view,
+            focus_mode: false,
+            show_caret: true,
+            show_code_line_numbers: false,
+            find_matches: &[],
+            active_find: None,
+            image_status: None,
+        };
+        let scene_out =
+            cache.build_editor_scene(&blocks, &style, &vp_out, |r| doc[r.start..r.end].to_string());
+        assert!(scene_out.table_buttons.is_empty());
+
+        // 2. Inside Center-aligned column ("| a | b | c |" at 'b') -> 10 buttons emitted cleanly above table
+        let inside_b = doc.rfind("| b |").unwrap() + 2;
+        let inside_view = EditorViewState {
+            mode: ViewMode::Wysiwyg,
+            selection: Selection::caret(inside_b),
+            ..Default::default()
+        };
+        let vp_in = EditorViewport {
+            view: &inside_view,
+            ..vp_out
+        };
+        let scene_in =
+            cache.build_editor_scene(&blocks, &style, &vp_in, |r| doc[r.start..r.end].to_string());
+        assert_eq!(scene_in.table_buttons.len(), 10);
+        let tbl_rec = cache
+            .last_hit_blocks
+            .iter()
+            .copied()
+            .find(|r| r.is_table)
+            .expect("table hit block record");
+        for btn in &scene_in.table_buttons {
+            assert!(
+                btn.rect.y + btn.rect.h <= tbl_rec.text_origin_y,
+                "table toolbar pill {:?} ({}) overlapped table top ({})",
+                btn.kind,
+                btn.rect.y + btn.rect.h,
+                tbl_rec.text_origin_y
+            );
+        }
+        // Center alignment pill highlighted with accent border
+        let align_c_rect = scene_in
+            .table_buttons
+            .iter()
+            .find(|b| b.kind == TableButtonKind::AlignCenter)
+            .unwrap()
+            .rect;
+        assert!(
+            scene_in
+                .draw
+                .rects
+                .iter()
+                .any(|r| r.rect == align_c_rect && r.border_color == style.chrome.accent)
+        );
+
+        // 3. IME preedit or Source mode or non-caret selection suppresses table toolbar
+        let ime_view = EditorViewState {
+            mode: ViewMode::Wysiwyg,
+            selection: Selection::caret(inside_b),
+            ime_preedit: Some("z".to_string()),
+            ime_composition_selection: Some(Selection::caret(inside_b)),
+            expansion_frozen: true,
+            ..Default::default()
+        };
+        let vp_ime = EditorViewport {
+            view: &ime_view,
+            ..vp_out
+        };
+        let scene_ime =
+            cache.build_editor_scene(&blocks, &style, &vp_ime, |r| doc[r.start..r.end].to_string());
+        assert!(scene_ime.table_buttons.is_empty());
+
+        let sel_view = EditorViewState {
+            mode: ViewMode::Wysiwyg,
+            selection: Selection::new(inside_b, inside_b + 1),
+            ..Default::default()
+        };
+        let vp_sel = EditorViewport {
+            view: &sel_view,
+            ..vp_out
+        };
+        let scene_sel =
+            cache.build_editor_scene(&blocks, &style, &vp_sel, |r| doc[r.start..r.end].to_string());
+        assert!(scene_sel.table_buttons.is_empty());
+
+        let src_view = EditorViewState {
+            mode: ViewMode::Source,
+            selection: Selection::caret(inside_b),
+            ..Default::default()
+        };
+        let vp_src = EditorViewport {
+            view: &src_view,
+            ..vp_out
+        };
+        let scene_src =
+            cache.build_editor_scene(&blocks, &style, &vp_src, |r| doc[r.start..r.end].to_string());
+        assert!(scene_src.table_buttons.is_empty());
     }
 }
