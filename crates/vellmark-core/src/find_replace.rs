@@ -8,6 +8,7 @@
 use std::fmt;
 
 use crate::buffer::{ByteOffset, ByteRange, Selection, TextBuffer};
+use crate::encoding::{LineEnding, normalize_line_endings};
 use crate::undo::{EditKind, EditOp, Transaction, UndoHistory};
 
 /// Configuration options for in-document Find & Replace (PRD E-11).
@@ -117,41 +118,59 @@ pub fn find_prev_match(
     }
 }
 
-/// Expand replacement template (`$0`/`$&`, `$1`..`$9`, `$$`, `\n`, `\t`, `\r`, `\\`) when `use_regex` is true.
-pub fn expand_replacement(
+fn flush_template_chunk(out: &mut String, chunk: &mut String, target_eol: Option<LineEnding>) {
+    if chunk.is_empty() {
+        return;
+    }
+    if let Some(eol) = target_eol {
+        out.push_str(&normalize_line_endings(chunk, eol));
+    } else {
+        out.push_str(chunk);
+    }
+    chunk.clear();
+}
+
+fn expand_replacement_inner(
     text: &str,
     matched: &FindMatch,
     replacement: &str,
     use_regex: bool,
+    target_eol: Option<LineEnding>,
 ) -> String {
     if !use_regex {
-        return replacement.to_string();
+        return match target_eol {
+            Some(eol) => normalize_line_endings(replacement, eol).into_owned(),
+            None => replacement.to_string(),
+        };
     }
     let mut out = String::with_capacity(replacement.len());
+    // Accumulate template-authored text/escapes separately so newline normalization
+    // applies only to template newlines (and handles `\r\n` as a single break) without
+    // altering existing line endings captured via `$0`/`$&`/`$1..$9`.
+    let mut template_chunk = String::new();
     let bytes = replacement.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
         if bytes[i] == b'$' && i + 1 < bytes.len() {
             let next = bytes[i + 1];
             if next == b'$' {
-                out.push('$');
+                template_chunk.push('$');
                 i += 2;
                 continue;
             }
-            if next == b'&' || next == b'0' {
-                if let Some(Some(r)) = matched.captures.first()
-                    && let Some(sub) = text.get(r.start..r.end) {
-                        out.push_str(sub);
-                    }
-                i += 2;
-                continue;
-            }
-            if next.is_ascii_digit() {
-                let idx = (next - b'0') as usize;
+            if next == b'&' || next.is_ascii_digit() {
+                let idx = if next == b'&' {
+                    0
+                } else {
+                    (next - b'0') as usize
+                };
                 if let Some(Some(r)) = matched.captures.get(idx)
-                    && let Some(sub) = text.get(r.start..r.end) {
-                        out.push_str(sub);
-                    }
+                    && let Some(sub) = text.get(r.start..r.end)
+                    && !sub.is_empty()
+                {
+                    flush_template_chunk(&mut out, &mut template_chunk, target_eol);
+                    out.push_str(sub);
+                }
                 i += 2;
                 continue;
             }
@@ -165,19 +184,41 @@ pub fn expand_replacement(
                 _ => None,
             };
             if let Some(ch) = esc {
-                out.push(ch);
+                template_chunk.push(ch);
                 i += 2;
                 continue;
             }
         }
         let ch = replacement[i..].chars().next().unwrap();
-        out.push(ch);
+        template_chunk.push(ch);
         i += ch.len_utf8();
     }
+    flush_template_chunk(&mut out, &mut template_chunk, target_eol);
     out
 }
 
-/// Replace a single match in `buffer` cleanly with undo history.
+/// Expand replacement template (`$0`/`$&`, `$1`..`$9`, `$$`, `\n`, `\t`, `\r`, `\\`) when `use_regex` is true.
+pub fn expand_replacement(
+    text: &str,
+    matched: &FindMatch,
+    replacement: &str,
+    use_regex: bool,
+) -> String {
+    expand_replacement_inner(text, matched, replacement, use_regex, None)
+}
+
+fn expand_and_normalize_replacement(
+    text: &str,
+    matched: &FindMatch,
+    replacement: &str,
+    use_regex: bool,
+    target_eol: LineEnding,
+) -> String {
+    expand_replacement_inner(text, matched, replacement, use_regex, Some(target_eol))
+}
+
+/// Replace a single match in `buffer` cleanly with undo history, normalizing inserted newlines
+/// to the document's dominant line ending.
 pub fn replace_match_in_buffer(
     buffer: &mut TextBuffer,
     undo: &mut UndoHistory,
@@ -186,8 +227,32 @@ pub fn replace_match_in_buffer(
     replacement: &str,
     use_regex: bool,
 ) -> FindReplaceOutcome {
+    replace_match_in_buffer_with_line_ending(
+        buffer,
+        undo,
+        selection_before,
+        matched,
+        replacement,
+        use_regex,
+        LineEnding::Lf,
+    )
+}
+
+/// Replace a single match in `buffer`, falling back to `preferred_eol` when normalizing newlines
+/// in single-line or empty documents.
+pub fn replace_match_in_buffer_with_line_ending(
+    buffer: &mut TextBuffer,
+    undo: &mut UndoHistory,
+    selection_before: Selection,
+    matched: &FindMatch,
+    replacement: &str,
+    use_regex: bool,
+    preferred_eol: LineEnding,
+) -> FindReplaceOutcome {
     let snapshot = buffer.to_string();
-    let expanded = expand_replacement(&snapshot, matched, replacement, use_regex);
+    let target_eol = LineEnding::detect_dominant_or(&snapshot, preferred_eol);
+    let expanded =
+        expand_and_normalize_replacement(&snapshot, matched, replacement, use_regex, target_eol);
     let sel_after = Selection::caret(matched.range.start + expanded.len());
     undo.apply_edit(
         buffer,
@@ -203,7 +268,8 @@ pub fn replace_match_in_buffer(
     }
 }
 
-/// Replace all matches in `buffer` inside a **single undo transaction** (PRD E-11).
+/// Replace all matches in `buffer` inside a **single undo transaction** (PRD E-11), normalizing
+/// inserted newlines to the document's dominant line ending.
 pub fn replace_all_in_buffer(
     buffer: &mut TextBuffer,
     undo: &mut UndoHistory,
@@ -211,6 +277,28 @@ pub fn replace_all_in_buffer(
     query: &str,
     replacement: &str,
     options: FindOptions,
+) -> Result<FindReplaceOutcome, FindError> {
+    replace_all_in_buffer_with_line_ending(
+        buffer,
+        undo,
+        selection_before,
+        query,
+        replacement,
+        options,
+        LineEnding::Lf,
+    )
+}
+
+/// Replace all matches in `buffer`, falling back to `preferred_eol` when normalizing newlines
+/// in single-line or empty documents.
+pub fn replace_all_in_buffer_with_line_ending(
+    buffer: &mut TextBuffer,
+    undo: &mut UndoHistory,
+    selection_before: Selection,
+    query: &str,
+    replacement: &str,
+    options: FindOptions,
+    preferred_eol: LineEnding,
 ) -> Result<FindReplaceOutcome, FindError> {
     let snapshot = buffer.to_string();
     let matches = find_all_matches(&snapshot, query, options)?;
@@ -221,9 +309,18 @@ pub fn replace_all_in_buffer(
         });
     }
 
+    let target_eol = LineEnding::detect_dominant_or(&snapshot, preferred_eol);
     let replacements: Vec<String> = matches
         .iter()
-        .map(|m| expand_replacement(&snapshot, m, replacement, options.use_regex))
+        .map(|m| {
+            expand_and_normalize_replacement(
+                &snapshot,
+                m,
+                replacement,
+                options.use_regex,
+                target_eol,
+            )
+        })
         .collect();
 
     // Compute mapped caret offset before mutating buffer.
@@ -1352,5 +1449,125 @@ mod tests {
         let boundary_ok = format!("{}a{}", "(?:".repeat(32), ")".repeat(32));
         let ok = find_all_matches("a", &boundary_ok, opts).unwrap();
         assert_eq!(ok.len(), 1);
+    }
+
+    #[test]
+    fn test_replace_normalizes_newlines_to_dominant_or_preferred_line_ending() {
+        let opts = FindOptions {
+            case_sensitive: true,
+            whole_word: false,
+            use_regex: true,
+        };
+        let mut crlf_buf = TextBuffer::from_str("A\r\nB\r\n");
+        let mut undo = UndoHistory::new();
+        let out = replace_all_in_buffer_with_line_ending(
+            &mut crlf_buf,
+            &mut undo,
+            Selection::caret(0),
+            "A",
+            r"X\nY",
+            opts,
+            LineEnding::CrLf,
+        )
+        .unwrap();
+        assert_eq!(out.replaced_count, 1);
+        assert_eq!(crlf_buf.to_string(), "X\r\nY\r\nB\r\n");
+
+        // Single-line CRLF session without prior newlines uses preferred_eol fallback
+        let mut single_buf = TextBuffer::from_str("A");
+        let m = find_all_matches("A", "A", opts).unwrap().pop().unwrap();
+        replace_match_in_buffer_with_line_ending(
+            &mut single_buf,
+            &mut undo,
+            Selection::caret(0),
+            &m,
+            r"X\nY",
+            true,
+            LineEnding::CrLf,
+        );
+        assert_eq!(single_buf.to_string(), "X\r\nY");
+
+        // Mixed-EOL document: `$0` / `$1` preserve captured original `\n` bytes while only
+        // template-inserted newlines normalize to dominant CRLF (and `\r\n` yields one break).
+        let mut mixed_buf = TextBuffer::from_str("A\r\nB\r\nC\nD\r\n");
+        replace_all_in_buffer_with_line_ending(
+            &mut mixed_buf,
+            &mut undo,
+            Selection::caret(0),
+            r"(C\nD)",
+            r"$1\nE\r\nF",
+            opts,
+            LineEnding::CrLf,
+        )
+        .unwrap();
+        assert_eq!(mixed_buf.to_string(), "A\r\nB\r\nC\nD\r\nE\r\nF\r\n");
+
+        let mut preserve_only_buf = TextBuffer::from_str("A\r\nB\r\nC\nD\r\n");
+        replace_all_in_buffer_with_line_ending(
+            &mut preserve_only_buf,
+            &mut undo,
+            Selection::caret(0),
+            r"C\nD",
+            "$0",
+            opts,
+            LineEnding::CrLf,
+        )
+        .unwrap();
+        assert_eq!(preserve_only_buf.to_string(), "A\r\nB\r\nC\nD\r\n");
+
+        // LF document: `\r\n` template collapses to single LF, never doubled
+        let mut lf_buf = TextBuffer::from_str("foo\nbar\n");
+        replace_all_in_buffer_with_line_ending(
+            &mut lf_buf,
+            &mut undo,
+            Selection::caret(0),
+            "foo",
+            r"X\r\nY",
+            opts,
+            LineEnding::Lf,
+        )
+        .unwrap();
+        assert_eq!(lf_buf.to_string(), "X\nY\nbar\n");
+
+        // Unmatched or empty optional capture group between `\r` and `\n` must not split
+        // `\r\n` into two separate line breaks.
+        let mut opt_crlf = TextBuffer::from_str("bar\r\nbaz\r\n");
+        replace_all_in_buffer_with_line_ending(
+            &mut opt_crlf,
+            &mut undo,
+            Selection::caret(0),
+            r"(foo)?bar",
+            r"X\r$1\nY",
+            opts,
+            LineEnding::CrLf,
+        )
+        .unwrap();
+        assert_eq!(opt_crlf.to_string(), "X\r\nY\r\nbaz\r\n");
+
+        let mut empty_cap_lf = TextBuffer::from_str("bar\nbaz\n");
+        replace_all_in_buffer_with_line_ending(
+            &mut empty_cap_lf,
+            &mut undo,
+            Selection::caret(0),
+            r"()bar",
+            r"X\r$1\nY",
+            opts,
+            LineEnding::Lf,
+        )
+        .unwrap();
+        assert_eq!(empty_cap_lf.to_string(), "X\nY\nbaz\n");
+
+        let mut matched_opt_crlf = TextBuffer::from_str("Zbar\r\nbaz\r\n");
+        replace_all_in_buffer_with_line_ending(
+            &mut matched_opt_crlf,
+            &mut undo,
+            Selection::caret(0),
+            r"(Z)?bar",
+            r"X\r$1\nY",
+            opts,
+            LineEnding::CrLf,
+        )
+        .unwrap();
+        assert_eq!(matched_opt_crlf.to_string(), "X\r\nZ\r\nY\r\nbaz\r\n");
     }
 }

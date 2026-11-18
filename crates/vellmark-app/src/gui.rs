@@ -11,10 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vellmark_core::{
-    AutoMergeOutcome, ByteRange, ConflictActionOutcome, ConflictDiffKind, DocState, DocumentStats,
-    EditorAction, EncodingDecision, ExternalSyncResult, FindMatch, FindOptions, SaveOutcome,
-    Selection, TableAlign, ViewMode, count_text_metrics,
+    AutoMergeOutcome, ByteRange, ConflictActionOutcome, ConflictDiffKind, DetectedEncoding,
+    DocState, DocumentStats, EditorAction, EncodingDecision, ExternalSyncResult, FindMatch,
+    FindOptions, LineEnding, SaveOutcome, Selection, TableAlign, ViewMode, atomic_write_file,
+    count_text_metrics, paths_share_underlying_file,
 };
+use vellmark_export::HtmlExportMode;
 use vellmark_parser::{
     BlockKind, InlineKind, OutlineItem, active_outline_index, extract_link_destination,
     parse_table_block,
@@ -743,6 +745,15 @@ enum UiAction {
     SelectGlobalSearchMatch(usize),
     FocusGlobalSearchInput,
     ToggleGlobalSearchCase,
+    ToggleFindWholeWord,
+    ToggleReplaceRow,
+    FocusReplaceInput,
+    ReplaceNext,
+    ReplaceAll,
+    SaveUtf8Copy,
+    CloseCommandPalette,
+    SelectCommandPaletteMatch(usize),
+    FocusCommandPaletteInput,
 }
 
 #[derive(Debug, Clone)]
@@ -766,6 +777,86 @@ enum FilePromptMode {
     RenameFile { source_path: PathBuf },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteCommandId {
+    FileNew,
+    FileOpen,
+    FileOpenFolder,
+    FileSave,
+    FileSaveAs,
+    ExportHtmlSafe,
+    ExportHtmlRaw,
+    QuickOpen,
+    GlobalSearch,
+    Find,
+    FindAndReplace,
+    ToggleSourceMode,
+    ToggleFocusMode,
+    ToggleTypewriterMode,
+    ToggleFullscreen,
+    ToggleSidebar,
+    InsertTable,
+    InsertCodeBlock,
+    InsertLink,
+    ToggleTableAutoAlign,
+    ToggleCodeLineNumbers,
+    ThemeFollowSystem,
+    ThemeLight,
+    ThemeDark,
+    ThemeAcademic,
+    ThemeGithub,
+    LoadCustomThemeCss,
+    ProseWidthNarrow,
+    ProseWidthBalanced,
+    ProseWidthWide,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+}
+
+#[derive(Debug, Clone)]
+struct PaletteCommandEntry {
+    id: PaletteCommandId,
+    label: &'static str,
+    shortcut: &'static str,
+}
+
+const PALETTE_COMMANDS: &[PaletteCommandEntry] = &[
+    PaletteCommandEntry { id: PaletteCommandId::FileNew, label: "File: New Document", shortcut: "Cmd/Ctrl+N" },
+    PaletteCommandEntry { id: PaletteCommandId::FileOpen, label: "File: Open File...", shortcut: "Cmd/Ctrl+O" },
+    PaletteCommandEntry { id: PaletteCommandId::FileOpenFolder, label: "File: Open Folder...", shortcut: "Cmd/Ctrl+Shift+O" },
+    PaletteCommandEntry { id: PaletteCommandId::FileSave, label: "File: Save", shortcut: "Cmd/Ctrl+S" },
+    PaletteCommandEntry { id: PaletteCommandId::FileSaveAs, label: "File: Save As...", shortcut: "Cmd/Ctrl+Shift+S" },
+    PaletteCommandEntry { id: PaletteCommandId::ExportHtmlSafe, label: "Export: Standalone HTML (Safe Mode)...", shortcut: "" },
+    PaletteCommandEntry { id: PaletteCommandId::ExportHtmlRaw, label: "Export: Standalone HTML (Raw)...", shortcut: "" },
+    PaletteCommandEntry { id: PaletteCommandId::QuickOpen, label: "Go: Quick Open File...", shortcut: "Cmd/Ctrl+P" },
+    PaletteCommandEntry { id: PaletteCommandId::GlobalSearch, label: "Search: Find in Workspace...", shortcut: "Cmd/Ctrl+Shift+F" },
+    PaletteCommandEntry { id: PaletteCommandId::Find, label: "Edit: Find in Document", shortcut: "Cmd/Ctrl+F" },
+    PaletteCommandEntry { id: PaletteCommandId::FindAndReplace, label: "Edit: Find and Replace", shortcut: "Cmd/Ctrl+H" },
+    PaletteCommandEntry { id: PaletteCommandId::InsertTable, label: "Insert: Table...", shortcut: "Cmd/Ctrl+T" },
+    PaletteCommandEntry { id: PaletteCommandId::InsertCodeBlock, label: "Insert / Edit: Code Block", shortcut: "Cmd+Option+C" },
+    PaletteCommandEntry { id: PaletteCommandId::InsertLink, label: "Insert: Hyperlink...", shortcut: "Cmd/Ctrl+K" },
+    PaletteCommandEntry { id: PaletteCommandId::ToggleSourceMode, label: "View: Toggle Source / WYSIWYG Mode", shortcut: "Cmd/Ctrl+/" },
+    PaletteCommandEntry { id: PaletteCommandId::ToggleFocusMode, label: "View: Toggle Focus Mode", shortcut: "F8" },
+    PaletteCommandEntry { id: PaletteCommandId::ToggleTypewriterMode, label: "View: Toggle Typewriter Mode", shortcut: "F9" },
+    PaletteCommandEntry { id: PaletteCommandId::ToggleFullscreen, label: "View: Toggle Fullscreen", shortcut: "F11" },
+    PaletteCommandEntry { id: PaletteCommandId::ToggleSidebar, label: "View: Toggle Sidebar", shortcut: "Cmd/Ctrl+\\" },
+    PaletteCommandEntry { id: PaletteCommandId::ToggleTableAutoAlign, label: "Table: Toggle Auto-Align Source on Edit", shortcut: "" },
+    PaletteCommandEntry { id: PaletteCommandId::ToggleCodeLineNumbers, label: "Editor: Toggle Code Block Line Numbers", shortcut: "Cmd/Ctrl+Shift+L" },
+    PaletteCommandEntry { id: PaletteCommandId::ThemeFollowSystem, label: "Theme: Follow System Appearance", shortcut: "" },
+    PaletteCommandEntry { id: PaletteCommandId::ThemeLight, label: "Theme: Light", shortcut: "Cmd/Ctrl+Shift+T" },
+    PaletteCommandEntry { id: PaletteCommandId::ThemeDark, label: "Theme: Dark", shortcut: "" },
+    PaletteCommandEntry { id: PaletteCommandId::ThemeAcademic, label: "Theme: Academic", shortcut: "" },
+    PaletteCommandEntry { id: PaletteCommandId::ThemeGithub, label: "Theme: GitHub", shortcut: "" },
+    PaletteCommandEntry { id: PaletteCommandId::LoadCustomThemeCss, label: "Theme: Load Custom CSS File...", shortcut: "" },
+    PaletteCommandEntry { id: PaletteCommandId::ProseWidthNarrow, label: "Layout: Prose Width Compact (720px)", shortcut: "" },
+    PaletteCommandEntry { id: PaletteCommandId::ProseWidthBalanced, label: "Layout: Prose Width Balanced (860px)", shortcut: "" },
+    PaletteCommandEntry { id: PaletteCommandId::ProseWidthWide, label: "Layout: Prose Width Wide (1080px)", shortcut: "" },
+    PaletteCommandEntry { id: PaletteCommandId::ZoomIn, label: "View: Zoom In", shortcut: "Cmd/Ctrl+=" },
+    PaletteCommandEntry { id: PaletteCommandId::ZoomOut, label: "View: Zoom Out", shortcut: "Cmd/Ctrl+-" },
+    PaletteCommandEntry { id: PaletteCommandId::ZoomReset, label: "View: Reset Zoom (100%)", shortcut: "Cmd/Ctrl+0" },
+];
+
 #[derive(Debug, Clone)]
 enum DocBannerKind {
     Conflict {
@@ -779,6 +870,9 @@ enum DocBannerKind {
         error: String,
     },
     RecoveryDegraded,
+    ReadOnlyEncoding {
+        candidate: DetectedEncoding,
+    },
     ConflictBackupCleanup {
         count: usize,
     },
@@ -811,10 +905,12 @@ enum ImeTarget {
     None,
     Tab(u64),
     FindBox,
+    ReplaceBox,
     LinkPromptBox,
     QuickOpenBox,
     CodeLangBox,
     GlobalSearchBox,
+    CommandPaletteBox,
     InsertTableBox,
     FileNameBox,
 }
@@ -837,6 +933,9 @@ pub struct GuiController {
     pub find_query: String,
     pub find_options: FindOptions,
     pub active_find_range: Option<ByteRange>,
+    pub replace_open: bool,
+    pub replace_focused: bool,
+    pub replace_text: String,
     pub link_prompt_open: bool,
     pub link_prompt_url: String,
     pub quick_open_open: bool,
@@ -854,6 +953,10 @@ pub struct GuiController {
     global_search_cancel: Option<Arc<AtomicBool>>,
     global_search_worker: Option<WorkspaceSearchWorker>,
     redraw_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub command_palette_open: bool,
+    pub command_palette_query: String,
+    command_palette_matches: Vec<PaletteCommandEntry>,
+    command_palette_selected: usize,
     insert_table_open: bool,
     insert_table_input: String,
     file_prompt_mode: Option<FilePromptMode>,
@@ -932,6 +1035,9 @@ impl GuiController {
             find_query: String::new(),
             find_options: FindOptions::default(),
             active_find_range: None,
+            replace_open: false,
+            replace_focused: false,
+            replace_text: String::new(),
             link_prompt_open: false,
             link_prompt_url: String::new(),
             quick_open_open: false,
@@ -949,6 +1055,10 @@ impl GuiController {
             global_search_cancel: None,
             global_search_worker: None,
             redraw_notifier: None,
+            command_palette_open: false,
+            command_palette_query: String::new(),
+            command_palette_matches: Vec::new(),
+            command_palette_selected: 0,
             insert_table_open: false,
             insert_table_input: String::new(),
             file_prompt_mode: None,
@@ -1243,17 +1353,24 @@ impl GuiController {
 
     fn active_doc_banner_kind(&self) -> Option<DocBannerKind> {
         let tab = self.workbench.active_tab()?;
-        match tab.session.state {
-            DocState::Conflict => Some(DocBannerKind::Conflict {
+        match (&tab.session.state, &tab.session.format.decision) {
+            (DocState::Conflict, _) => Some(DocBannerKind::Conflict {
                 theirs_updated: tab.conflict_theirs_updated,
             }),
-            DocState::Missing { has_local_edits } => Some(DocBannerKind::Missing {
-                has_local_edits,
+            (DocState::Missing { has_local_edits }, _) => Some(DocBannerKind::Missing {
+                has_local_edits: *has_local_edits,
                 write_error: tab.last_write_error.clone(),
             }),
-            DocState::Dirty if tab.last_write_error.is_some() => Some(DocBannerKind::WriteError {
-                error: tab.last_write_error.clone().unwrap_or_default(),
-            }),
+            (DocState::Dirty, _) if tab.last_write_error.is_some() => {
+                Some(DocBannerKind::WriteError {
+                    error: tab.last_write_error.clone().unwrap_or_default(),
+                })
+            }
+            (_, EncodingDecision::ReadOnly { candidate }) => {
+                Some(DocBannerKind::ReadOnlyEncoding {
+                    candidate: *candidate,
+                })
+            }
             _ if tab.session.recovery_degraded => Some(DocBannerKind::RecoveryDegraded),
             _ if tab.conflict_backup_count > 0 && !tab.conflict_backup_notice_dismissed => {
                 Some(DocBannerKind::ConflictBackupCleanup {
@@ -1366,6 +1483,9 @@ impl GuiController {
         }
         if self.global_search_open {
             self.build_global_search_modal(&mut chrome_layer, layout.editor);
+        }
+        if self.command_palette_open {
+            self.build_command_palette_modal(&mut chrome_layer, layout.editor);
         }
         if self.insert_table_open || self.file_prompt_mode.is_some() {
             self.build_simple_prompt_modal(&mut chrome_layer, layout.editor);
@@ -2257,19 +2377,35 @@ impl GuiController {
 
     fn build_find_bar(&mut self, dl: &mut DrawList, editor_rect: Rect) {
         let chrome = self.style.chrome;
-        let bar_w = 420.0_f32.min((editor_rect.w - 24.0).max(240.0));
+        let bar_w = 490.0_f32.min((editor_rect.w - 24.0).max(280.0));
+        let bar_h = if self.replace_open {
+            FIND_BAR_H + 34.0
+        } else {
+            FIND_BAR_H
+        };
         let bar = Rect::new(
             editor_rect.x + editor_rect.w - bar_w - 16.0,
             editor_rect.y + 8.0,
             bar_w,
-            FIND_BAR_H,
+            bar_h,
         );
         dl.rects.push(
             SceneRect::rounded(bar, chrome.panel_bg, 7.0)
                 .with_border(1.0, chrome.border),
         );
+        self.ui_hit_zones.push(UiHitZone {
+            rect: bar,
+            action: if self.replace_open && self.replace_focused {
+                UiAction::FocusReplaceInput
+            } else {
+                UiAction::FocusFindInput
+            },
+            pointer_cursor: false,
+        });
 
-        let input_w = (bar.w - 210.0).max(90.0);
+        let mut bx = bar.x + bar.w - 208.0;
+        let count_x = bx - 48.0;
+        let input_w = (count_x - 6.0 - (bar.x + 8.0)).max(84.0);
         let input_rect = Rect::new(bar.x + 8.0, bar.y + 6.0, input_w, 26.0);
         let query = self.find_query.clone();
         self.draw_overlay_text_input(
@@ -2298,13 +2434,13 @@ impl GuiController {
             (None, t) if t > 0 => format!("{t}"),
             _ => String::new(),
         };
-        let count_x = input_rect.x + input_w + 6.0;
-        self.push_ui_text(dl, &count_text, count_x, bar.y + 11.0, 11.0, 500, chrome.muted_text, Some(42.0), Some(bar));
+        self.push_ui_text(dl, &count_text, count_x, bar.y + 11.0, 11.0, 500, chrome.muted_text, Some(44.0), Some(bar));
 
-        let mut bx = bar.x + bar.w - 148.0;
         for (label, bw, active, action) in [
+            ("W", 26.0, self.find_options.whole_word, UiAction::ToggleFindWholeWord),
             ("Aa", 26.0, self.find_options.case_sensitive, UiAction::ToggleFindCase),
             (".*", 26.0, self.find_options.use_regex, UiAction::ToggleFindRegex),
+            ("⇄", 26.0, self.replace_open, UiAction::ToggleReplaceRow),
             ("<", 24.0, false, UiAction::FindPrev),
             (">", 24.0, false, UiAction::FindNext),
             ("×", 24.0, false, UiAction::CloseFind),
@@ -2326,13 +2462,58 @@ impl GuiController {
             });
             bx += bw + 4.0;
         }
+
+        if self.replace_open {
+            let row2_y = bar.y + FIND_BAR_H;
+            let mut right_edge = bar.x + bar.w - 8.0;
+            right_edge = self.push_action_button(
+                dl,
+                right_edge,
+                row2_y + 1.0,
+                24.0,
+                "All",
+                chrome.tab_bar_bg,
+                chrome.border,
+                chrome.text,
+                UiAction::ReplaceAll,
+                bar,
+            );
+            right_edge = self.push_action_button(
+                dl,
+                right_edge,
+                row2_y + 1.0,
+                24.0,
+                "Rep",
+                chrome.accent.with_alpha(48),
+                chrome.accent,
+                chrome.text,
+                UiAction::ReplaceNext,
+                bar,
+            );
+            let rep_w = (right_edge - (bar.x + 8.0)).max(90.0);
+            let rep_rect = Rect::new(bar.x + 8.0, row2_y, rep_w, 26.0);
+            let rep_val = self.replace_text.clone();
+            self.draw_overlay_text_input(
+                dl,
+                rep_rect,
+                &rep_val,
+                "Replace...",
+                self.replace_focused,
+                UiAction::FocusReplaceInput,
+            );
+        }
     }
 
     fn build_link_prompt(&mut self, dl: &mut DrawList, editor_rect: Rect) {
         let chrome = self.style.chrome;
         let bar_w = 430.0_f32.min((editor_rect.w - 24.0).max(240.0));
         let top_offset = if self.find_open {
-            FIND_BAR_H + 14.0
+            let find_h = if self.replace_open {
+                FIND_BAR_H + 34.0
+            } else {
+                FIND_BAR_H
+            };
+            find_h + 14.0
         } else {
             8.0
         };
@@ -2465,6 +2646,33 @@ impl GuiController {
                 self.global_search_case_sensitive,
                 UiAction::ToggleGlobalSearchCase,
             )),
+            rows,
+        );
+    }
+
+    fn build_command_palette_modal(&mut self, dl: &mut DrawList, editor_rect: Rect) {
+        let query = self.command_palette_query.clone();
+        let selected = self.command_palette_selected;
+        let rows: Vec<ListPickerRow> = self
+            .command_palette_matches
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| ListPickerRow {
+                label: entry.label.to_string(),
+                badge: (!entry.shortcut.is_empty()).then(|| entry.shortcut.to_string()),
+                action: UiAction::SelectCommandPaletteMatch(idx),
+            })
+            .collect();
+        self.draw_list_picker_modal(
+            dl,
+            editor_rect,
+            &query,
+            "Command Palette — type a command...",
+            "No matching commands",
+            selected,
+            UiAction::FocusCommandPaletteInput,
+            UiAction::CloseCommandPalette,
+            None,
             rows,
         );
     }
@@ -2900,6 +3108,21 @@ impl GuiController {
                     ("Save Now", UiAction::SaveActiveNow, chrome.warning.with_alpha(38), chrome.warning, chrome.text),
                 ],
             ),
+            DocBannerKind::ReadOnlyEncoding { candidate } => (
+                chrome.warning,
+                24,
+                format!(
+                    "Read-only ({}) — cannot overwrite original non-UTF-8 file directly",
+                    encoding_label(*candidate)
+                ),
+                vec![(
+                    "Save UTF-8 Copy...",
+                    UiAction::SaveUtf8Copy,
+                    chrome.warning.with_alpha(38),
+                    chrome.warning,
+                    chrome.text,
+                )],
+            ),
             DocBannerKind::ConflictBackupCleanup { count } => (
                 chrome.warning,
                 18,
@@ -3092,16 +3315,18 @@ impl GuiController {
                     DocState::Conflict => ("Conflict", chrome.danger),
                     DocState::Missing { .. } => ("Missing", chrome.danger),
                 };
-                let ro = if matches!(tab.session.format.decision, EncodingDecision::ReadOnly { .. }) {
-                    " [Read-Only]"
-                } else {
-                    ""
+                let (enc, ro) = match tab.session.format.decision {
+                    EncodingDecision::Editable(enc) => (encoding_label(enc), ""),
+                    EncodingDecision::ReadOnly { candidate } => {
+                        (encoding_label(candidate), " [Read-Only]")
+                    }
                 };
-                let eol = match tab.session.format.dominant_line_ending {
-                    vellmark_core::LineEnding::Lf => "UTF-8 • LF",
-                    vellmark_core::LineEnding::CrLf => "UTF-8 • CRLF",
-                    vellmark_core::LineEnding::Cr => "UTF-8 • CR",
+                let eol_name = match tab.session.format.dominant_line_ending {
+                    LineEnding::Lf => "LF",
+                    LineEnding::CrLf => "CRLF",
+                    LineEnding::Cr => "CR",
                 };
+                let eol = format!("{enc} • {eol_name}");
                 let ime = if tab.view.ime_preedit.is_some() {
                     "IME: Composing"
                 } else if self.ime_enabled {
@@ -3111,7 +3336,7 @@ impl GuiController {
                 };
                 (format!("{st}{ro}"), col, eol, ime)
             }
-            None => ("No Document".to_string(), chrome.muted_text, "", ""),
+            None => ("No Document".to_string(), chrome.muted_text, String::new(), ""),
         };
 
         let active_notice = self.active_status_notice();
@@ -3210,12 +3435,16 @@ impl GuiController {
             Some(ImeTarget::InsertTableBox)
         } else if self.file_prompt_mode.is_some() {
             Some(ImeTarget::FileNameBox)
+        } else if self.command_palette_open {
+            Some(ImeTarget::CommandPaletteBox)
         } else if self.global_search_open {
             Some(ImeTarget::GlobalSearchBox)
         } else if self.quick_open_open {
             Some(ImeTarget::QuickOpenBox)
         } else if self.link_prompt_open {
             Some(ImeTarget::LinkPromptBox)
+        } else if self.find_open && self.replace_open && self.replace_focused {
+            Some(ImeTarget::ReplaceBox)
         } else if self.find_open && self.find_focused {
             Some(ImeTarget::FindBox)
         } else {
@@ -3232,9 +3461,11 @@ impl GuiController {
             ImeTarget::CodeLangBox => self.code_lang_open,
             ImeTarget::InsertTableBox => self.insert_table_open,
             ImeTarget::FileNameBox => self.file_prompt_mode.is_some(),
+            ImeTarget::CommandPaletteBox => self.command_palette_open,
             ImeTarget::GlobalSearchBox => self.global_search_open,
             ImeTarget::QuickOpenBox => self.quick_open_open,
             ImeTarget::LinkPromptBox => self.link_prompt_open,
+            ImeTarget::ReplaceBox => self.find_open && self.replace_open,
             ImeTarget::FindBox => self.find_open,
             _ => false,
         }
@@ -3245,6 +3476,10 @@ impl GuiController {
             ImeTarget::FindBox => {
                 self.find_query.push_str(text);
                 self.run_find_next(false);
+                true
+            }
+            ImeTarget::ReplaceBox => {
+                self.replace_text.push_str(text);
                 true
             }
             ImeTarget::LinkPromptBox => {
@@ -3264,6 +3499,11 @@ impl GuiController {
             ImeTarget::GlobalSearchBox => {
                 self.global_search_query.push_str(text);
                 self.schedule_global_search(false);
+                true
+            }
+            ImeTarget::CommandPaletteBox => {
+                self.command_palette_query.push_str(text);
+                self.refresh_command_palette_matches();
                 true
             }
             ImeTarget::InsertTableBox => {
@@ -3304,10 +3544,12 @@ impl GuiController {
                     // Clearing only the visible preedit preserves `ime_composition_selection` and `ime_target`.
                     match self.ime_target {
                         ImeTarget::FindBox
+                        | ImeTarget::ReplaceBox
                         | ImeTarget::LinkPromptBox
                         | ImeTarget::QuickOpenBox
                         | ImeTarget::CodeLangBox
                         | ImeTarget::GlobalSearchBox
+                        | ImeTarget::CommandPaletteBox
                         | ImeTarget::InsertTableBox
                         | ImeTarget::FileNameBox => {}
                         ImeTarget::Tab(target_id) => {
@@ -3359,10 +3601,12 @@ impl GuiController {
 
                 match target {
                     ImeTarget::FindBox
+                    | ImeTarget::ReplaceBox
                     | ImeTarget::LinkPromptBox
                     | ImeTarget::QuickOpenBox
                     | ImeTarget::CodeLangBox
                     | ImeTarget::GlobalSearchBox
+                    | ImeTarget::CommandPaletteBox
                     | ImeTarget::InsertTableBox
                     | ImeTarget::FileNameBox => {
                         self.commit_overlay_text(target, committed);
@@ -3566,6 +3810,15 @@ impl GuiController {
                 self.open_insert_table_prompt();
                 return true;
             }
+            if physical_key == Some(PhysicalKey::Code(KeyCode::KeyF))
+                || matches!(
+                    logical_key,
+                    Key::Character(ch) if matches!(ch.as_str(), "f" | "F" | "ƒ")
+                )
+            {
+                self.open_find_bar(true);
+                return true;
+            }
         }
 
         // Function key view toggles (`F8` Focus Mode, `F9` Typewriter Mode, `F11` Fullscreen, PRD 4.7 / 4.10)
@@ -3606,6 +3859,10 @@ impl GuiController {
                     }
                     "o" => {
                         self.open_file_dialog();
+                        return true;
+                    }
+                    "p" if shift => {
+                        self.open_command_palette();
                         return true;
                     }
                     "p" => {
@@ -3693,9 +3950,11 @@ impl GuiController {
                         return true;
                     }
                     "f" => {
-                        self.close_transient_prompts();
-                        self.find_open = true;
-                        self.find_focused = true;
+                        self.open_find_bar(false);
+                        return true;
+                    }
+                    "h" if !shift => {
+                        self.open_find_bar(true);
                         return true;
                     }
                     "/" => {
@@ -3753,9 +4012,7 @@ impl GuiController {
                     return true;
                 }
                 if self.find_open {
-                    self.find_open = false;
-                    self.find_focused = false;
-                    self.active_find_range = None;
+                    self.close_find_bar();
                     return true;
                 }
                 false
@@ -3907,6 +4164,32 @@ impl GuiController {
             return true;
         }
 
+        if self.command_palette_open {
+            match decode_list_modal_key(logical_key, text, primary, ctrl) {
+                ListModalAction::Close => self.close_command_palette(),
+                ListModalAction::MoveSelection(delta) => {
+                    move_list_selection(
+                        &mut self.command_palette_selected,
+                        self.command_palette_matches.len(),
+                        delta,
+                    );
+                }
+                ListModalAction::Confirm => {
+                    self.confirm_command_palette_match(self.command_palette_selected);
+                }
+                ListModalAction::QueryBackspace => {
+                    self.command_palette_query.pop();
+                    self.refresh_command_palette_matches();
+                }
+                ListModalAction::QueryAppend(txt) => {
+                    self.command_palette_query.push_str(&txt);
+                    self.refresh_command_palette_matches();
+                }
+                ListModalAction::None => {}
+            }
+            return true;
+        }
+
         if self.global_search_open {
             match decode_list_modal_key(logical_key, text, primary, ctrl) {
                 ListModalAction::Close => self.close_global_search(),
@@ -3986,35 +4269,68 @@ impl GuiController {
             return true;
         }
 
-        if self.find_open && self.find_focused {
-            match logical_key {
-                Key::Named(NamedKey::Escape) => {
-                    self.find_open = false;
-                    self.find_focused = false;
-                    self.active_find_range = None;
-                    return true;
+        if self.find_open && (self.find_focused || (self.replace_open && self.replace_focused)) {
+            if matches!(logical_key, Key::Named(NamedKey::Escape)) {
+                self.close_find_bar();
+                return true;
+            }
+            if matches!(logical_key, Key::Named(NamedKey::Tab)) && self.replace_open {
+                let to_replace = !self.replace_focused;
+                self.find_focused = !to_replace;
+                self.replace_focused = to_replace;
+                if matches!(self.ime_target, ImeTarget::FindBox | ImeTarget::ReplaceBox) {
+                    self.ime_target = ImeTarget::None;
                 }
-                Key::Named(NamedKey::Enter) => {
-                    if shift {
-                        self.run_find_prev();
-                    } else {
-                        self.run_find_next(true);
+                return true;
+            }
+            if self.replace_open && self.replace_focused {
+                match logical_key {
+                    Key::Named(NamedKey::Enter) => {
+                        if primary || shift {
+                            self.run_replace_all();
+                        } else {
+                            self.run_replace_next();
+                        }
+                        return true;
                     }
-                    return true;
+                    Key::Named(NamedKey::Backspace) => {
+                        self.replace_text.pop();
+                        return true;
+                    }
+                    _ => {
+                        if let Some(txt) = (!primary && !ctrl)
+                            .then(|| overlay_printable_key_text(logical_key, text))
+                            .flatten()
+                        {
+                            self.replace_text.push_str(&txt);
+                            return true;
+                        }
+                    }
                 }
-                Key::Named(NamedKey::Backspace) => {
-                    self.find_query.pop();
-                    self.run_find_next(false);
-                    return true;
-                }
-                _ => {
-                    if let Some(txt) = (!primary && !ctrl)
-                        .then(|| overlay_printable_key_text(logical_key, text))
-                        .flatten()
-                    {
-                        self.find_query.push_str(&txt);
+            } else {
+                match logical_key {
+                    Key::Named(NamedKey::Enter) => {
+                        if shift {
+                            self.run_find_prev();
+                        } else {
+                            self.run_find_next(true);
+                        }
+                        return true;
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        self.find_query.pop();
                         self.run_find_next(false);
                         return true;
+                    }
+                    _ => {
+                        if let Some(txt) = (!primary && !ctrl)
+                            .then(|| overlay_printable_key_text(logical_key, text))
+                            .flatten()
+                        {
+                            self.find_query.push_str(&txt);
+                            self.run_find_next(false);
+                            return true;
+                        }
                     }
                 }
             }
@@ -4306,6 +4622,11 @@ impl GuiController {
                 true
             }
             UiAction::FocusSimplePromptInput => true,
+            UiAction::ToggleFindWholeWord => {
+                self.find_options.whole_word = !self.find_options.whole_word;
+                self.run_find_next(false);
+                true
+            }
             UiAction::ToggleFindCase => {
                 self.find_options.case_sensitive = !self.find_options.case_sensitive;
                 self.run_find_next(false);
@@ -4316,6 +4637,25 @@ impl GuiController {
                 self.run_find_next(false);
                 true
             }
+            UiAction::ToggleReplaceRow => {
+                self.replace_open = !self.replace_open;
+                if self.replace_open {
+                    if self.find_query.is_empty() {
+                        self.find_focused = true;
+                        self.replace_focused = false;
+                    } else {
+                        self.find_focused = false;
+                        self.replace_focused = true;
+                    }
+                } else {
+                    self.replace_focused = false;
+                    self.find_focused = true;
+                }
+                if matches!(self.ime_target, ImeTarget::FindBox | ImeTarget::ReplaceBox) {
+                    self.ime_target = ImeTarget::None;
+                }
+                true
+            }
             UiAction::FindPrev => {
                 self.run_find_prev();
                 true
@@ -4324,15 +4664,35 @@ impl GuiController {
                 self.run_find_next(true);
                 true
             }
+            UiAction::ReplaceNext => {
+                self.run_replace_next();
+                true
+            }
+            UiAction::ReplaceAll => {
+                self.run_replace_all();
+                true
+            }
             UiAction::CloseFind => {
-                self.find_open = false;
-                self.find_focused = false;
-                self.active_find_range = None;
+                self.close_find_bar();
                 true
             }
             UiAction::FocusFindInput => {
                 self.close_transient_prompts();
                 self.find_focused = true;
+                self.replace_focused = false;
+                if self.ime_target == ImeTarget::ReplaceBox {
+                    self.ime_target = ImeTarget::None;
+                }
+                true
+            }
+            UiAction::FocusReplaceInput => {
+                self.close_transient_prompts();
+                self.replace_open = true;
+                self.find_focused = false;
+                self.replace_focused = true;
+                if self.ime_target == ImeTarget::FindBox {
+                    self.ime_target = ImeTarget::None;
+                }
                 true
             }
             UiAction::ToggleConflictDiff => {
@@ -4410,7 +4770,8 @@ impl GuiController {
             UiAction::FocusLinkInput
             | UiAction::FocusQuickOpenInput
             | UiAction::FocusCodeLangInput
-            | UiAction::FocusGlobalSearchInput => true,
+            | UiAction::FocusGlobalSearchInput
+            | UiAction::FocusCommandPaletteInput => true,
             UiAction::CloseQuickOpen => {
                 self.close_quick_open();
                 true
@@ -4462,6 +4823,18 @@ impl GuiController {
                 self.schedule_global_search(true);
                 true
             }
+            UiAction::SaveUtf8Copy => {
+                self.save_utf8_copy_dialog();
+                true
+            }
+            UiAction::CloseCommandPalette => {
+                self.close_command_palette();
+                true
+            }
+            UiAction::SelectCommandPaletteMatch(idx) => {
+                self.confirm_command_palette_match(idx);
+                true
+            }
         }
     }
 
@@ -4470,11 +4843,7 @@ impl GuiController {
         let current = self.workbench.config.theme;
         let idx = all.iter().position(|&t| t == current).unwrap_or(0);
         let next = all[(idx + 1) % all.len()];
-        self.workbench.config.follow_system_theme = false;
-        self.workbench.config.theme = next;
-        self.workbench.theme = next.load();
-        self.refresh_style();
-        self.set_notice(format!("Theme: {next:?}"));
+        self.apply_builtin_theme_selection(false, Some(next));
     }
 
     fn close_tab_checked(&mut self, id: u64, unsaved_msg: &str) {
@@ -4789,6 +5158,7 @@ impl GuiController {
 
     fn dispatch_editor(&mut self, action: EditorAction) {
         self.find_focused = false;
+        self.replace_focused = false;
         self.close_transient_prompts();
         self.close_confirm_armed = false;
         self.delete_confirm_path = None;
@@ -5025,7 +5395,9 @@ impl GuiController {
             ImeTarget::QuickOpenBox => self.refresh_quick_open_matches(),
             ImeTarget::CodeLangBox => self.refresh_code_lang_matches(),
             ImeTarget::GlobalSearchBox => self.schedule_global_search(false),
-            ImeTarget::LinkPromptBox
+            ImeTarget::CommandPaletteBox => self.refresh_command_palette_matches(),
+            ImeTarget::ReplaceBox
+            | ImeTarget::LinkPromptBox
             | ImeTarget::InsertTableBox
             | ImeTarget::FileNameBox
             | ImeTarget::None
@@ -5036,10 +5408,12 @@ impl GuiController {
     fn overlay_input_text(&self, target: ImeTarget) -> &str {
         match target {
             ImeTarget::FindBox => &self.find_query,
+            ImeTarget::ReplaceBox => &self.replace_text,
             ImeTarget::LinkPromptBox => &self.link_prompt_url,
             ImeTarget::QuickOpenBox => &self.quick_open_query,
             ImeTarget::CodeLangBox => &self.code_lang_query,
             ImeTarget::GlobalSearchBox => &self.global_search_query,
+            ImeTarget::CommandPaletteBox => &self.command_palette_query,
             ImeTarget::InsertTableBox => &self.insert_table_input,
             ImeTarget::FileNameBox => &self.file_prompt_input,
             ImeTarget::None | ImeTarget::Tab(_) => "",
@@ -5049,10 +5423,12 @@ impl GuiController {
     fn clear_overlay_input_text(&mut self, target: ImeTarget) {
         match target {
             ImeTarget::FindBox => self.find_query.clear(),
+            ImeTarget::ReplaceBox => self.replace_text.clear(),
             ImeTarget::LinkPromptBox => self.link_prompt_url.clear(),
             ImeTarget::QuickOpenBox => self.quick_open_query.clear(),
             ImeTarget::CodeLangBox => self.code_lang_query.clear(),
             ImeTarget::GlobalSearchBox => self.global_search_query.clear(),
+            ImeTarget::CommandPaletteBox => self.command_palette_query.clear(),
             ImeTarget::InsertTableBox => self.insert_table_input.clear(),
             ImeTarget::FileNameBox => self.file_prompt_input.clear(),
             ImeTarget::None | ImeTarget::Tab(_) => {}
@@ -5066,10 +5442,10 @@ impl GuiController {
                 match self.clipboard.write(&text, None) {
                     Ok(()) => {
                         self.clipboard_text = text;
-                        let noun = if matches!(target, ImeTarget::FindBox) {
-                            "search query"
-                        } else {
-                            "text"
+                        let noun = match target {
+                            ImeTarget::FindBox => "search query",
+                            ImeTarget::ReplaceBox => "replacement text",
+                            _ => "text",
                         };
                         self.set_notice(if cut {
                             format!("Cut {noun}")
@@ -5155,11 +5531,12 @@ impl GuiController {
         }
         if let Some(target) = self.focused_overlay_ime_target() {
             let clean = match target {
-                ImeTarget::FindBox => plain.as_str(),
+                ImeTarget::FindBox | ImeTarget::ReplaceBox => plain.as_str(),
                 ImeTarget::LinkPromptBox
                 | ImeTarget::QuickOpenBox
                 | ImeTarget::CodeLangBox
                 | ImeTarget::GlobalSearchBox
+                | ImeTarget::CommandPaletteBox
                 | ImeTarget::InsertTableBox
                 | ImeTarget::FileNameBox => plain.trim_matches(&['\r', '\n'][..]),
                 ImeTarget::None | ImeTarget::Tab(_) => "",
@@ -5179,12 +5556,14 @@ impl GuiController {
     }
 
     fn close_transient_prompts(&mut self) {
+        self.replace_focused = false;
         self.link_prompt_open = false;
         self.quick_open_open = false;
         self.code_lang_open = false;
         self.code_lang_block_range = None;
         self.global_search_open = false;
         self.cancel_active_global_search();
+        self.command_palette_open = false;
         self.insert_table_open = false;
         self.file_prompt_mode = None;
         if matches!(
@@ -5193,6 +5572,7 @@ impl GuiController {
                 | ImeTarget::QuickOpenBox
                 | ImeTarget::CodeLangBox
                 | ImeTarget::GlobalSearchBox
+                | ImeTarget::CommandPaletteBox
                 | ImeTarget::InsertTableBox
                 | ImeTarget::FileNameBox
         ) {
@@ -5302,6 +5682,326 @@ impl GuiController {
                 self.set_notice(format!("Opened {}", picked.relative_path));
             }
             Err(e) => self.set_notice(format!("Open failed: {e}")),
+        }
+    }
+
+    /// Show Command Palette (`Cmd/Ctrl + Shift + P`, PRD 4.9 P-02).
+    pub fn open_command_palette(&mut self) {
+        self.close_confirm_armed = false;
+        self.close_transient_prompts();
+        self.find_focused = false;
+        self.replace_focused = false;
+        let active_id = self.workbench.active_tab().map(|t| t.id);
+        self.cancel_abandoned_tab_ime(active_id);
+        self.command_palette_open = true;
+        self.command_palette_query.clear();
+        self.refresh_command_palette_matches();
+    }
+
+    fn close_command_palette(&mut self) {
+        self.command_palette_open = false;
+        if self.ime_target == ImeTarget::CommandPaletteBox {
+            self.ime_target = ImeTarget::None;
+        }
+    }
+
+    fn refresh_command_palette_matches(&mut self) {
+        let terms: Vec<String> = self
+            .command_palette_query
+            .split_whitespace()
+            .map(|t| t.to_ascii_lowercase())
+            .collect();
+        self.command_palette_matches = PALETTE_COMMANDS
+            .iter()
+            .filter(|entry| {
+                let label = entry.label.to_ascii_lowercase();
+                let shortcut = entry.shortcut.to_ascii_lowercase();
+                terms
+                    .iter()
+                    .all(|term| label.contains(term) || shortcut.contains(term))
+            })
+            .cloned()
+            .collect();
+        self.command_palette_selected = 0;
+    }
+
+    fn confirm_command_palette_match(&mut self, idx: usize) {
+        let Some(picked) = self.command_palette_matches.get(idx).cloned() else {
+            self.close_command_palette();
+            return;
+        };
+        self.close_command_palette();
+        self.execute_palette_command(picked.id);
+    }
+
+    fn apply_builtin_theme_selection(
+        &mut self,
+        follow_system: bool,
+        theme_opt: Option<BuiltinTheme>,
+    ) {
+        self.workbench
+            .select_builtin_theme(follow_system, theme_opt);
+        self.refresh_style();
+        let effective = self
+            .workbench
+            .config
+            .effective_builtin_theme(self.workbench.system_prefers_dark);
+        if follow_system {
+            self.set_notice("Theme: Follow System Appearance");
+        } else {
+            self.set_notice(format!("Theme: {effective:?}"));
+        }
+    }
+
+    fn set_prose_width_px(&mut self, width_px: u32, label: &str) {
+        self.workbench.config.max_content_width_px = width_px;
+        self.refresh_style();
+        self.set_notice(format!("Prose width: {label} ({width_px}px)"));
+    }
+
+    fn execute_palette_command(&mut self, id: PaletteCommandId) {
+        self.close_confirm_armed = false;
+        match id {
+            PaletteCommandId::FileNew => {
+                self.close_transient_prompts();
+                self.flush_active_tab_before_switch();
+                self.workbench.new_document();
+                self.find_focused = false;
+                self.replace_focused = false;
+                self.pending_scroll_ensure_caret = true;
+                self.set_notice("New Document");
+            }
+            PaletteCommandId::FileOpen => self.open_file_dialog(),
+            PaletteCommandId::FileOpenFolder => self.open_folder_dialog(),
+            PaletteCommandId::FileSave => self.save_active_tab(),
+            PaletteCommandId::FileSaveAs => self.save_as_active_tab(),
+            PaletteCommandId::ExportHtmlSafe => self.export_active_html_dialog(HtmlExportMode::Safe),
+            PaletteCommandId::ExportHtmlRaw => self.export_active_html_dialog(HtmlExportMode::Raw),
+            PaletteCommandId::QuickOpen => self.open_quick_open(),
+            PaletteCommandId::GlobalSearch => self.open_global_search(),
+            PaletteCommandId::Find => self.open_find_bar(false),
+            PaletteCommandId::FindAndReplace => self.open_find_bar(true),
+            PaletteCommandId::ToggleSourceMode => {
+                self.dispatch_editor(EditorAction::ToggleSourceMode);
+                self.preferred_caret_x = None;
+            }
+            PaletteCommandId::ToggleFocusMode => self.toggle_focus_mode(),
+            PaletteCommandId::ToggleTypewriterMode => self.toggle_typewriter_mode(),
+            PaletteCommandId::ToggleFullscreen => self.toggle_fullscreen(),
+            PaletteCommandId::ToggleSidebar => {
+                self.workbench.config.sidebar_visible = !self.workbench.config.sidebar_visible;
+            }
+            PaletteCommandId::InsertTable => self.open_insert_table_prompt(),
+            PaletteCommandId::InsertCodeBlock => self.insert_or_pick_code_block(),
+            PaletteCommandId::InsertLink => self.open_link_prompt(),
+            PaletteCommandId::ToggleTableAutoAlign => {
+                self.workbench.config.table_auto_align = !self.workbench.config.table_auto_align;
+                let on = self.workbench.config.table_auto_align;
+                if let Some(tab) = self.workbench.active_tab_mut() {
+                    tab.view.table_auto_align = on;
+                }
+                self.set_notice(if on {
+                    "Table Auto-Align: ON"
+                } else {
+                    "Table Auto-Align: OFF"
+                });
+            }
+            PaletteCommandId::ToggleCodeLineNumbers => {
+                let _ = self.execute_ui_action(UiAction::ToggleCodeLineNumbers);
+            }
+            PaletteCommandId::ThemeFollowSystem => {
+                self.apply_builtin_theme_selection(true, None);
+            }
+            PaletteCommandId::ThemeLight => {
+                self.apply_builtin_theme_selection(false, Some(BuiltinTheme::Light));
+            }
+            PaletteCommandId::ThemeDark => {
+                self.apply_builtin_theme_selection(false, Some(BuiltinTheme::Dark));
+            }
+            PaletteCommandId::ThemeAcademic => {
+                self.apply_builtin_theme_selection(false, Some(BuiltinTheme::Academic));
+            }
+            PaletteCommandId::ThemeGithub => {
+                self.apply_builtin_theme_selection(false, Some(BuiltinTheme::GitHub));
+            }
+            PaletteCommandId::LoadCustomThemeCss => self.load_custom_theme_dialog(),
+            PaletteCommandId::ProseWidthNarrow => self.set_prose_width_px(720, "Compact"),
+            PaletteCommandId::ProseWidthBalanced => self.set_prose_width_px(860, "Balanced"),
+            PaletteCommandId::ProseWidthWide => self.set_prose_width_px(1080, "Wide"),
+            PaletteCommandId::ZoomIn => {
+                self.workbench.config.zoom_in();
+                self.refresh_style();
+                self.set_notice(format!("Zoom {}%", self.workbench.config.zoom_percent));
+            }
+            PaletteCommandId::ZoomOut => {
+                self.workbench.config.zoom_out();
+                self.refresh_style();
+                self.set_notice(format!("Zoom {}%", self.workbench.config.zoom_percent));
+            }
+            PaletteCommandId::ZoomReset => {
+                self.workbench.config.reset_zoom();
+                self.refresh_style();
+                self.set_notice("Zoom 100%");
+            }
+        }
+    }
+
+    fn export_active_html_dialog(&mut self, mode: HtmlExportMode) {
+        self.close_confirm_armed = false;
+        let Some((current_path, default_name)) = self.workbench.active_tab().map(|t| {
+            let stem = t
+                .session
+                .path
+                .as_deref()
+                .and_then(|p| p.file_stem())
+                .and_then(|n| n.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Untitled");
+            (t.session.path.clone(), format!("{stem}.html"))
+        }) else {
+            return;
+        };
+        let Some(html) = self.workbench.export_active_html(mode) else {
+            return;
+        };
+        let Some(dest) = self
+            .save_dialog
+            .pick_save_as_path(current_path.as_deref(), &default_name)
+        else {
+            self.set_notice("HTML export cancelled");
+            return;
+        };
+        if let Some(parent) = dest.parent()
+            && !parent.as_os_str().is_empty()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            self.set_notice(format!("HTML export failed: {err}"));
+            return;
+        }
+        match atomic_write_file(&dest, html.as_bytes()) {
+            Ok(()) => {
+                let name = dest
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("export.html");
+                let mode_label = match mode {
+                    HtmlExportMode::Safe => "Safe",
+                    HtmlExportMode::Raw => "Raw",
+                };
+                self.set_notice(format!("Exported HTML ({mode_label}): {name}"));
+            }
+            Err(err) => self.set_notice(format!("HTML export failed: {err}")),
+        }
+    }
+
+    fn load_custom_theme_dialog(&mut self) {
+        self.close_confirm_armed = false;
+        self.close_transient_prompts();
+        let dir = self
+            .workbench
+            .config
+            .custom_theme_path
+            .as_deref()
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf)
+            .or_else(|| self.active_dialog_dir());
+        let Some(path) = self.save_dialog.pick_open_path(dir.as_deref()) else {
+            self.set_notice("Load Custom CSS cancelled");
+            return;
+        };
+        let css = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                self.set_notice(format!("Failed to read CSS {}: {err}", path.display()));
+                return;
+            }
+        };
+        self.workbench.config.follow_system_theme = false;
+        self.workbench.config.custom_theme_path = Some(path.clone());
+        self.workbench.load_custom_theme_css(&css);
+        self.refresh_style();
+        let diag_count = self.workbench.theme.diagnostics.len();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("custom.css");
+        if diag_count > 0 {
+            self.set_notice(format!(
+                "Loaded theme CSS: {name} ({diag_count} unsupported rule(s) ignored)"
+            ));
+        } else {
+            self.set_notice(format!("Loaded theme CSS: {name}"));
+        }
+    }
+
+    fn save_utf8_copy_dialog(&mut self) {
+        self.close_confirm_armed = false;
+        let Some((tab_id, orig_path, content, default_name)) = self.workbench.active_tab().map(|t| {
+            let p = t.session.path.clone();
+            let default_name = match p.as_deref() {
+                Some(path) => {
+                    let stem = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("Untitled");
+                    match path.extension().and_then(|e| e.to_str()) {
+                        Some(ext) if !ext.is_empty() => format!("{stem}-utf8.{ext}"),
+                        _ => format!("{stem}-utf8.md"),
+                    }
+                }
+                None => "Untitled-utf8.md".to_string(),
+            };
+            (t.id, p, t.session.buffer.to_string(), default_name)
+        }) else {
+            return;
+        };
+        let Some(dest) = self
+            .save_dialog
+            .pick_save_as_path(orig_path.as_deref(), &default_name)
+        else {
+            self.set_notice("Save UTF-8 Copy cancelled");
+            return;
+        };
+        if let Some(orig) = orig_path.as_deref()
+            && paths_share_underlying_file(orig, &dest)
+        {
+            self.set_notice("Choose a new path — cannot overwrite original non-UTF-8 file directly");
+            return;
+        }
+        if let Some((other_idx, _, other_title)) =
+            self.workbench.find_other_tab_sharing_file(tab_id, &dest)
+        {
+            self.set_notice(format!(
+                "'{other_title}' is already open in tab {} — close that tab first or pick another file",
+                other_idx + 1
+            ));
+            return;
+        }
+        if let Some(parent) = dest.parent()
+            && !parent.as_os_str().is_empty()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            self.set_notice(format!("Save UTF-8 Copy failed: {err}"));
+            return;
+        }
+        if let Err(err) = atomic_write_file(&dest, content.as_bytes()) {
+            self.set_notice(format!("Save UTF-8 Copy failed: {err}"));
+            return;
+        }
+        self.flush_active_tab_before_switch();
+        match self.workbench.open_document(&dest) {
+            Ok(_) => {
+                self.ime_target = ImeTarget::None;
+                self.preferred_caret_x = None;
+                self.pending_scroll_ensure_caret = true;
+                let name = dest
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("copy.md");
+                self.set_notice(format!("Saved editable UTF-8 copy: {name}"));
+            }
+            Err(err) => self.set_notice(format!("Saved copy, but open failed: {err}")),
         }
     }
 
@@ -6032,6 +6732,88 @@ impl GuiController {
         candidates.into_iter().find(|p| p.is_file())
     }
 
+    fn open_find_bar(&mut self, show_replace: bool) {
+        self.close_confirm_armed = false;
+        self.close_transient_prompts();
+        self.find_open = true;
+        self.replace_open = show_replace;
+        if show_replace && !self.find_query.is_empty() {
+            self.find_focused = false;
+            self.replace_focused = true;
+        } else {
+            self.find_focused = true;
+            self.replace_focused = false;
+        }
+        if matches!(self.ime_target, ImeTarget::FindBox | ImeTarget::ReplaceBox) {
+            self.ime_target = ImeTarget::None;
+        }
+    }
+
+    fn close_find_bar(&mut self) {
+        self.find_open = false;
+        self.find_focused = false;
+        self.replace_focused = false;
+        self.active_find_range = None;
+        if matches!(self.ime_target, ImeTarget::FindBox | ImeTarget::ReplaceBox) {
+            self.ime_target = ImeTarget::None;
+        }
+    }
+
+    fn replace_in_active_tab(&mut self, all: bool) {
+        if self.find_query.is_empty() {
+            self.set_notice("Enter text to find");
+            return;
+        }
+        let query = self.find_query.clone();
+        let replacement = self.replace_text.clone();
+        let opts = self.find_options;
+        let outcome = {
+            let Some(tab) = self.workbench.active_tab_mut() else {
+                return;
+            };
+            if all {
+                tab.replace_all(&query, &replacement, opts)
+            } else {
+                tab.replace_current_or_next(&query, &replacement, true, opts)
+            }
+        };
+        match outcome {
+            Ok(Ok(res)) if res.replaced_count == 0 => {
+                self.active_find_range = None;
+                self.set_notice(if all {
+                    "No matches replaced"
+                } else {
+                    "No matches found"
+                });
+            }
+            Ok(Ok(res)) => {
+                self.pending_scroll_ensure_caret = true;
+                if all {
+                    self.active_find_range = None;
+                    self.set_notice(format!("Replaced {} match(es)", res.replaced_count));
+                } else {
+                    self.run_find_next(false);
+                    self.set_notice("Replaced 1 match");
+                }
+            }
+            Ok(Err(err)) => {
+                self.active_find_range = None;
+                self.set_notice(format!("Replace error: {err}"));
+            }
+            Err(err) => {
+                self.set_notice(format!("Read-only or blocked: {err}"));
+            }
+        }
+    }
+
+    fn run_replace_next(&mut self) {
+        self.replace_in_active_tab(false);
+    }
+
+    fn run_replace_all(&mut self) {
+        self.replace_in_active_tab(true);
+    }
+
     fn run_find_next(&mut self, advance: bool) {
         if self.find_query.is_empty() {
             self.active_find_range = None;
@@ -6076,6 +6858,18 @@ impl GuiController {
 }
 
 /// Active native `winit` + `wgpu` application handler.
+fn encoding_label(enc: DetectedEncoding) -> &'static str {
+    match enc {
+        DetectedEncoding::Utf8 => "UTF-8",
+        DetectedEncoding::Utf8Bom => "UTF-8 BOM",
+        DetectedEncoding::Utf16LeBom => "UTF-16 LE BOM",
+        DetectedEncoding::Utf16BeBom => "UTF-16 BE BOM",
+        DetectedEncoding::Utf16LeNoBom => "UTF-16 LE",
+        DetectedEncoding::Utf16BeNoBom => "UTF-16 BE",
+        DetectedEncoding::NonUtf8Ambiguous => "Non-UTF-8",
+    }
+}
+
 fn format_reading_time(secs: usize) -> String {
     if secs == 0 {
         "0m read".to_string()
@@ -8897,5 +9691,437 @@ Second duplicate body\n";
             ));
             assert!(!gui.workbench.config.fullscreen);
         }
+    }
+
+    #[test]
+    fn test_find_bar_whole_word_toggle_and_replace_next_replace_all() {
+        let mut wb = AppWorkbench::new(AppConfig::default(), None);
+        wb.new_document();
+        wb.active_tab_mut()
+            .unwrap()
+            .session
+            .buffer
+            .reset_content("foo foobar foo foo\n");
+        let mut gui = GuiController::new(wb);
+        let p_mod = primary_test_mod();
+
+        // Cmd/Ctrl+H opens Find + Replace bar focused on Find when query is empty
+        assert!(gui.handle_key_input(&Key::Character("h".into()), None, p_mod));
+        assert!(gui.find_open);
+        assert!(gui.replace_open);
+        assert!(gui.find_focused);
+        assert!(!gui.replace_focused);
+
+        for ch in "foo".chars() {
+            let s = ch.to_string();
+            assert!(gui.handle_key_input(
+                &Key::Character(s.as_str().into()),
+                Some(&s),
+                ModifiersState::empty(),
+            ));
+        }
+        let _ = gui.build_frame();
+        assert_eq!(gui.cached_meta.as_ref().unwrap().find_matches.len(), 4);
+
+        // Toggle whole-word ("W") button: "foobar" must no longer match (4 -> 3 matches)
+        let whole_word_rect = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::ToggleFindWholeWord))
+            .map(|z| z.rect)
+            .expect("expected W whole-word toggle button");
+        assert!(gui.handle_pointer_down(whole_word_rect.x + 2.0, whole_word_rect.y + 2.0));
+        assert!(gui.find_options.whole_word);
+        let _ = gui.build_frame();
+        assert_eq!(gui.cached_meta.as_ref().unwrap().find_matches.len(), 3);
+
+        // Tab cycles focus from Find input to Replace input
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Tab), None, ModifiersState::empty()));
+        assert!(!gui.find_focused);
+        assert!(gui.replace_focused);
+
+        for ch in "baz".chars() {
+            let s = ch.to_string();
+            assert!(gui.handle_key_input(
+                &Key::Character(s.as_str().into()),
+                Some(&s),
+                ModifiersState::empty(),
+            ));
+        }
+        assert_eq!(gui.replace_text, "baz");
+
+        // Enter in Replace input replaces current/next match
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "baz foobar foo foo\n"
+        );
+        assert!(gui.active_find_range.is_some());
+
+        // Clicking Replace All ("All") replaces remaining whole-word matches without touching "foobar"
+        let _ = gui.build_frame();
+        let all_rect = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::ReplaceAll))
+            .map(|z| z.rect)
+            .expect("expected Replace All button");
+        assert!(gui.handle_pointer_down(all_rect.x + 2.0, all_rect.y + 2.0));
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "baz foobar baz baz\n"
+        );
+
+        // IME commits route into ReplaceBox while Replace input is focused
+        let rep_input = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::FocusReplaceInput))
+            .map(|z| z.rect)
+            .expect("expected Replace input hit zone");
+        assert!(gui.handle_pointer_down(rep_input.x + 4.0, rep_input.y + 4.0));
+        assert!(gui.replace_focused);
+        gui.handle_ime_event(&Ime::Preedit("!".to_string(), Some((0, 1))));
+        assert_eq!(gui.ime_target, ImeTarget::ReplaceBox);
+        gui.handle_ime_event(&Ime::Commit("!".to_string()));
+        assert_eq!(gui.replace_text, "baz!");
+
+        // Escape closes Find & Replace cleanly; Cmd/Ctrl+Option+F re-opens it
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Escape), None, ModifiersState::empty()));
+        assert!(!gui.find_open);
+        assert!(!gui.find_focused);
+        assert!(!gui.replace_focused);
+
+        assert!(gui.handle_key_input_with_physical(
+            &Key::Character("ƒ".into()),
+            Some(PhysicalKey::Code(KeyCode::KeyF)),
+            None,
+            p_mod | ModifiersState::ALT,
+        ));
+        assert!(gui.find_open);
+        assert!(gui.replace_open);
+    }
+
+    #[test]
+    fn test_command_palette_filter_export_html_custom_css_and_prose_width() {
+        let dir = unique_test_dir("vellmark-gui-palette");
+        fs::create_dir_all(&dir).unwrap();
+        let doc_path = dir.join("note.md");
+        let export_path = dir.join("out").join("note.html");
+        let css_path = dir.join("custom.css");
+        fs::write(&doc_path, "# Heading\n\nBody copy.\n").unwrap();
+        fs::write(
+            &css_path,
+            ":root { --accent: #ff5500; }\nh1 { color: #123456; }\n",
+        )
+        .unwrap();
+
+        let dialog = Arc::new(MemorySaveDialog::new(None));
+        struct SharedDialog(Arc<MemorySaveDialog>);
+        impl SaveDialogBackend for SharedDialog {
+            fn pick_save_as_path(&self, cur: Option<&Path>, def: &str) -> Option<PathBuf> {
+                self.0.pick_save_as_path(cur, def)
+            }
+            fn pick_open_path(&self, cur_dir: Option<&Path>) -> Option<PathBuf> {
+                self.0.pick_open_path(cur_dir)
+            }
+            fn pick_open_folder(&self, cur_dir: Option<&Path>) -> Option<PathBuf> {
+                self.0.pick_open_folder(cur_dir)
+            }
+        }
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), None);
+        wb.open_document(&doc_path).unwrap();
+        let mut gui = GuiController::with_backends(
+            wb,
+            Box::new(MemoryClipboard::default()),
+            Box::new(SharedDialog(dialog.clone())),
+        );
+        let p_mod = primary_test_mod();
+
+        // Cmd/Ctrl+Shift+P opens Command Palette (distinct from Cmd/Ctrl+P Quick Open)
+        assert!(gui.handle_key_input(
+            &Key::Character("p".into()),
+            None,
+            p_mod | ModifiersState::SHIFT,
+        ));
+        assert!(gui.command_palette_open);
+        assert!(!gui.quick_open_open);
+
+        for ch in "html safe".chars() {
+            let s = ch.to_string();
+            assert!(gui.handle_key_input(
+                &Key::Character(s.as_str().into()),
+                Some(&s),
+                ModifiersState::empty(),
+            ));
+        }
+        assert_eq!(gui.command_palette_matches.len(), 1);
+        assert_eq!(
+            gui.command_palette_matches[0].id,
+            PaletteCommandId::ExportHtmlSafe
+        );
+
+        let _ = gui.build_frame();
+        assert!(gui
+            .ui_hit_zones
+            .iter()
+            .any(|z| matches!(z.action, UiAction::SelectCommandPaletteMatch(0))));
+
+        dialog.set_next_path(Some(export_path.clone()));
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert!(!gui.command_palette_open);
+        let exported = fs::read_to_string(&export_path).unwrap();
+        assert!(exported.contains("<!DOCTYPE html"));
+        assert!(exported.contains("Body copy."));
+
+        // Load Custom CSS via Command Palette
+        assert!(gui.handle_key_input(
+            &Key::Character("p".into()),
+            None,
+            p_mod | ModifiersState::SHIFT,
+        ));
+        for ch in "custom css".chars() {
+            let s = ch.to_string();
+            assert!(gui.handle_key_input(
+                &Key::Character(s.as_str().into()),
+                Some(&s),
+                ModifiersState::empty(),
+            ));
+        }
+        dialog.set_next_open_path(Some(css_path.clone()));
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert_eq!(gui.workbench.config.custom_theme_path, Some(css_path));
+        assert_eq!(
+            gui.workbench.theme.variables.get("--accent").map(String::as_str),
+            Some("#ff5500")
+        );
+
+        // Prose width preset (Wide 1080px) via Command Palette updates style.max_content_width_px
+        assert!(gui.handle_key_input(
+            &Key::Character("p".into()),
+            None,
+            p_mod | ModifiersState::SHIFT,
+        ));
+        for ch in "1080".chars() {
+            let s = ch.to_string();
+            assert!(gui.handle_key_input(
+                &Key::Character(s.as_str().into()),
+                Some(&s),
+                ModifiersState::empty(),
+            ));
+        }
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert_eq!(gui.workbench.config.max_content_width_px, 1080);
+        assert!((gui.style.max_content_width_px - 1080.0).abs() < 0.01);
+
+        // Switching back to built-in Dark theme clears custom_theme_path and custom CSS override
+        assert!(gui.handle_key_input(
+            &Key::Character("p".into()),
+            None,
+            p_mod | ModifiersState::SHIFT,
+        ));
+        for ch in "theme: dark".chars() {
+            let s = ch.to_string();
+            assert!(gui.handle_key_input(
+                &Key::Character(s.as_str().into()),
+                Some(&s),
+                ModifiersState::empty(),
+            ));
+        }
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert!(gui.workbench.config.custom_theme_path.is_none());
+        assert_eq!(gui.workbench.config.theme, BuiltinTheme::Dark);
+        let dark_html = gui.workbench.export_active_html(HtmlExportMode::Safe).unwrap();
+        assert!(!dark_html.contains("#ff5500"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_only_encoding_banner_status_label_and_save_utf8_copy() {
+        let dir = unique_test_dir("vellmark-gui-readonly-enc");
+        fs::create_dir_all(&dir).unwrap();
+        let orig_path = dir.join("utf16.md");
+        let copy_path = dir.join("utf16-utf8.md");
+
+        let mut utf16_bytes = vec![0xFFu8, 0xFEu8];
+        for unit in "# UTF16 Title\n\nBody text.\n".encode_utf16() {
+            utf16_bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(&orig_path, &utf16_bytes).unwrap();
+
+        let dialog = Arc::new(MemorySaveDialog::new(None));
+        struct SharedDialog(Arc<MemorySaveDialog>);
+        impl SaveDialogBackend for SharedDialog {
+            fn pick_save_as_path(&self, cur: Option<&Path>, def: &str) -> Option<PathBuf> {
+                self.0.pick_save_as_path(cur, def)
+            }
+        }
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), None);
+        wb.open_document(&orig_path).unwrap();
+        let mut gui = GuiController::with_backends(
+            wb,
+            Box::new(MemoryClipboard::default()),
+            Box::new(SharedDialog(dialog.clone())),
+        );
+
+        assert!(matches!(
+            gui.active_doc_banner_kind(),
+            Some(DocBannerKind::ReadOnlyEncoding {
+                candidate: DetectedEncoding::Utf16LeBom
+            })
+        ));
+        assert_eq!(encoding_label(DetectedEncoding::Utf16LeBom), "UTF-16 LE BOM");
+
+        // Replace All must fail gracefully without modifying ReadOnly buffer
+        gui.find_query = "Body".to_string();
+        gui.replace_text = "Edited".to_string();
+        gui.run_replace_all();
+        assert!(gui
+            .workbench
+            .active_tab()
+            .unwrap()
+            .session
+            .buffer
+            .to_string()
+            .contains("Body text."));
+        assert!(gui
+            .status_notice
+            .as_ref()
+            .is_some_and(|(msg, _)| msg.contains("Read-only")));
+
+        // Frame exposes Save UTF-8 Copy... button
+        let _ = gui.build_frame();
+        let copy_btn = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::SaveUtf8Copy))
+            .map(|z| z.rect)
+            .expect("expected Save UTF-8 Copy... banner button");
+
+        // Refuses to overwrite original non-UTF-8 file in-place
+        dialog.set_next_path(Some(orig_path.clone()));
+        assert!(gui.handle_pointer_down(copy_btn.x + 2.0, copy_btn.y + 2.0));
+        assert_eq!(fs::read(&orig_path).unwrap(), utf16_bytes);
+        assert!(gui
+            .status_notice
+            .as_ref()
+            .is_some_and(|(msg, _)| msg.contains("Choose a new path")));
+
+        // Refuses to overwrite a hard link aliasing the original non-UTF-8 inode
+        let hardlink_path = dir.join("utf16-hardlink.md");
+        fs::hard_link(&orig_path, &hardlink_path).unwrap();
+        dialog.set_next_path(Some(hardlink_path.clone()));
+        assert!(gui.handle_pointer_down(copy_btn.x + 2.0, copy_btn.y + 2.0));
+        assert_eq!(fs::read(&orig_path).unwrap(), utf16_bytes);
+        assert_eq!(fs::read(&hardlink_path).unwrap(), utf16_bytes);
+        assert!(gui
+            .status_notice
+            .as_ref()
+            .is_some_and(|(msg, _)| msg.contains("Choose a new path")));
+
+        // Refuses to overwrite another already-open tab's file (even if its tab holds stale ReadOnly state)
+        let other_ro_path = dir.join("other-ro.md");
+        let mut other_utf16 = vec![0xFFu8, 0xFEu8];
+        for unit in "# Other ReadOnly\n".encode_utf16() {
+            other_utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(&other_ro_path, &other_utf16).unwrap();
+        gui.workbench.open_document(&other_ro_path).unwrap();
+        // Switch back to the first tab (`orig_path`) before triggering Save UTF-8 Copy...
+        gui.workbench.active_tab_idx = Some(0);
+        dialog.set_next_path(Some(other_ro_path.clone()));
+        let _ = gui.build_frame();
+        let copy_btn_again = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::SaveUtf8Copy))
+            .map(|z| z.rect)
+            .expect("expected Save UTF-8 Copy... banner button");
+        assert!(gui.handle_pointer_down(copy_btn_again.x + 2.0, copy_btn_again.y + 2.0));
+        assert_eq!(fs::read(&other_ro_path).unwrap(), other_utf16);
+        assert_eq!(gui.workbench.active_tab_idx, Some(0));
+        assert!(gui
+            .status_notice
+            .as_ref()
+            .is_some_and(|(msg, _)| msg.contains("already open in tab")));
+
+        // Writing to a new path opens an editable UTF-8 tab while leaving original UTF-16LE file untouched
+        dialog.set_next_path(Some(copy_path.clone()));
+        assert!(gui.handle_pointer_down(copy_btn.x + 2.0, copy_btn.y + 2.0));
+        assert_eq!(fs::read(&orig_path).unwrap(), utf16_bytes);
+        assert_eq!(fs::read_to_string(&copy_path).unwrap(), "# UTF16 Title\n\nBody text.\n");
+
+        let active = gui.workbench.active_tab().unwrap();
+        assert_eq!(
+            active.session.format.decision,
+            EncodingDecision::Editable(DetectedEncoding::Utf8)
+        );
+        assert_eq!(active.session.state, DocState::Clean);
+        assert!(gui.active_doc_banner_kind().is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_find_bar_regex_replace_normalizes_crlf_line_endings() {
+        let dir = unique_test_dir("vellmark-gui-replace-crlf");
+        fs::create_dir_all(&dir).unwrap();
+        let doc_path = dir.join("crlf.md");
+        fs::write(&doc_path, b"A\r\nB\r\n").unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), None);
+        wb.open_document(&doc_path).unwrap();
+        let mut gui = GuiController::new(wb);
+        let p_mod = primary_test_mod();
+
+        assert!(gui.handle_key_input(&Key::Character("h".into()), None, p_mod));
+        let _ = gui.build_frame();
+        let regex_btn = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::ToggleFindRegex))
+            .map(|z| z.rect)
+            .expect("expected .* regex toggle button");
+        assert!(gui.handle_pointer_down(regex_btn.x + 2.0, regex_btn.y + 2.0));
+        assert!(gui.find_options.use_regex);
+
+        gui.find_query = "A".to_string();
+        gui.replace_text = r"X\nY".to_string();
+        let _ = gui.build_frame();
+        let rep_btn = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::ReplaceNext))
+            .map(|z| z.rect)
+            .expect("expected Rep button");
+        assert!(gui.handle_pointer_down(rep_btn.x + 2.0, rep_btn.y + 2.0));
+
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "X\r\nY\r\nB\r\n"
+        );
+        assert!(gui.handle_key_input(&Key::Character("s".into()), None, p_mod));
+        assert_eq!(fs::read(&doc_path).unwrap(), b"X\r\nY\r\nB\r\n");
+
+        // Mixed-EOL document: replacing `C\nD` via `$0` preserves its captured LF while
+        // template-inserted `\n` still normalizes to CRLF.
+        gui.workbench
+            .active_tab_mut()
+            .unwrap()
+            .session
+            .buffer
+            .reset_content("A\r\nB\r\nC\nD\r\n");
+        gui.find_query = r"C\nD".to_string();
+        gui.replace_text = "$0".to_string();
+        gui.run_replace_all();
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            "A\r\nB\r\nC\nD\r\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

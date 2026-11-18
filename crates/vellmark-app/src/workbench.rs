@@ -323,13 +323,14 @@ impl DocumentTab {
             selection_after: self.view.selection,
         };
         self.edit(|ctx| {
-            let res = vellmark_core::replace_match_in_buffer(
+            let res = vellmark_core::replace_match_in_buffer_with_line_ending(
                 ctx.buffer,
                 ctx.undo,
                 *ctx.selection,
                 &matched,
                 replacement,
                 options.use_regex,
+                ctx.preferred_line_ending,
             );
             *ctx.selection = res.selection_after;
             outcome = res;
@@ -364,13 +365,14 @@ impl DocumentTab {
                 selection_after: self.view.selection,
             });
         self.edit(|ctx| {
-            match vellmark_core::replace_all_in_buffer(
+            match vellmark_core::replace_all_in_buffer_with_line_ending(
                 ctx.buffer,
                 ctx.undo,
                 *ctx.selection,
                 query,
                 replacement,
                 options,
+                ctx.preferred_line_ending,
             ) {
                 Ok(res) => {
                     *ctx.selection = res.selection_after;
@@ -804,12 +806,11 @@ impl AppWorkbench {
         Ok(id)
     }
 
-    /// Return `(tab_idx, tab_id, title)` if any open tab other than `exclude_tab_id` is already
-    /// bound to the same canonical/equivalent file path (PRD 4.5.1 E single-document invariant).
-    pub fn find_other_tab_with_path(
+    fn find_other_tab_matching(
         &self,
         exclude_tab_id: u64,
         target: &Path,
+        matcher: impl Fn(&Path, &Path) -> bool,
     ) -> Option<(usize, u64, String)> {
         self.tabs
             .iter()
@@ -820,9 +821,33 @@ impl AppWorkbench {
                         .session
                         .path
                         .as_deref()
-                        .is_some_and(|p| paths_refer_to_same_file(p, target))
+                        .is_some_and(|p| matcher(p, target))
             })
             .map(|(idx, tab)| (idx, tab.id, tab.title()))
+    }
+
+    /// Return `(tab_idx, tab_id, title)` if any open tab other than `exclude_tab_id` is already
+    /// bound to the same canonical/equivalent file path (PRD 4.5.1 E single-document invariant).
+    pub fn find_other_tab_with_path(
+        &self,
+        exclude_tab_id: u64,
+        target: &Path,
+    ) -> Option<(usize, u64, String)> {
+        self.find_other_tab_matching(exclude_tab_id, target, paths_refer_to_same_file)
+    }
+
+    /// Return `(tab_idx, tab_id, title)` if any open tab other than `exclude_tab_id` refers to
+    /// the same path or shares the same underlying file identity (e.g., hard link).
+    pub fn find_other_tab_sharing_file(
+        &self,
+        exclude_tab_id: u64,
+        target: &Path,
+    ) -> Option<(usize, u64, String)> {
+        self.find_other_tab_matching(
+            exclude_tab_id,
+            target,
+            vellmark_core::paths_share_underlying_file,
+        )
     }
 
     /// Save tab `tab_id` to `new_path`, refusing to bind a second independent tab to a file path
@@ -1099,6 +1124,23 @@ impl AppWorkbench {
     pub fn load_custom_theme_css(&mut self, css: &str) {
         self.custom_theme_css = Some(css.to_string());
         self.theme = ThemeSheet::parse_css(css);
+    }
+
+    pub fn select_builtin_theme(
+        &mut self,
+        follow_system: bool,
+        theme_opt: Option<vellmark_theme::BuiltinTheme>,
+    ) {
+        self.config.follow_system_theme = follow_system;
+        self.config.custom_theme_path = None;
+        self.custom_theme_css = None;
+        if let Some(theme) = theme_opt {
+            self.config.theme = theme;
+        }
+        self.theme = self
+            .config
+            .effective_builtin_theme(self.system_prefers_dark)
+            .load();
     }
 
     /// Export active document to standalone HTML using the active theme CSS (PRD 4.6 X-01 & 4.8 S-04).

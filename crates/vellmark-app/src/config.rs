@@ -271,7 +271,7 @@ language = \"{lang_name}\"\n",
             && !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
-        fs::write(path, self.to_toml_string())
+        vellmark_core::atomic_write_file(path, self.to_toml_string().as_bytes())
     }
 
     pub fn load_from_file(path: &Path) -> io::Result<Self> {

@@ -91,6 +91,28 @@ struct CaseFoldScratch {
     orig_offsets: Vec<(usize, usize)>,
 }
 
+fn push_folded_char(out: &mut String, ch: char) {
+    if ch.is_ascii() {
+        out.push(ch.to_ascii_lowercase());
+    } else if ch == '\u{03C2}' {
+        // Unify Greek final sigma (ς) with medial/non-final sigma (σ) so query and line
+        // fold identically without context-sensitive Final_Sigma mismatches.
+        out.push('\u{03C3}');
+    } else {
+        for lc in ch.to_lowercase() {
+            out.push(if lc == '\u{03C2}' { '\u{03C3}' } else { lc });
+        }
+    }
+}
+
+fn fold_query_string(query: &str) -> String {
+    let mut folded = String::with_capacity(query.len());
+    for ch in query.chars() {
+        push_folded_char(&mut folded, ch);
+    }
+    folded
+}
+
 fn find_query_in_line(
     clean_line: &str,
     needle: &str,
@@ -116,13 +138,7 @@ fn find_query_in_line(
     for (orig_idx, ch) in clean_line.char_indices() {
         let folded_start = scratch.folded.len();
         scratch.orig_offsets.push((folded_start, orig_idx));
-        if ch.is_ascii() {
-            scratch.folded.push(ch.to_ascii_lowercase());
-        } else {
-            for lc in ch.to_lowercase() {
-                scratch.folded.push(lc);
-            }
-        }
+        push_folded_char(&mut scratch.folded, ch);
     }
 
     let match_pos = scratch.folded.find(needle)?;
@@ -157,7 +173,7 @@ pub fn global_workspace_search_with_cancel(
     let q_needle = if case_sensitive {
         query.to_string()
     } else {
-        query.to_lowercase()
+        fold_query_string(query)
     };
 
     let mut results = Vec::new();
@@ -626,6 +642,26 @@ mod tests {
         let hits_title = global_workspace_search(&root, "标题", false).unwrap();
         assert_eq!(hits_title.len(), 1);
         assert_eq!(hits_title[0].line_byte_offset, 2);
+
+        // Greek Final_Sigma consistency: "ΟΣ" query ("ος") must match uppercase "ΟΣ",
+        // prefix inside "ΚΟΣΜΟΣ", and lowercase medial/final sigma ("οσ" / "ος") identically.
+        fs::write(
+            root.join("greek.md"),
+            "ΟΣ\nΚΟΣΜΟΣ\nοσ\nκόσμος\n",
+        )
+        .unwrap();
+        let greek_hits_upper = global_workspace_search(&root, "ΟΣ", false).unwrap();
+        assert_eq!(greek_hits_upper.len(), 4);
+        assert_eq!(greek_hits_upper[0].line_byte_offset, 0);
+        assert_eq!(greek_hits_upper[1].line_byte_offset, "ΟΣ\nΚ".len());
+        assert_eq!(greek_hits_upper[2].line_byte_offset, "ΟΣ\nΚΟΣΜΟΣ\n".len());
+        assert_eq!(
+            greek_hits_upper[3].line_byte_offset,
+            "ΟΣ\nΚΟΣΜΟΣ\nοσ\nκόσμ".len()
+        );
+
+        let final_sigma_only = global_workspace_search(&root, "Σ", false).unwrap();
+        assert_eq!(final_sigma_only.len(), 4);
 
         // Case-sensitive search keeps exact codepoint distinction
         let hits_cs = global_workspace_search(&root, "k", true).unwrap();

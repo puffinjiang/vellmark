@@ -168,7 +168,7 @@ fn run_export(args: &[String]) -> ExitCode {
     };
 
     if let Some(out) = opts.output_path {
-        if let Err(e) = fs::write(&out, html_doc) {
+        if let Err(e) = vellmark_core::atomic_write_file(&out, html_doc.as_bytes()) {
             eprintln!("Failed to write {}: {e}", out.display());
             return ExitCode::FAILURE;
         }
@@ -250,6 +250,55 @@ mod tests {
             .expect("raw export");
         assert!(raw_html.contains("<script>alert(1)</script>"));
         assert!(raw_html.contains("#123456"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_export_succeeds_for_245_byte_filename() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "vellmark-cli-longname-{}-{uniq}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+
+        let md_path = root.join("src.md");
+        fs::write(&md_path, "# Long Export\n\nBody").expect("write md");
+
+        let long_name = format!("{}.html", "x".repeat(240));
+        assert_eq!(long_name.len(), 245);
+        let out_path = root.join(&long_name);
+        fs::write(&out_path, "stale").expect("seed existing target");
+
+        let args = vec![
+            md_path.to_string_lossy().into_owned(),
+            "-o".to_string(),
+            out_path.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run_export(&args), ExitCode::SUCCESS);
+        let exported = fs::read_to_string(&out_path).expect("read exported html");
+        assert!(exported.contains("Long Export"));
+
+        let fifo_path = root.join("pipe.html");
+        if std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            let fifo_args = vec![
+                md_path.to_string_lossy().into_owned(),
+                "-o".to_string(),
+                fifo_path.to_string_lossy().into_owned(),
+            ];
+            assert_eq!(run_export(&fifo_args), ExitCode::FAILURE);
+            let meta = fs::symlink_metadata(&fifo_path).expect("fifo should remain");
+            assert!(!meta.is_file());
+        }
 
         let _ = fs::remove_dir_all(&root);
     }

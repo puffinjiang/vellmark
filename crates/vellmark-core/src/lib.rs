@@ -47,12 +47,14 @@ pub use state::{
     AutoMergeOutcome, ConflictActionOutcome, ConflictDiffKind, ConflictDiffLine, DiskSnapshot,
     DocState, DocumentSession, ExternalSyncResult, MergeConflictHunk, PendingRecoveryEntry,
     RECOVERY_META_FILENAME, RecoveryMeta, RecoveryPayload, RecoverySlotReport, RecoveryWorker,
-    SaveOutcome, SessionError, paths_refer_to_same_file, scan_recovery_root,
+    SaveOutcome, SessionError, atomic_write_file, paths_refer_to_same_file,
+    paths_share_underlying_file, scan_recovery_root,
 };
 pub use stats::{DocumentStats, count_text_metrics};
 pub use find_replace::{
     FindError, FindMatch, FindOptions, FindReplaceOutcome, find_all_matches, find_next_match,
-    find_prev_match, replace_all_in_buffer, replace_match_in_buffer,
+    find_prev_match, replace_all_in_buffer, replace_all_in_buffer_with_line_ending,
+    replace_match_in_buffer, replace_match_in_buffer_with_line_ending,
 };
 pub use undo::{EditKind, EditOp, Transaction, UndoHistory, syntax_conversion_escape_op};
 pub use workspace::{FileTreeNode, RecentFilesList, is_supported_document};

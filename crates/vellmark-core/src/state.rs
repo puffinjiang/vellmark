@@ -2164,6 +2164,117 @@ pub fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
     a == b || canonicalize_lossy(a) == canonicalize_lossy(b)
 }
 
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> Option<(u32, u32, u32)> {
+    use std::ffi::OsStr;
+    use std::mem::MaybeUninit;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+    #[repr(C)]
+    struct FileTime {
+        _low: u32,
+        _high: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        _dw_file_attributes: u32,
+        _ft_creation_time: FileTime,
+        _ft_last_access_time: FileTime,
+        _ft_last_write_time: FileTime,
+        dw_volume_serial_number: u32,
+        _n_file_size_high: u32,
+        _n_file_size_low: u32,
+        _n_number_of_links: u32,
+        n_file_index_high: u32,
+        n_file_index_low: u32,
+    }
+
+    type RawHandle = *mut core::ffi::c_void;
+    const INVALID_HANDLE_VALUE: RawHandle = -1isize as RawHandle;
+    const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *const core::ffi::c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: RawHandle,
+        ) -> RawHandle;
+        fn GetFileInformationByHandle(
+            h_file: RawHandle,
+            lp_file_information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut wide: Vec<u16> = OsStr::new(path).encode_wide().collect();
+    if wide.contains(&0) {
+        return None;
+    }
+    wide.push(0);
+
+    // SAFETY: `wide` is NUL-terminated UTF-16, `dwDesiredAccess = 0` avoids data access/locking,
+    // and valid handles are immediately transferred to `OwnedHandle` so they are closed on drop.
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_ALL,
+            core::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            core::ptr::null_mut(),
+        )
+    };
+    if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut info = MaybeUninit::<ByHandleFileInformation>::uninit();
+    let ok = unsafe { GetFileInformationByHandle(handle.as_raw_handle(), info.as_mut_ptr()) };
+    if ok == 0 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    if info.n_file_index_high == 0 && info.n_file_index_low == 0 {
+        return None;
+    }
+    Some((
+        info.dw_volume_serial_number,
+        info.n_file_index_high,
+        info.n_file_index_low,
+    ))
+}
+
+/// Return `true` when `a` and `b` refer to the same path or share the same underlying
+/// filesystem file identity (e.g., hard links or symlink-to-hardlink aliases).
+///
+/// Underlying file-ID comparison is implemented on Unix `(dev, ino)` and Windows
+/// (`GetFileInformationByHandle` volume serial + file index); other platforms fall back to
+/// `paths_refer_to_same_file`.
+pub fn paths_share_underlying_file(a: &Path, b: &Path) -> bool {
+    if paths_refer_to_same_file(a, b) {
+        return true;
+    }
+    #[cfg(unix)]
+    if let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) {
+        use std::os::unix::fs::MetadataExt;
+        return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+    }
+    #[cfg(windows)]
+    if let (Some(ida), Some(idb)) = (windows_file_identity(a), windows_file_identity(b)) {
+        return ida == idb;
+    }
+    false
+}
+
 fn resolve_symlink_target_for_write(target: &Path) -> std::io::Result<PathBuf> {
     match fs::canonicalize(target) {
         Ok(canon) => Ok(canon),
@@ -2219,47 +2330,70 @@ fn resolve_write_target_and_permissions(
                 "refusing to overwrite directory",
             ));
         }
+        Ok(meta) if !meta.is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to overwrite special file",
+            ));
+        }
         Ok(_) => target.to_path_buf(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => target.to_path_buf(),
         Err(e) => return Err(e),
     };
 
-    if fs::metadata(&write_target).is_ok_and(|m| m.is_dir()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "refusing to overwrite directory",
-        ));
-    }
-
-    let existing_perms = if preserve_permissions {
-        fs::metadata(&write_target).ok().map(|m| m.permissions())
-    } else {
-        None
+    let existing_meta = match fs::metadata(&write_target) {
+        Ok(meta) if meta.is_dir() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to overwrite directory",
+            ));
+        }
+        Ok(meta) if !meta.is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to overwrite special file",
+            ));
+        }
+        Ok(meta) => Some(meta),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
     };
+
+    let existing_perms = preserve_permissions
+        .then_some(existing_meta)
+        .flatten()
+        .map(|m| m.permissions());
 
     Ok((write_target, existing_perms))
 }
 
-fn atomic_write_resolved(
-    write_target: &Path,
-    bytes: &[u8],
-    existing_perms: Option<fs::Permissions>,
-) -> std::io::Result<()> {
-    let parent = match write_target.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let file_name = write_target
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("vellmark");
-    let seq = NEXT_ATOMIC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = parent.join(format!(
-        ".{file_name}.{}.{seq}.vellmark.tmp",
-        std::process::id()
-    ));
+fn bounded_temp_name_prefix(file_name: &str) -> &str {
+    const MAX_PREFIX_BYTES: usize = 48;
+    let mut end = file_name.len().min(MAX_PREFIX_BYTES);
+    while end > 0 && !file_name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let trimmed = file_name[..end].trim_end_matches('.');
+    if trimmed.is_empty() {
+        "vellmark"
+    } else {
+        trimmed
+    }
+}
 
-    let write_res = (|| -> std::io::Result<()> {
+fn create_unique_atomic_temp_file_with_seq(
+    parent: &Path,
+    prefix: &str,
+    existing_perms: Option<&fs::Permissions>,
+    seq_source: &AtomicU64,
+) -> std::io::Result<(PathBuf, File)> {
+    const MAX_ATTEMPTS: usize = 64;
+    let pid = std::process::id();
+    let mut last_already_exists = None;
+
+    for _ in 0..MAX_ATTEMPTS {
+        let seq = seq_source.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{prefix}.{pid}.{seq}.vellmark.tmp"));
         let mut opts = fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -2270,7 +2404,53 @@ fn atomic_write_resolved(
                 opts.mode(0o600);
             }
         }
-        let mut f = opts.open(&tmp_path)?;
+        match opts.open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_already_exists = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_already_exists.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "unable to allocate unique temporary file",
+        )
+    }))
+}
+
+fn atomic_write_resolved(
+    write_target: &Path,
+    bytes: &[u8],
+    existing_perms: Option<fs::Permissions>,
+) -> std::io::Result<()> {
+    atomic_write_resolved_with_seq(write_target, bytes, existing_perms, &NEXT_ATOMIC_TMP_SEQ)
+}
+
+fn atomic_write_resolved_with_seq(
+    write_target: &Path,
+    bytes: &[u8],
+    existing_perms: Option<fs::Permissions>,
+    seq_source: &AtomicU64,
+) -> std::io::Result<()> {
+    let parent = match write_target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let file_name = write_target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("vellmark");
+    let prefix = bounded_temp_name_prefix(file_name);
+
+    // Only clean up `tmp_path` after `create_unique_atomic_temp_file_with_seq` succeeds so an
+    // existing colliding path is never removed on `AlreadyExists`.
+    let (tmp_path, mut f) =
+        create_unique_atomic_temp_file_with_seq(parent, prefix, existing_perms.as_ref(), seq_source)?;
+
+    let write_res = (|| -> std::io::Result<()> {
         f.write_all(bytes)?;
         if let Some(perms) = existing_perms {
             #[cfg(unix)]
@@ -2287,6 +2467,7 @@ fn atomic_write_resolved(
         Ok(())
     })();
 
+    drop(f);
     if let Err(e) = write_res {
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
@@ -5308,6 +5489,124 @@ mod tests {
         );
 
         drop(session);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_paths_share_underlying_file_detects_hard_links_and_symlinks() {
+        let root = unique_temp_dir("share-underlying-file");
+        let file_a = root.join("orig.md");
+        let hardlink = root.join("orig-hardlink.md");
+        let other = root.join("other.md");
+        fs::write(&file_a, b"orig").unwrap();
+        fs::write(&other, b"other").unwrap();
+        fs::hard_link(&file_a, &hardlink).unwrap();
+
+        assert!(paths_share_underlying_file(&file_a, &file_a));
+        assert!(paths_share_underlying_file(&file_a, &hardlink));
+        assert!(!paths_share_underlying_file(&file_a, &other));
+
+        #[cfg(unix)]
+        {
+            let symlink = root.join("orig-symlink.md");
+            std::os::unix::fs::symlink(&hardlink, &symlink).unwrap();
+            assert!(paths_share_underlying_file(&file_a, &symlink));
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_atomic_write_file_supports_long_ascii_and_multibyte_filenames() {
+        assert_eq!(bounded_temp_name_prefix(&"x".repeat(245)).len(), 48);
+        let mixed = format!("ab{}", "文".repeat(20));
+        let cut = bounded_temp_name_prefix(&mixed);
+        assert!(cut.len() <= 48);
+        assert_eq!(cut, format!("ab{}", "文".repeat(15)));
+        assert_eq!(bounded_temp_name_prefix("..."), "vellmark");
+
+        #[cfg(unix)]
+        {
+            let root = unique_temp_dir("atomic-long-name");
+            let long_ascii = root.join(format!("{}.md", "a".repeat(242)));
+            assert_eq!(long_ascii.file_name().unwrap().to_str().unwrap().len(), 245);
+            atomic_write_file(&long_ascii, b"first\n").unwrap();
+            assert_eq!(fs::read(&long_ascii).unwrap(), b"first\n");
+            atomic_write_file(&long_ascii, b"second\n").unwrap();
+            assert_eq!(fs::read(&long_ascii).unwrap(), b"second\n");
+
+            let long_cjk = root.join(format!("{}.md", "文".repeat(79)));
+            assert_eq!(long_cjk.file_name().unwrap().to_str().unwrap().len(), 240);
+            atomic_write_file(&long_cjk, b"cjk ok\n").unwrap();
+            assert_eq!(fs::read(&long_cjk).unwrap(), b"cjk ok\n");
+
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn test_atomic_write_retries_temp_collision_and_never_deletes_existing_files() {
+        let root = unique_temp_dir("atomic-tmp-collision");
+        let pid = std::process::id();
+
+        let doc = root.join("doc.md");
+        let collide_1 = root.join(format!(".doc.md.{pid}.1.vellmark.tmp"));
+        let collide_2 = root.join(format!(".doc.md.{pid}.2.vellmark.tmp"));
+        fs::write(&collide_1, b"keep-1").unwrap();
+        fs::write(&collide_2, b"keep-2").unwrap();
+
+        let seq = AtomicU64::new(1);
+        atomic_write_resolved_with_seq(&doc, b"written\n", None, &seq).unwrap();
+        assert_eq!(fs::read(&doc).unwrap(), b"written\n");
+        assert_eq!(fs::read(&collide_1).unwrap(), b"keep-1");
+        assert_eq!(fs::read(&collide_2).unwrap(), b"keep-2");
+
+        let exhaust = root.join("exhaust.md");
+        let mut exhaust_paths = Vec::new();
+        for n in 1..=64u64 {
+            let p = root.join(format!(".exhaust.md.{pid}.{n}.vellmark.tmp"));
+            fs::write(&p, b"keep-exhaust").unwrap();
+            exhaust_paths.push(p);
+        }
+        let err = atomic_write_resolved_with_seq(
+            &exhaust,
+            b"should-fail",
+            None,
+            &AtomicU64::new(1),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!exhaust.exists());
+        for p in exhaust_paths {
+            assert_eq!(fs::read(&p).unwrap(), b"keep-exhaust");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_refuses_special_files() {
+        let root = unique_temp_dir("atomic-special-file");
+        let fifo = root.join("out.fifo");
+        if std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            let err = atomic_write_file(&fifo, b"html").unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            let meta = fs::symlink_metadata(&fifo).unwrap();
+            assert!(!meta.is_file() && !meta.is_dir());
+
+            let symlink = root.join("link.fifo");
+            std::os::unix::fs::symlink(&fifo, &symlink).unwrap();
+            let link_err = atomic_write_file(&symlink, b"html").unwrap_err();
+            assert_eq!(link_err.kind(), std::io::ErrorKind::InvalidInput);
+            let fifo_meta = fs::symlink_metadata(&fifo).unwrap();
+            assert!(!fifo_meta.is_file() && !fifo_meta.is_dir());
+        }
+
         let _ = fs::remove_dir_all(&root);
     }
 }
