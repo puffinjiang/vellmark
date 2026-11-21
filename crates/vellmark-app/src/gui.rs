@@ -13,8 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use vellmark_core::{
     AutoMergeOutcome, ByteRange, ConflictActionOutcome, ConflictDiffKind, DetectedEncoding,
     DocState, DocumentStats, EditorAction, EncodingDecision, ExternalSyncResult, FindMatch,
-    FindOptions, LineEnding, SaveOutcome, Selection, TableAlign, ViewMode, atomic_write_file,
-    count_text_metrics, paths_share_underlying_file,
+    FindOptions, HistoricalBackupEntry, LineEnding, SaveOutcome, Selection, TableAlign, ViewMode,
+    atomic_write_file, count_text_metrics, paths_share_underlying_file,
 };
 use vellmark_export::HtmlExportMode;
 use vellmark_parser::{
@@ -138,6 +138,7 @@ impl SaveDialogBackend for MemorySaveDialog {
     }
 }
 
+#[cfg(any(unix, test))]
 fn parse_dialog_stdout_path(stdout: &[u8]) -> Option<PathBuf> {
     // Strip ONLY the single trailing LF appended by the Unix dialog CLI (`osascript`/`zenity`).
     // Never call `.trim()` or strip CRLF, so valid filenames ending in spaces or `\r` (e.g. `Icon\r`)
@@ -159,10 +160,12 @@ fn parse_dialog_stdout_path(stdout: &[u8]) -> Option<PathBuf> {
     }
 }
 
+#[cfg(any(unix, test))]
 fn existing_default_dialog_dir(current_path: Option<&Path>) -> Option<&Path> {
     existing_dir_or_ancestor(current_path, true)
 }
 
+#[cfg(any(unix, test))]
 fn existing_dir_or_ancestor(path: Option<&Path>, start_from_parent: bool) -> Option<&Path> {
     let start = if start_from_parent {
         path.and_then(|p| p.parent())?
@@ -754,6 +757,11 @@ enum UiAction {
     CloseCommandPalette,
     SelectCommandPaletteMatch(usize),
     FocusCommandPaletteInput,
+    CloseInspectModal,
+    FocusInspectModalInput,
+    SelectInspectModalRow(usize),
+    ReloadCustomTheme,
+    DeleteSelectedRecoveryBackup,
 }
 
 #[derive(Debug, Clone)]
@@ -778,12 +786,19 @@ enum FilePromptMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectModalKind {
+    ThemeDiagnostics,
+    RecoveryBackups,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaletteCommandId {
     FileNew,
     FileOpen,
     FileOpenFolder,
     FileSave,
     FileSaveAs,
+    ManageRecoveryBackups,
     ExportHtmlSafe,
     ExportHtmlRaw,
     QuickOpen,
@@ -800,12 +815,14 @@ enum PaletteCommandId {
     InsertLink,
     ToggleTableAutoAlign,
     ToggleCodeLineNumbers,
+    ToggleNetworkImages,
     ThemeFollowSystem,
     ThemeLight,
     ThemeDark,
     ThemeAcademic,
     ThemeGithub,
     LoadCustomThemeCss,
+    ShowThemeDiagnostics,
     ProseWidthNarrow,
     ProseWidthBalanced,
     ProseWidthWide,
@@ -827,6 +844,7 @@ const PALETTE_COMMANDS: &[PaletteCommandEntry] = &[
     PaletteCommandEntry { id: PaletteCommandId::FileOpenFolder, label: "File: Open Folder...", shortcut: "Cmd/Ctrl+Shift+O" },
     PaletteCommandEntry { id: PaletteCommandId::FileSave, label: "File: Save", shortcut: "Cmd/Ctrl+S" },
     PaletteCommandEntry { id: PaletteCommandId::FileSaveAs, label: "File: Save As...", shortcut: "Cmd/Ctrl+Shift+S" },
+    PaletteCommandEntry { id: PaletteCommandId::ManageRecoveryBackups, label: "File: Manage Recovery & Safety Backups...", shortcut: "" },
     PaletteCommandEntry { id: PaletteCommandId::ExportHtmlSafe, label: "Export: Standalone HTML (Safe Mode)...", shortcut: "" },
     PaletteCommandEntry { id: PaletteCommandId::ExportHtmlRaw, label: "Export: Standalone HTML (Raw)...", shortcut: "" },
     PaletteCommandEntry { id: PaletteCommandId::QuickOpen, label: "Go: Quick Open File...", shortcut: "Cmd/Ctrl+P" },
@@ -843,12 +861,14 @@ const PALETTE_COMMANDS: &[PaletteCommandEntry] = &[
     PaletteCommandEntry { id: PaletteCommandId::ToggleSidebar, label: "View: Toggle Sidebar", shortcut: "Cmd/Ctrl+\\" },
     PaletteCommandEntry { id: PaletteCommandId::ToggleTableAutoAlign, label: "Table: Toggle Auto-Align Source on Edit", shortcut: "" },
     PaletteCommandEntry { id: PaletteCommandId::ToggleCodeLineNumbers, label: "Editor: Toggle Code Block Line Numbers", shortcut: "Cmd/Ctrl+Shift+L" },
+    PaletteCommandEntry { id: PaletteCommandId::ToggleNetworkImages, label: "Images: Toggle Allow Network Images", shortcut: "" },
     PaletteCommandEntry { id: PaletteCommandId::ThemeFollowSystem, label: "Theme: Follow System Appearance", shortcut: "" },
     PaletteCommandEntry { id: PaletteCommandId::ThemeLight, label: "Theme: Light", shortcut: "Cmd/Ctrl+Shift+T" },
     PaletteCommandEntry { id: PaletteCommandId::ThemeDark, label: "Theme: Dark", shortcut: "" },
     PaletteCommandEntry { id: PaletteCommandId::ThemeAcademic, label: "Theme: Academic", shortcut: "" },
     PaletteCommandEntry { id: PaletteCommandId::ThemeGithub, label: "Theme: GitHub", shortcut: "" },
     PaletteCommandEntry { id: PaletteCommandId::LoadCustomThemeCss, label: "Theme: Load Custom CSS File...", shortcut: "" },
+    PaletteCommandEntry { id: PaletteCommandId::ShowThemeDiagnostics, label: "Theme: Show Theme Diagnostics...", shortcut: "" },
     PaletteCommandEntry { id: PaletteCommandId::ProseWidthNarrow, label: "Layout: Prose Width Compact (720px)", shortcut: "" },
     PaletteCommandEntry { id: PaletteCommandId::ProseWidthBalanced, label: "Layout: Prose Width Balanced (860px)", shortcut: "" },
     PaletteCommandEntry { id: PaletteCommandId::ProseWidthWide, label: "Layout: Prose Width Wide (1080px)", shortcut: "" },
@@ -911,6 +931,7 @@ enum ImeTarget {
     CodeLangBox,
     GlobalSearchBox,
     CommandPaletteBox,
+    InspectModalBox,
     InsertTableBox,
     FileNameBox,
 }
@@ -957,6 +978,10 @@ pub struct GuiController {
     pub command_palette_query: String,
     command_palette_matches: Vec<PaletteCommandEntry>,
     command_palette_selected: usize,
+    pub inspect_modal: Option<InspectModalKind>,
+    pub inspect_modal_query: String,
+    inspect_modal_selected: usize,
+    inspect_recovery_backups: Vec<HistoricalBackupEntry>,
     insert_table_open: bool,
     insert_table_input: String,
     file_prompt_mode: Option<FilePromptMode>,
@@ -1059,6 +1084,10 @@ impl GuiController {
             command_palette_query: String::new(),
             command_palette_matches: Vec::new(),
             command_palette_selected: 0,
+            inspect_modal: None,
+            inspect_modal_query: String::new(),
+            inspect_modal_selected: 0,
+            inspect_recovery_backups: Vec::new(),
             insert_table_open: false,
             insert_table_input: String::new(),
             file_prompt_mode: None,
@@ -1296,6 +1325,8 @@ impl GuiController {
             self.last_external_poll = now;
             let poll_events = self.workbench.poll_external_changes(false);
             changed |= self.apply_runtime_events(poll_events);
+            changed |= self.poll_custom_theme_hot_reload(false);
+            let _ = self.workbench.flush_pending_persistence();
         }
         changed
     }
@@ -1323,7 +1354,9 @@ impl GuiController {
     pub fn handle_focus_gained(&mut self) -> bool {
         self.last_external_poll = Instant::now();
         let events = self.workbench.poll_external_changes(true);
-        let changed = self.apply_runtime_events(events);
+        let mut changed = self.apply_runtime_events(events);
+        changed |= self.poll_custom_theme_hot_reload(true);
+        let _ = self.workbench.flush_pending_persistence();
         self.trigger_background_maintenance(false);
         self.reset_blink();
         changed
@@ -1486,6 +1519,9 @@ impl GuiController {
         }
         if self.command_palette_open {
             self.build_command_palette_modal(&mut chrome_layer, layout.editor);
+        }
+        if self.inspect_modal.is_some() {
+            self.build_inspect_modal(&mut chrome_layer, layout.editor);
         }
         if self.insert_table_open || self.file_prompt_mode.is_some() {
             self.build_simple_prompt_modal(&mut chrome_layer, layout.editor);
@@ -2677,6 +2713,92 @@ impl GuiController {
         );
     }
 
+    fn build_inspect_modal(&mut self, dl: &mut DrawList, editor_rect: Rect) {
+        let Some(kind) = self.inspect_modal else {
+            return;
+        };
+        let query = self.inspect_modal_query.clone();
+        let selected = self.inspect_modal_selected;
+        match kind {
+            InspectModalKind::ThemeDiagnostics => {
+                let indices = self.filtered_theme_diagnostic_indices();
+                let rows: Vec<ListPickerRow> = indices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot_idx, &diag_idx)| {
+                        let d = self.workbench.theme.diagnostics.get(diag_idx)?;
+                        Some(ListPickerRow {
+                            label: format!("{} — {}", d.item, d.reason),
+                            badge: Some(d.selector.clone()),
+                            action: UiAction::SelectInspectModalRow(slot_idx),
+                        })
+                    })
+                    .collect();
+                let empty_msg = if query.trim().is_empty() {
+                    "No unsupported CSS rules — active theme matches Vellmark CSS subset"
+                } else {
+                    "No matching theme diagnostics"
+                };
+                let header_btn = self
+                    .workbench
+                    .config
+                    .custom_theme_path
+                    .as_ref()
+                    .map(|_| ("Reload", false, UiAction::ReloadCustomTheme));
+                self.draw_list_picker_modal(
+                    dl,
+                    editor_rect,
+                    &query,
+                    "Theme Diagnostics — filter unsupported CSS rules...",
+                    empty_msg,
+                    selected,
+                    UiAction::FocusInspectModalInput,
+                    UiAction::CloseInspectModal,
+                    header_btn,
+                    rows,
+                );
+            }
+            InspectModalKind::RecoveryBackups => {
+                let indices = self.filtered_recovery_backup_indices();
+                let rows: Vec<ListPickerRow> = indices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot_idx, &entry_idx)| {
+                        let entry = self.inspect_recovery_backups.get(entry_idx)?;
+                        let source_name = entry
+                            .source_path
+                            .as_deref()
+                            .and_then(|p| p.file_name())
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("(untitled draft)");
+                        Some(ListPickerRow {
+                            label: format!("{source_name} — {}", entry.reason.as_slug()),
+                            badge: Some(format!("{} B", entry.payload_len)),
+                            action: UiAction::SelectInspectModalRow(slot_idx),
+                        })
+                    })
+                    .collect();
+                let empty_msg = if query.trim().is_empty() {
+                    "No historical recovery or conflict safety backups found"
+                } else {
+                    "No matching recovery backups"
+                };
+                self.draw_list_picker_modal(
+                    dl,
+                    editor_rect,
+                    &query,
+                    "Recovery Backups — Enter to restore draft, Del/Cmd+Backspace to delete...",
+                    empty_msg,
+                    selected,
+                    UiAction::FocusInspectModalInput,
+                    UiAction::CloseInspectModal,
+                    Some(("Del", false, UiAction::DeleteSelectedRecoveryBackup)),
+                    rows,
+                );
+            }
+        }
+    }
+
     fn build_code_lang_modal(&mut self, dl: &mut DrawList, editor_rect: Rect) {
         let query = self.code_lang_query.clone();
         let selected = self.code_lang_selected;
@@ -2859,7 +2981,7 @@ impl GuiController {
         });
 
         let input_right = if let Some((toggle_label, toggle_on, toggle_action)) = header_toggle {
-            let toggle_w = 28.0;
+            let toggle_w = (toggle_label.chars().count() as f32 * 7.2 + 12.0).max(28.0);
             let toggle_rect = Rect::new(close_rect.x - toggle_w - 6.0, modal.y + 8.0, toggle_w, 24.0);
             dl.rects.push(
                 SceneRect::rounded(
@@ -3437,6 +3559,8 @@ impl GuiController {
             Some(ImeTarget::FileNameBox)
         } else if self.command_palette_open {
             Some(ImeTarget::CommandPaletteBox)
+        } else if self.inspect_modal.is_some() {
+            Some(ImeTarget::InspectModalBox)
         } else if self.global_search_open {
             Some(ImeTarget::GlobalSearchBox)
         } else if self.quick_open_open {
@@ -3462,6 +3586,7 @@ impl GuiController {
             ImeTarget::InsertTableBox => self.insert_table_open,
             ImeTarget::FileNameBox => self.file_prompt_mode.is_some(),
             ImeTarget::CommandPaletteBox => self.command_palette_open,
+            ImeTarget::InspectModalBox => self.inspect_modal.is_some(),
             ImeTarget::GlobalSearchBox => self.global_search_open,
             ImeTarget::QuickOpenBox => self.quick_open_open,
             ImeTarget::LinkPromptBox => self.link_prompt_open,
@@ -3504,6 +3629,11 @@ impl GuiController {
             ImeTarget::CommandPaletteBox => {
                 self.command_palette_query.push_str(text);
                 self.refresh_command_palette_matches();
+                true
+            }
+            ImeTarget::InspectModalBox => {
+                self.inspect_modal_query.push_str(text);
+                self.inspect_modal_selected = 0;
                 true
             }
             ImeTarget::InsertTableBox => {
@@ -3550,6 +3680,7 @@ impl GuiController {
                         | ImeTarget::CodeLangBox
                         | ImeTarget::GlobalSearchBox
                         | ImeTarget::CommandPaletteBox
+                        | ImeTarget::InspectModalBox
                         | ImeTarget::InsertTableBox
                         | ImeTarget::FileNameBox => {}
                         ImeTarget::Tab(target_id) => {
@@ -3607,6 +3738,7 @@ impl GuiController {
                     | ImeTarget::CodeLangBox
                     | ImeTarget::GlobalSearchBox
                     | ImeTarget::CommandPaletteBox
+                    | ImeTarget::InspectModalBox
                     | ImeTarget::InsertTableBox
                     | ImeTarget::FileNameBox => {
                         self.commit_overlay_text(target, committed);
@@ -3660,12 +3792,23 @@ impl GuiController {
             let _ = self.apply_runtime_events(auto_events);
         }
         self.workbench.flush_all_recoveries();
+        let _ = self
+            .workbench
+            .flush_pending_persistence_with_timeout(crate::config::CLOSE_PERSISTENCE_LOCK_TIMEOUT);
         let first_unsaved = self
             .workbench
             .tabs
             .iter()
             .position(|t| t.session.state != DocState::Clean);
         let Some(idx) = first_unsaved else {
+            if self.workbench.has_pending_persistence() && !self.close_confirm_armed {
+                self.close_confirm_armed = true;
+                self.find_focused = false;
+                self.set_notice(
+                    "Settings or recent files are locked by another instance — close again to retry or exit without saving them",
+                );
+                return false;
+            }
             self.workbench.maintain_recovery_storage();
             return true;
         };
@@ -3675,23 +3818,28 @@ impl GuiController {
             self.find_focused = false;
             let state = self.workbench.tabs[idx].session.state;
             let title = self.workbench.tabs[idx].title();
+            let pending_suffix = if self.workbench.has_pending_persistence() {
+                " (settings/recent files also locked by another instance)"
+            } else {
+                ""
+            };
             match state {
                 DocState::Conflict => {
                     self.conflict_diff_open = true;
                     self.set_notice(format!(
-                        "External conflict in '{title}' — resolve or close again to archive backup & exit"
+                        "External conflict in '{title}' — resolve or close again to archive backup & exit{pending_suffix}"
                     ));
                 }
                 DocState::Missing {
                     has_local_edits: true,
                 } => {
                     self.set_notice(format!(
-                        "Missing file '{title}' has unsaved changes — Save As or close again to backup & exit"
+                        "Missing file '{title}' has unsaved changes — Save As or close again to backup & exit{pending_suffix}"
                     ));
                 }
                 _ => {
                     self.set_notice(format!(
-                        "Unsaved changes in '{title}' — Save (Cmd/Ctrl+S) or close again to discard"
+                        "Unsaved changes in '{title}' — Save (Cmd/Ctrl+S) or close again to discard{pending_suffix}"
                     ));
                 }
             }
@@ -3964,6 +4112,7 @@ impl GuiController {
                     }
                     "\\" => {
                         self.workbench.config.sidebar_visible = !self.workbench.config.sidebar_visible;
+                        self.persist_user_config();
                         return true;
                     }
                     "t" if shift => {
@@ -3976,16 +4125,22 @@ impl GuiController {
                     }
                     "=" | "+" => {
                         self.workbench.config.zoom_in();
+                        self.refresh_style();
+                        self.persist_user_config();
                         self.set_notice(format!("Zoom {}%", self.workbench.config.zoom_percent));
                         return true;
                     }
                     "-" => {
                         self.workbench.config.zoom_out();
+                        self.refresh_style();
+                        self.persist_user_config();
                         self.set_notice(format!("Zoom {}%", self.workbench.config.zoom_percent));
                         return true;
                     }
                     "0" => {
                         self.workbench.config.reset_zoom();
+                        self.refresh_style();
+                        self.persist_user_config();
                         self.set_notice("Zoom 100%");
                         return true;
                     }
@@ -4184,6 +4339,36 @@ impl GuiController {
                 ListModalAction::QueryAppend(txt) => {
                     self.command_palette_query.push_str(&txt);
                     self.refresh_command_palette_matches();
+                }
+                ListModalAction::None => {}
+            }
+            return true;
+        }
+
+        if let Some(kind) = self.inspect_modal {
+            if kind == InspectModalKind::RecoveryBackups
+                && (matches!(logical_key, Key::Named(NamedKey::Delete))
+                    || ((primary || ctrl) && matches!(logical_key, Key::Named(NamedKey::Backspace))))
+            {
+                self.delete_selected_recovery_backup();
+                return true;
+            }
+            match decode_list_modal_key(logical_key, text, primary, ctrl) {
+                ListModalAction::Close => self.close_inspect_modal(),
+                ListModalAction::MoveSelection(delta) => {
+                    let len = self.filtered_inspect_modal_len();
+                    move_list_selection(&mut self.inspect_modal_selected, len, delta);
+                }
+                ListModalAction::Confirm => {
+                    self.confirm_inspect_modal_row(self.inspect_modal_selected);
+                }
+                ListModalAction::QueryBackspace => {
+                    self.inspect_modal_query.pop();
+                    self.inspect_modal_selected = 0;
+                }
+                ListModalAction::QueryAppend(txt) => {
+                    self.inspect_modal_query.push_str(&txt);
+                    self.inspect_modal_selected = 0;
                 }
                 ListModalAction::None => {}
             }
@@ -4520,6 +4705,7 @@ impl GuiController {
             }
             UiAction::ToggleSidebar => {
                 self.workbench.config.sidebar_visible = !self.workbench.config.sidebar_visible;
+                self.persist_user_config();
                 true
             }
             UiAction::SwitchSidebarSection(sec) => {
@@ -4567,7 +4753,10 @@ impl GuiController {
                     let normalized: PathBuf = path.components().collect();
                     match self.workbench.open_folder(&normalized) {
                         Ok(()) => {
-                            self.workbench.config.sidebar_visible = true;
+                            if !self.workbench.config.sidebar_visible {
+                                self.workbench.config.sidebar_visible = true;
+                                self.persist_user_config();
+                            }
                             self.sidebar_section = SidebarSection::Files;
                             self.collapsed_dirs.clear();
                             self.selected_workspace_path = None;
@@ -4771,7 +4960,8 @@ impl GuiController {
             | UiAction::FocusQuickOpenInput
             | UiAction::FocusCodeLangInput
             | UiAction::FocusGlobalSearchInput
-            | UiAction::FocusCommandPaletteInput => true,
+            | UiAction::FocusCommandPaletteInput
+            | UiAction::FocusInspectModalInput => true,
             UiAction::CloseQuickOpen => {
                 self.close_quick_open();
                 true
@@ -4790,6 +4980,7 @@ impl GuiController {
             UiAction::ToggleCodeLineNumbers => {
                 self.workbench.config.show_code_line_numbers =
                     !self.workbench.config.show_code_line_numbers;
+                self.persist_user_config();
                 let on = self.workbench.config.show_code_line_numbers;
                 self.set_notice(if on {
                     "Code Line Numbers: ON"
@@ -4833,6 +5024,22 @@ impl GuiController {
             }
             UiAction::SelectCommandPaletteMatch(idx) => {
                 self.confirm_command_palette_match(idx);
+                true
+            }
+            UiAction::CloseInspectModal => {
+                self.close_inspect_modal();
+                true
+            }
+            UiAction::SelectInspectModalRow(slot_idx) => {
+                self.confirm_inspect_modal_row(slot_idx);
+                true
+            }
+            UiAction::ReloadCustomTheme => {
+                self.reload_custom_theme_now();
+                true
+            }
+            UiAction::DeleteSelectedRecoveryBackup => {
+                self.delete_selected_recovery_backup();
                 true
             }
         }
@@ -4955,7 +5162,7 @@ impl GuiController {
         match outcome {
             SaveOutcome::SavedClean | SaveOutcome::SavedButStillDirty { .. } => {
                 self.conflict_diff_open = false;
-                self.workbench.recent_files.record_open(dest);
+                self.workbench.record_recent_path(dest);
                 self.workbench.refresh_tab_conflict_backup_count(tab_id);
                 if notice_with_path {
                     self.set_notice(format!("Saved {}", dest.display()));
@@ -5044,7 +5251,7 @@ impl GuiController {
                     }
                     ExternalSyncResult::BecameMissing
                 } else {
-                    self.workbench.recent_files.record_open(&new_path);
+                    self.workbench.record_recent_path(&new_path);
                     self.workbench.refresh_tab_conflict_backup_count(tab_id);
                     match self.workbench.tabs.iter_mut().find(|t| t.id == tab_id) {
                         Some(cur) => cur.sync_from_disk(true),
@@ -5396,6 +5603,7 @@ impl GuiController {
             ImeTarget::CodeLangBox => self.refresh_code_lang_matches(),
             ImeTarget::GlobalSearchBox => self.schedule_global_search(false),
             ImeTarget::CommandPaletteBox => self.refresh_command_palette_matches(),
+            ImeTarget::InspectModalBox => self.inspect_modal_selected = 0,
             ImeTarget::ReplaceBox
             | ImeTarget::LinkPromptBox
             | ImeTarget::InsertTableBox
@@ -5414,6 +5622,7 @@ impl GuiController {
             ImeTarget::CodeLangBox => &self.code_lang_query,
             ImeTarget::GlobalSearchBox => &self.global_search_query,
             ImeTarget::CommandPaletteBox => &self.command_palette_query,
+            ImeTarget::InspectModalBox => &self.inspect_modal_query,
             ImeTarget::InsertTableBox => &self.insert_table_input,
             ImeTarget::FileNameBox => &self.file_prompt_input,
             ImeTarget::None | ImeTarget::Tab(_) => "",
@@ -5429,6 +5638,7 @@ impl GuiController {
             ImeTarget::CodeLangBox => self.code_lang_query.clear(),
             ImeTarget::GlobalSearchBox => self.global_search_query.clear(),
             ImeTarget::CommandPaletteBox => self.command_palette_query.clear(),
+            ImeTarget::InspectModalBox => self.inspect_modal_query.clear(),
             ImeTarget::InsertTableBox => self.insert_table_input.clear(),
             ImeTarget::FileNameBox => self.file_prompt_input.clear(),
             ImeTarget::None | ImeTarget::Tab(_) => {}
@@ -5537,6 +5747,7 @@ impl GuiController {
                 | ImeTarget::CodeLangBox
                 | ImeTarget::GlobalSearchBox
                 | ImeTarget::CommandPaletteBox
+                | ImeTarget::InspectModalBox
                 | ImeTarget::InsertTableBox
                 | ImeTarget::FileNameBox => plain.trim_matches(&['\r', '\n'][..]),
                 ImeTarget::None | ImeTarget::Tab(_) => "",
@@ -5564,6 +5775,7 @@ impl GuiController {
         self.global_search_open = false;
         self.cancel_active_global_search();
         self.command_palette_open = false;
+        self.inspect_modal = None;
         self.insert_table_open = false;
         self.file_prompt_mode = None;
         if matches!(
@@ -5573,6 +5785,7 @@ impl GuiController {
                 | ImeTarget::CodeLangBox
                 | ImeTarget::GlobalSearchBox
                 | ImeTarget::CommandPaletteBox
+                | ImeTarget::InspectModalBox
                 | ImeTarget::InsertTableBox
                 | ImeTarget::FileNameBox
         ) {
@@ -5626,7 +5839,10 @@ impl GuiController {
         let normalized: PathBuf = folder.components().collect();
         match self.workbench.open_folder(&normalized) {
             Ok(()) => {
-                self.workbench.config.sidebar_visible = true;
+                if !self.workbench.config.sidebar_visible {
+                    self.workbench.config.sidebar_visible = true;
+                    self.persist_user_config();
+                }
                 self.sidebar_section = SidebarSection::Files;
                 self.collapsed_dirs.clear();
                 self.selected_workspace_path = None;
@@ -5734,6 +5950,224 @@ impl GuiController {
         self.execute_palette_command(picked.id);
     }
 
+    fn persist_user_config(&mut self) {
+        let _ = self.workbench.persist_config();
+    }
+
+    fn poll_custom_theme_hot_reload(&mut self, force: bool) -> bool {
+        let Some((name, diag_count)) = self.workbench.poll_custom_theme_reload(force) else {
+            return false;
+        };
+        self.refresh_style();
+        if diag_count > 0 {
+            self.set_notice(format!(
+                "Hot-reloaded theme CSS: {name} ({diag_count} unsupported rule(s) ignored)"
+            ));
+        } else {
+            self.set_notice(format!("Hot-reloaded theme CSS: {name}"));
+        }
+        true
+    }
+
+    fn reload_custom_theme_now(&mut self) {
+        let Some(path) = self.workbench.config.custom_theme_path.clone() else {
+            self.set_notice("No custom theme CSS configured");
+            return;
+        };
+        match self.workbench.load_custom_theme_file(&path) {
+            Ok(diag_count) => {
+                self.refresh_style();
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("custom.css");
+                if diag_count > 0 {
+                    self.set_notice(format!(
+                        "Reloaded theme CSS: {name} ({diag_count} unsupported rule(s) ignored)"
+                    ));
+                } else {
+                    self.set_notice(format!("Reloaded theme CSS: {name}"));
+                }
+            }
+            Err(err) => self.set_notice(format!("Failed to reload CSS {}: {err}", path.display())),
+        }
+    }
+
+    /// Open an inspect/management modal (`ThemeDiagnostics` or `RecoveryBackups`).
+    pub fn open_inspect_modal(&mut self, kind: InspectModalKind) {
+        self.close_confirm_armed = false;
+        self.close_transient_prompts();
+        self.find_focused = false;
+        self.replace_focused = false;
+        let active_id = self.workbench.active_tab().map(|t| t.id);
+        self.cancel_abandoned_tab_ime(active_id);
+        self.inspect_modal = Some(kind);
+        self.inspect_modal_query.clear();
+        self.inspect_modal_selected = 0;
+        if kind == InspectModalKind::RecoveryBackups {
+            self.inspect_recovery_backups = self.workbench.list_history_backups();
+        }
+    }
+
+    fn close_inspect_modal(&mut self) {
+        self.inspect_modal = None;
+        if self.ime_target == ImeTarget::InspectModalBox {
+            self.ime_target = ImeTarget::None;
+        }
+    }
+
+    fn filtered_theme_diagnostic_indices(&self) -> Vec<usize> {
+        let terms: Vec<String> = self
+            .inspect_modal_query
+            .split_whitespace()
+            .map(|t| t.to_ascii_lowercase())
+            .collect();
+        self.workbench
+            .theme
+            .diagnostics
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, d)| {
+                if terms.is_empty() {
+                    return Some(idx);
+                }
+                let hay = format!("{} {} {}", d.selector, d.item, d.reason).to_ascii_lowercase();
+                terms.iter().all(|term| hay.contains(term)).then_some(idx)
+            })
+            .collect()
+    }
+
+    fn filtered_recovery_backup_indices(&self) -> Vec<usize> {
+        let terms: Vec<String> = self
+            .inspect_modal_query
+            .split_whitespace()
+            .map(|t| t.to_ascii_lowercase())
+            .collect();
+        self.inspect_recovery_backups
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| {
+                if terms.is_empty() {
+                    return Some(idx);
+                }
+                let source = entry
+                    .source_path
+                    .as_deref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "untitled".to_string());
+                let hay = format!(
+                    "{source} {} {}",
+                    entry.reason.as_slug(),
+                    entry.path.to_string_lossy()
+                )
+                .to_ascii_lowercase();
+                terms.iter().all(|term| hay.contains(term)).then_some(idx)
+            })
+            .collect()
+    }
+
+    fn filtered_inspect_modal_len(&self) -> usize {
+        match self.inspect_modal {
+            Some(InspectModalKind::ThemeDiagnostics) => {
+                self.filtered_theme_diagnostic_indices().len()
+            }
+            Some(InspectModalKind::RecoveryBackups) => {
+                self.filtered_recovery_backup_indices().len()
+            }
+            None => 0,
+        }
+    }
+
+    fn confirm_inspect_modal_row(&mut self, slot_idx: usize) {
+        let Some(kind) = self.inspect_modal else {
+            return;
+        };
+        match kind {
+            InspectModalKind::ThemeDiagnostics => {
+                let indices = self.filtered_theme_diagnostic_indices();
+                let Some(&diag_idx) = indices.get(slot_idx) else {
+                    return;
+                };
+                self.inspect_modal_selected = slot_idx;
+                if let Some(d) = self.workbench.theme.diagnostics.get(diag_idx) {
+                    self.set_notice(format!("CSS [{}] {}: {}", d.selector, d.item, d.reason));
+                }
+            }
+            InspectModalKind::RecoveryBackups => {
+                let indices = self.filtered_recovery_backup_indices();
+                let Some(&entry_idx) = indices.get(slot_idx) else {
+                    return;
+                };
+                let Some(entry) = self.inspect_recovery_backups.get(entry_idx).cloned() else {
+                    return;
+                };
+                self.close_inspect_modal();
+                self.flush_active_tab_before_switch();
+                match self.workbench.restore_history_backup_as_draft(&entry.path) {
+                    Ok(_) => {
+                        self.find_focused = false;
+                        self.ime_target = ImeTarget::None;
+                        self.preferred_caret_x = None;
+                        self.pending_scroll_ensure_caret = true;
+                        let source_name = entry
+                            .source_path
+                            .as_deref()
+                            .and_then(|p| p.file_name())
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("untitled draft");
+                        self.set_notice(format!(
+                            "Restored backup ({}) from {source_name} as new draft tab",
+                            entry.reason.as_slug()
+                        ));
+                    }
+                    Err(err) => self.set_notice(format!("Restore backup failed: {err}")),
+                }
+            }
+        }
+    }
+
+    fn delete_selected_recovery_backup(&mut self) {
+        if self.inspect_modal != Some(InspectModalKind::RecoveryBackups) {
+            return;
+        }
+        let indices = self.filtered_recovery_backup_indices();
+        if indices.is_empty() {
+            self.set_notice("No recovery backup selected");
+            return;
+        }
+        let slot = self.inspect_modal_selected.min(indices.len() - 1);
+        let Some(&entry_idx) = indices.get(slot) else {
+            return;
+        };
+        let Some(entry) = self.inspect_recovery_backups.get(entry_idx).cloned() else {
+            return;
+        };
+        match self.workbench.delete_history_backup(&entry.path) {
+            Ok(deleted) => {
+                self.inspect_recovery_backups = self.workbench.list_history_backups();
+                let new_len = self.filtered_recovery_backup_indices().len();
+                self.inspect_modal_selected = if new_len == 0 {
+                    0
+                } else {
+                    slot.min(new_len - 1)
+                };
+                self.trigger_background_maintenance(true);
+                let name = entry
+                    .source_path
+                    .as_deref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("backup");
+                if deleted {
+                    self.set_notice(format!("Deleted recovery backup for {name}"));
+                } else {
+                    self.set_notice(format!("Recovery backup for {name} was already removed"));
+                }
+            }
+            Err(err) => self.set_notice(format!("Delete backup failed: {err}")),
+        }
+    }
+
     fn apply_builtin_theme_selection(
         &mut self,
         follow_system: bool,
@@ -5742,6 +6176,7 @@ impl GuiController {
         self.workbench
             .select_builtin_theme(follow_system, theme_opt);
         self.refresh_style();
+        self.persist_user_config();
         let effective = self
             .workbench
             .config
@@ -5756,6 +6191,7 @@ impl GuiController {
     fn set_prose_width_px(&mut self, width_px: u32, label: &str) {
         self.workbench.config.max_content_width_px = width_px;
         self.refresh_style();
+        self.persist_user_config();
         self.set_notice(format!("Prose width: {label} ({width_px}px)"));
     }
 
@@ -5777,6 +6213,9 @@ impl GuiController {
             PaletteCommandId::FileSaveAs => self.save_as_active_tab(),
             PaletteCommandId::ExportHtmlSafe => self.export_active_html_dialog(HtmlExportMode::Safe),
             PaletteCommandId::ExportHtmlRaw => self.export_active_html_dialog(HtmlExportMode::Raw),
+            PaletteCommandId::ManageRecoveryBackups => {
+                self.open_inspect_modal(InspectModalKind::RecoveryBackups);
+            }
             PaletteCommandId::QuickOpen => self.open_quick_open(),
             PaletteCommandId::GlobalSearch => self.open_global_search(),
             PaletteCommandId::Find => self.open_find_bar(false),
@@ -5790,12 +6229,14 @@ impl GuiController {
             PaletteCommandId::ToggleFullscreen => self.toggle_fullscreen(),
             PaletteCommandId::ToggleSidebar => {
                 self.workbench.config.sidebar_visible = !self.workbench.config.sidebar_visible;
+                self.persist_user_config();
             }
             PaletteCommandId::InsertTable => self.open_insert_table_prompt(),
             PaletteCommandId::InsertCodeBlock => self.insert_or_pick_code_block(),
             PaletteCommandId::InsertLink => self.open_link_prompt(),
             PaletteCommandId::ToggleTableAutoAlign => {
                 self.workbench.config.table_auto_align = !self.workbench.config.table_auto_align;
+                self.persist_user_config();
                 let on = self.workbench.config.table_auto_align;
                 if let Some(tab) = self.workbench.active_tab_mut() {
                     tab.view.table_auto_align = on;
@@ -5808,6 +6249,18 @@ impl GuiController {
             }
             PaletteCommandId::ToggleCodeLineNumbers => {
                 let _ = self.execute_ui_action(UiAction::ToggleCodeLineNumbers);
+            }
+            PaletteCommandId::ToggleNetworkImages => {
+                self.workbench.config.allow_network_images =
+                    !self.workbench.config.allow_network_images;
+                self.persist_user_config();
+                self.image_cache.invalidate_remote_entries();
+                let on = self.workbench.config.allow_network_images;
+                self.set_notice(if on {
+                    "Network Images: ON"
+                } else {
+                    "Network Images: OFF"
+                });
             }
             PaletteCommandId::ThemeFollowSystem => {
                 self.apply_builtin_theme_selection(true, None);
@@ -5825,22 +6278,28 @@ impl GuiController {
                 self.apply_builtin_theme_selection(false, Some(BuiltinTheme::GitHub));
             }
             PaletteCommandId::LoadCustomThemeCss => self.load_custom_theme_dialog(),
+            PaletteCommandId::ShowThemeDiagnostics => {
+                self.open_inspect_modal(InspectModalKind::ThemeDiagnostics);
+            }
             PaletteCommandId::ProseWidthNarrow => self.set_prose_width_px(720, "Compact"),
             PaletteCommandId::ProseWidthBalanced => self.set_prose_width_px(860, "Balanced"),
             PaletteCommandId::ProseWidthWide => self.set_prose_width_px(1080, "Wide"),
             PaletteCommandId::ZoomIn => {
                 self.workbench.config.zoom_in();
                 self.refresh_style();
+                self.persist_user_config();
                 self.set_notice(format!("Zoom {}%", self.workbench.config.zoom_percent));
             }
             PaletteCommandId::ZoomOut => {
                 self.workbench.config.zoom_out();
                 self.refresh_style();
+                self.persist_user_config();
                 self.set_notice(format!("Zoom {}%", self.workbench.config.zoom_percent));
             }
             PaletteCommandId::ZoomReset => {
                 self.workbench.config.reset_zoom();
                 self.refresh_style();
+                self.persist_user_config();
                 self.set_notice("Zoom 100%");
             }
         }
@@ -5909,25 +6368,22 @@ impl GuiController {
             self.set_notice("Load Custom CSS cancelled");
             return;
         };
-        let css = match fs::read_to_string(&path) {
-            Ok(text) => text,
+        let diag_count = match self.workbench.load_custom_theme_file(&path) {
+            Ok(count) => count,
             Err(err) => {
                 self.set_notice(format!("Failed to read CSS {}: {err}", path.display()));
                 return;
             }
         };
-        self.workbench.config.follow_system_theme = false;
-        self.workbench.config.custom_theme_path = Some(path.clone());
-        self.workbench.load_custom_theme_css(&css);
         self.refresh_style();
-        let diag_count = self.workbench.theme.diagnostics.len();
+        self.persist_user_config();
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("custom.css");
         if diag_count > 0 {
             self.set_notice(format!(
-                "Loaded theme CSS: {name} ({diag_count} unsupported rule(s) ignored)"
+                "Loaded theme CSS: {name} ({diag_count} unsupported rule(s) — open Theme Diagnostics)"
             ));
         } else {
             self.set_notice(format!("Loaded theme CSS: {name}"));
@@ -6357,12 +6813,14 @@ impl GuiController {
 
     pub fn toggle_focus_mode(&mut self) {
         self.workbench.config.focus_mode = !self.workbench.config.focus_mode;
+        self.persist_user_config();
         let on = self.workbench.config.focus_mode;
         self.set_notice(if on { "Focus Mode: ON" } else { "Focus Mode: OFF" });
     }
 
     pub fn toggle_typewriter_mode(&mut self) {
         self.workbench.config.typewriter_mode = !self.workbench.config.typewriter_mode;
+        self.persist_user_config();
         let on = self.workbench.config.typewriter_mode;
         if on {
             self.pending_scroll_ensure_caret = true;
@@ -6376,6 +6834,7 @@ impl GuiController {
 
     pub fn toggle_fullscreen(&mut self) {
         self.workbench.config.fullscreen = !self.workbench.config.fullscreen;
+        self.persist_user_config();
         let on = self.workbench.config.fullscreen;
         self.set_notice(if on { "Fullscreen: ON" } else { "Fullscreen: OFF" });
     }
@@ -10121,6 +10580,385 @@ Second duplicate body\n";
             gui.workbench.active_tab().unwrap().session.buffer.to_string(),
             "A\r\nB\r\nC\nD\r\n"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_config_persistence_custom_css_hot_reload_and_theme_diagnostics_modal() {
+        let dir = unique_test_dir("vellmark-gui-css-hotreload");
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let recent_path = dir.join("recent-files.txt");
+        let css_path = dir.join("theme.css");
+        let doc_path = dir.join("note.md");
+
+        fs::write(&doc_path, "# Hello\n").unwrap();
+        fs::write(
+            &css_path,
+            ":root { --bg-color: #112233; }\n#write { background-color: var(--bg-color); }\nbody { position: fixed; }\n",
+        )
+        .unwrap();
+
+        let dialog = Arc::new(MemorySaveDialog::new(None));
+        struct SharedDialog(Arc<MemorySaveDialog>);
+        impl SaveDialogBackend for SharedDialog {
+            fn pick_save_as_path(&self, cur: Option<&Path>, def: &str) -> Option<PathBuf> {
+                self.0.pick_save_as_path(cur, def)
+            }
+            fn pick_open_path(&self, cur: Option<&Path>) -> Option<PathBuf> {
+                self.0.pick_open_path(cur)
+            }
+        }
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), None);
+        wb.set_persistence_paths(Some(config_path.clone()), Some(recent_path.clone()));
+        wb.open_document(&doc_path).unwrap();
+
+        let mut gui = GuiController::with_backends(
+            wb,
+            Box::new(MemoryClipboard::default()),
+            Box::new(SharedDialog(dialog.clone())),
+        );
+        let p_mod = primary_test_mod();
+
+        // Recent file open is persisted to disk automatically
+        let loaded_recent = vellmark_core::RecentFilesList::load_from_file(&recent_path, 10).unwrap();
+        assert_eq!(loaded_recent.entries.len(), 1);
+        assert!(paths_share_underlying_file(&loaded_recent.entries[0], &doc_path));
+
+        // Load custom CSS via Command Palette -> persists config + updates style + records diagnostics
+        dialog.set_next_open_path(Some(css_path.clone()));
+        gui.execute_palette_command(PaletteCommandId::LoadCustomThemeCss);
+        assert_eq!(
+            gui.workbench.theme.variables.get("--bg-color").map(String::as_str),
+            Some("#112233")
+        );
+        assert!(!gui.workbench.theme.diagnostics.is_empty());
+        let saved_cfg = AppConfig::load_from_file(&config_path).unwrap();
+        assert_eq!(saved_cfg.custom_theme_path.as_deref(), Some(css_path.as_path()));
+        assert!(!saved_cfg.follow_system_theme);
+
+        // Zoom shortcut updates style & persists zoom_percent
+        assert!(gui.handle_key_input(&Key::Character("+".into()), None, p_mod));
+        let saved_cfg_zoom = AppConfig::load_from_file(&config_path).unwrap();
+        assert_eq!(saved_cfg_zoom.zoom_percent, 110);
+
+        // Hot-reload custom CSS on disk via tick_runtime_at (even with same byte length!)
+        fs::write(
+            &css_path,
+            ":root { --bg-color: #445566; }\n#write { background-color: var(--bg-color); }\n.card { animation: spin; }\n",
+        )
+        .unwrap();
+        let bg_before = gui.style.bg_color;
+        assert_eq!(bg_before, vellmark_render::RgbaColor::rgb(0x11, 0x22, 0x33));
+        assert!(gui.tick_runtime_at(Instant::now() + EXTERNAL_POLL_INTERVAL + Duration::from_millis(50)));
+        assert_eq!(
+            gui.workbench.theme.variables.get("--bg-color").map(String::as_str),
+            Some("#445566")
+        );
+        assert_eq!(gui.style.bg_color, vellmark_render::RgbaColor::rgb(0x44, 0x55, 0x66));
+        assert_ne!(gui.style.bg_color, bg_before);
+        assert!(gui
+            .status_notice
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("Hot-reloaded theme CSS")));
+
+        // Open Theme Diagnostics modal via Command Palette, filter rules, select row, and click Reload
+        gui.execute_palette_command(PaletteCommandId::ShowThemeDiagnostics);
+        assert_eq!(gui.inspect_modal, Some(InspectModalKind::ThemeDiagnostics));
+        let _ = gui.build_frame();
+        assert!(gui
+            .ui_hit_zones
+            .iter()
+            .any(|z| matches!(z.action, UiAction::ReloadCustomTheme)));
+        assert!(gui.handle_key_input(
+            &Key::Character("card".into()),
+            Some("card"),
+            ModifiersState::empty(),
+        ));
+        assert_eq!(gui.filtered_theme_diagnostic_indices().len(), 1);
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert!(gui
+            .status_notice
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("CSS [")));
+
+        // Manual Reload button updates diagnostics and style when CSS is cleaned up
+        fs::write(
+            &css_path,
+            ":root { --bg-color: #778899; }\n#write { background-color: var(--bg-color); }\n",
+        )
+        .unwrap();
+        let _ = gui.build_frame();
+        let reload_btn = gui
+            .ui_hit_zones
+            .iter()
+            .find(|z| matches!(z.action, UiAction::ReloadCustomTheme))
+            .map(|z| z.rect)
+            .expect("expected Reload button in Theme Diagnostics modal");
+        assert!(gui.handle_pointer_down(reload_btn.x + 2.0, reload_btn.y + 2.0));
+        assert_eq!(
+            gui.workbench.theme.variables.get("--bg-color").map(String::as_str),
+            Some("#778899")
+        );
+        assert_eq!(gui.style.bg_color, vellmark_render::RgbaColor::rgb(0x77, 0x88, 0x99));
+        assert!(gui.workbench.theme.diagnostics.is_empty());
+
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Escape), None, ModifiersState::empty()));
+        assert!(gui.inspect_modal.is_none());
+
+        // Toggle Network Images via Command Palette persists to config.toml
+        assert!(gui.workbench.config.allow_network_images);
+        gui.execute_palette_command(PaletteCommandId::ToggleNetworkImages);
+        assert!(!gui.workbench.config.allow_network_images);
+        assert!(!AppConfig::load_from_file(&config_path).unwrap().allow_network_images);
+        gui.execute_palette_command(PaletteCommandId::ToggleNetworkImages);
+        assert!(gui.workbench.config.allow_network_images);
+        assert!(AppConfig::load_from_file(&config_path).unwrap().allow_network_images);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_recovery_backups_modal_restore_draft_and_delete() {
+        let dir = unique_test_dir("vellmark-gui-recovery-modal");
+        let rec_root = dir.join("recovery");
+        fs::create_dir_all(&rec_root).unwrap();
+
+        let doc_path = dir.join("chapter.md");
+        fs::write(&doc_path, "base version\n").unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root.clone()));
+        wb.open_document(&doc_path).unwrap();
+        wb.active_tab_mut()
+            .unwrap()
+            .edit(|ctx| {
+                ctx.set_selection(0, ctx.buffer.len_bytes());
+                ctx.insert_text("local conflict edits\n");
+            })
+            .unwrap();
+        // Create external modification with mixed EOL (`A\r\nB\nC\r\n`) & keep mine -> conflict safety backup #1
+        fs::write(&doc_path, "A\r\nB\nC\r\n").unwrap();
+        let _ = wb.active_tab_mut().unwrap().sync_from_disk(true);
+        assert_eq!(wb.active_tab().unwrap().session.state, DocState::Conflict);
+        let outcome = wb.active_tab_mut().unwrap().resolve_conflict_keep_mine();
+        assert!(matches!(outcome, ConflictActionOutcome::ResolvedClean));
+
+        // Create a second backup to test both plain `Del` and `Cmd/Ctrl + Backspace`
+        wb.active_tab_mut()
+            .unwrap()
+            .edit(|ctx| {
+                ctx.set_selection(0, ctx.buffer.len_bytes());
+                ctx.insert_text("local conflict edits v2\n");
+            })
+            .unwrap();
+        fs::write(&doc_path, "second external disk version\n").unwrap();
+        let _ = wb.active_tab_mut().unwrap().sync_from_disk(true);
+        assert_eq!(wb.active_tab().unwrap().session.state, DocState::Conflict);
+        let outcome2 = wb.active_tab_mut().unwrap().resolve_conflict_keep_mine();
+        assert!(matches!(outcome2, ConflictActionOutcome::ResolvedClean));
+
+        let backups_before = wb.list_history_backups();
+        assert_eq!(backups_before.len(), 2);
+
+        let mut gui = GuiController::new(wb);
+        let p_mod = primary_test_mod();
+
+        // Open Recovery & Safety Backups modal via Command Palette
+        gui.execute_palette_command(PaletteCommandId::ManageRecoveryBackups);
+        assert_eq!(gui.inspect_modal, Some(InspectModalKind::RecoveryBackups));
+        let _ = gui.build_frame();
+        assert!(gui
+            .ui_hit_zones
+            .iter()
+            .any(|z| matches!(z.action, UiAction::DeleteSelectedRecoveryBackup)));
+
+        // Select the mixed-EOL backup (may be at index 0 or 1 depending on sort order)
+        let mixed_slot = gui
+            .inspect_recovery_backups
+            .iter()
+            .position(|e| e.payload_len == "A\r\nB\nC\r\n".len())
+            .expect("expected mixed-EOL backup entry");
+        gui.inspect_modal_selected = mixed_slot;
+
+        // Pressing Enter restores backup verbatim without rewriting mixed line endings or altering chapter.md
+        let tab_count_before = gui.workbench.tabs.len();
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert!(gui.inspect_modal.is_none());
+        assert_eq!(gui.workbench.tabs.len(), tab_count_before + 1);
+        let restored_tab = gui.workbench.active_tab().unwrap();
+        assert!(restored_tab.session.path.is_none());
+        assert_eq!(restored_tab.session.state, DocState::Dirty);
+        assert_eq!(restored_tab.session.format.dominant_line_ending, LineEnding::CrLf);
+        assert_eq!(restored_tab.session.buffer.to_string(), "A\r\nB\nC\r\n");
+        assert_eq!(fs::read_to_string(&doc_path).unwrap(), "local conflict edits v2\n");
+
+        // Re-open modal: delete first backup via plain `Delete` (no modifier), then second via `Cmd/Ctrl + Backspace`
+        gui.execute_palette_command(PaletteCommandId::ManageRecoveryBackups);
+        assert_eq!(gui.inspect_recovery_backups.len(), 2);
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Delete), None, ModifiersState::empty()));
+        assert_eq!(gui.inspect_recovery_backups.len(), 1);
+        assert_eq!(gui.workbench.list_history_backups().len(), 1);
+        assert!(gui
+            .status_notice
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("Deleted recovery backup")));
+
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Backspace), None, p_mod));
+        assert!(gui.inspect_recovery_backups.is_empty());
+        assert!(gui.workbench.list_history_backups().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_multi_instance_exit_and_open_preserve_newer_config_and_recent_files() {
+        let dir = unique_test_dir("vellmark-gui-multi-instance");
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let recent_path = dir.join("recent-files.txt");
+        let file_a = dir.join("a.md");
+        let file_b = dir.join("b.md");
+        let file_c = dir.join("c.md");
+        fs::write(&file_a, "# A\n").unwrap();
+        fs::write(&file_b, "# B\n").unwrap();
+        fs::write(&file_c, "# C\n").unwrap();
+
+        // Instance A hides sidebar, then opens a folder from recent files (forcing sidebar_visible=true
+        // and persisting immediately), BEFORE Instance B switches theme to Dark.
+        let folder_a = dir.join("folder_a");
+        fs::create_dir_all(&folder_a).unwrap();
+        let mut wb_a = AppWorkbench::new(AppConfig::default(), None);
+        wb_a.set_persistence_paths(Some(config_path.clone()), Some(recent_path.clone()));
+        wb_a.open_document(&file_a).unwrap();
+        let mut gui_a = GuiController::new(wb_a);
+        assert!(gui_a.execute_ui_action(UiAction::ToggleSidebar));
+        assert!(!gui_a.workbench.config.sidebar_visible);
+        assert!(gui_a.execute_ui_action(UiAction::OpenRecentFile(folder_a.clone())));
+        assert!(gui_a.workbench.config.sidebar_visible);
+        assert!(AppConfig::load_from_file(&config_path).unwrap().sidebar_visible);
+
+        // Instance B starts with same persisted files, changes theme + zoom and opens b.md
+        let mut wb_b = AppWorkbench::new(AppConfig::default(), None);
+        wb_b.set_persistence_paths(Some(config_path.clone()), Some(recent_path.clone()));
+        wb_b.open_document(&file_b).unwrap();
+        let mut gui_b = GuiController::new(wb_b);
+        gui_b.execute_palette_command(PaletteCommandId::ThemeDark);
+        gui_b.execute_palette_command(PaletteCommandId::ZoomIn);
+
+        // Older Instance A exits: must NOT overwrite B's config or B's recent-files entry
+        assert!(gui_a.handle_close_requested());
+        let saved_cfg = AppConfig::load_from_file(&config_path).unwrap();
+        assert_eq!(saved_cfg.theme, BuiltinTheme::Dark);
+        assert!(!saved_cfg.follow_system_theme);
+        assert_eq!(saved_cfg.zoom_percent, 110);
+
+        let recent_after_a_exit =
+            vellmark_core::RecentFilesList::load_from_file(&recent_path, 10).unwrap();
+        assert_eq!(recent_after_a_exit.entries.len(), 3);
+        assert!(paths_share_underlying_file(&recent_after_a_exit.entries[0], &file_b));
+        assert!(paths_share_underlying_file(&recent_after_a_exit.entries[1], &folder_a));
+        assert!(paths_share_underlying_file(&recent_after_a_exit.entries[2], &file_a));
+
+        // Instance C (started before B opened b.md) opens c.md: must merge with disk rather than wiping b.md
+        let mut wb_c = AppWorkbench::new(AppConfig::default(), None);
+        wb_c.set_persistence_paths(Some(config_path.clone()), Some(recent_path.clone()));
+        wb_c.open_document(&file_c).unwrap();
+        let recent_after_c_open =
+            vellmark_core::RecentFilesList::load_from_file(&recent_path, 10).unwrap();
+        assert_eq!(recent_after_c_open.entries.len(), 4);
+        assert!(paths_share_underlying_file(&recent_after_c_open.entries[0], &file_c));
+        assert!(paths_share_underlying_file(&recent_after_c_open.entries[1], &file_b));
+        assert!(paths_share_underlying_file(&recent_after_c_open.entries[2], &folder_a));
+        assert!(paths_share_underlying_file(&recent_after_c_open.entries[3], &file_a));
+
+        // Issue 1 repro: Instance D (started earlier with Light theme) modifies ONLY zoom & focus mode
+        // AFTER Instance B saved Dark theme — D's save must merge fields and preserve B's Dark theme!
+        let mut wb_d = AppWorkbench::new(AppConfig::default(), None);
+        wb_d.set_persistence_paths(Some(config_path.clone()), Some(recent_path.clone()));
+        let mut gui_d = GuiController::new(wb_d);
+        gui_d.execute_palette_command(PaletteCommandId::ZoomIn);
+        gui_d.execute_palette_command(PaletteCommandId::ZoomIn);
+        gui_d.execute_palette_command(PaletteCommandId::ToggleFocusMode);
+        assert!(gui_d.handle_close_requested());
+
+        let merged_cfg = AppConfig::load_from_file(&config_path).unwrap();
+        assert_eq!(merged_cfg.theme, BuiltinTheme::Dark);
+        assert!(!merged_cfg.follow_system_theme);
+        assert_eq!(merged_cfg.zoom_percent, 120);
+        assert!(merged_cfg.focus_mode);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_close_warns_when_pending_persistence_is_locked_and_allows_retry_or_second_close() {
+        let dir = unique_test_dir("vellmark-gui-close-locked-persist");
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let recent_path = dir.join("recent-files.txt");
+
+        let cfg_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(".config.toml.vellmark.lock"))
+            .unwrap();
+        cfg_lock.lock().unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), None);
+        wb.set_persistence_paths(Some(config_path.clone()), Some(recent_path.clone()));
+        let mut gui = GuiController::new(wb);
+
+        // User changes Focus Mode while peer holds config lock -> deferred, not yet on disk.
+        gui.execute_palette_command(PaletteCommandId::ToggleFocusMode);
+        assert!(gui.workbench.has_pending_persistence());
+        assert!(!config_path.exists());
+
+        // First close attempt warns instead of silently losing settings.
+        assert!(!gui.handle_close_requested());
+        assert!(gui.close_confirm_armed);
+        assert!(gui
+            .status_notice
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("locked")));
+
+        // Peer releases the lock before second close -> retry succeeds and persists before exit.
+        let _ = cfg_lock.unlock();
+        drop(cfg_lock);
+        assert!(gui.handle_close_requested());
+        assert!(!gui.workbench.has_pending_persistence());
+        assert!(AppConfig::load_from_file(&config_path).unwrap().focus_mode);
+
+        // Combined case: unsaved untitled draft AND locked pending settings -> first close notice
+        // must warn about BOTH the unsaved draft and the locked settings before second close exits.
+        let cfg_lock2 = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(".config.toml.vellmark.lock"))
+            .unwrap();
+        cfg_lock2.lock().unwrap();
+        let mut wb2 = AppWorkbench::new(AppConfig::default(), None);
+        wb2.set_persistence_paths(Some(config_path.clone()), Some(recent_path));
+        wb2.new_document();
+        wb2.active_tab_mut()
+            .unwrap()
+            .edit(|ctx| ctx.insert_text("unsaved draft text"))
+            .unwrap();
+        let mut gui2 = GuiController::new(wb2);
+        gui2.execute_palette_command(PaletteCommandId::ZoomIn);
+        assert!(!gui2.handle_close_requested());
+        assert!(gui2
+            .status_notice
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("Unsaved changes") && m.contains("locked")));
+        assert!(gui2.handle_close_requested());
+        let _ = cfg_lock2.unlock();
+        drop(cfg_lock2);
 
         let _ = fs::remove_dir_all(&dir);
     }

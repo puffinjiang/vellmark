@@ -158,6 +158,82 @@ impl RecentFilesList {
     pub fn prune_missing(&mut self) {
         self.entries.retain(|p| p.exists());
     }
+
+    /// Serialize recent file paths using line-oriented escaping (`\\`, `\n`, `\r`) so paths
+    /// remain round-trippable across platforms without external dependencies.
+    pub fn to_persisted_str(&self) -> String {
+        let mut out = String::new();
+        for p in &self.entries {
+            let s = p.to_string_lossy();
+            if s.is_empty() {
+                continue;
+            }
+            for ch in s.chars() {
+                match ch {
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    other => out.push(other),
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    pub fn from_persisted_str(raw: &str, max_entries: usize) -> Self {
+        let mut list = Self::new(max_entries);
+        for line in raw.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let mut decoded = String::with_capacity(line.len());
+            let mut chars = line.chars();
+            while let Some(ch) = chars.next() {
+                if ch == '\\' {
+                    match chars.next() {
+                        Some('\\') => decoded.push('\\'),
+                        Some('n') => decoded.push('\n'),
+                        Some('r') => decoded.push('\r'),
+                        Some(other) => {
+                            decoded.push('\\');
+                            decoded.push(other);
+                        }
+                        None => decoded.push('\\'),
+                    }
+                } else {
+                    decoded.push(ch);
+                }
+            }
+            if !decoded.is_empty() {
+                let pb = PathBuf::from(decoded);
+                if !list.entries.contains(&pb) {
+                    list.entries.push(pb);
+                    if list.entries.len() >= list.max_entries {
+                        break;
+                    }
+                }
+            }
+        }
+        list
+    }
+
+    pub fn save_to_file(&self, path: &Path) -> io::Result<()> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        crate::state::atomic_write_file(path, self.to_persisted_str().as_bytes())
+    }
+
+    pub fn load_from_file(path: &Path, max_entries: usize) -> io::Result<Self> {
+        match fs::read_to_string(path) {
+            Ok(raw) => Ok(Self::from_persisted_str(&raw, max_entries)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Self::new(max_entries)),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -243,6 +319,39 @@ mod tests {
                 .unwrap_or(false),
             "dangling symlink should remain intact"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_recent_files_persistence_roundtrip() {
+        let root = unique_temp_dir("recent-persist");
+        let recent_file = root.join("nested").join("recent-files.txt");
+
+        let mut list = RecentFilesList::new(3);
+        let p1 = root.join("with space.md");
+        let p2 = root.join(r"back\slash.md");
+        let p3 = root.join("third.md");
+        let p4 = root.join("fourth.md");
+        list.record_open(&p1);
+        list.record_open(&p2);
+        list.record_open(&p3);
+        list.record_open(&p4);
+        // Max entries = 3 -> p1 evicted, order is p4, p3, p2
+        assert_eq!(list.entries, vec![p4.clone(), p3.clone(), p2.clone()]);
+
+        list.save_to_file(&recent_file).unwrap();
+        let loaded = RecentFilesList::load_from_file(&recent_file, 3).unwrap();
+        assert_eq!(loaded.entries, vec![p4.clone(), p3.clone(), p2.clone()]);
+
+        // Truncating to smaller max_entries preserves most recent entries and deduplicates
+        let loaded_small = RecentFilesList::load_from_file(&recent_file, 2).unwrap();
+        assert_eq!(loaded_small.entries, vec![p4, p3]);
+
+        // Missing file loads as empty list without error
+        let missing =
+            RecentFilesList::load_from_file(&root.join("does-not-exist.txt"), 5).unwrap();
+        assert!(missing.entries.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }

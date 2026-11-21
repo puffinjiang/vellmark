@@ -9,50 +9,38 @@ pub mod workbench;
 
 use std::path::{Path, PathBuf};
 
-use config::AppConfig;
+pub use config::default_recovery_root;
+use config::{AppConfig, default_config_path, default_recent_files_path};
 use gui::{GuiController, PROTECTED_SNAPSHOT_LIMIT_NOTICE, WELCOME_MARKDOWN, VellmarkApp};
-use vellmark_core::Selection;
+use vellmark_core::{RecentFilesList, Selection};
 use workbench::AppWorkbench;
-
-/// Default persistent directory storing crash-recovery snapshots across GUI restarts.
-pub fn default_recovery_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("VELLMARK_RECOVERY_DIR").filter(|v| !v.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("vellmark")
-            .join("recovery");
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
-        return PathBuf::from(appdata).join("vellmark").join("recovery");
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-            return PathBuf::from(xdg).join("vellmark").join("recovery");
-        }
-        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-            return PathBuf::from(home)
-                .join(".local")
-                .join("share")
-                .join("vellmark")
-                .join("recovery");
-        }
-    }
-    std::env::temp_dir().join("vellmark-recovery")
-}
 
 fn build_initial_workbench_with_recovery(
     paths: &[PathBuf],
     recovery_root: Option<PathBuf>,
 ) -> (AppWorkbench, usize) {
-    let config = AppConfig::default();
+    build_initial_workbench_with_persistence(paths, recovery_root, None, None)
+}
+
+fn build_initial_workbench_with_persistence(
+    paths: &[PathBuf],
+    recovery_root: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+    recent_files_path: Option<PathBuf>,
+) -> (AppWorkbench, usize) {
+    let config = config_path
+        .as_deref()
+        .and_then(|p| AppConfig::load_from_file(p).ok())
+        .unwrap_or_default();
     let mut workbench = AppWorkbench::new(config, recovery_root);
+    workbench.restore_configured_theme();
+    if let Some(recent_path) = recent_files_path.as_deref()
+        && let Ok(loaded) = RecentFilesList::load_from_file(recent_path, workbench.recent_files.max_entries)
+    {
+        workbench.recent_files = loaded;
+        workbench.recent_files.prune_missing();
+    }
+    workbench.set_persistence_paths(config_path, recent_files_path);
 
     for path in paths {
         if path.is_dir() {
@@ -116,8 +104,12 @@ fn main() {
         return;
     }
 
-    let (workbench, recovered) =
-        build_initial_workbench_with_recovery(&paths, Some(default_recovery_root()));
+    let (workbench, recovered) = build_initial_workbench_with_persistence(
+        &paths,
+        Some(default_recovery_root()),
+        Some(default_config_path()),
+        Some(default_recent_files_path()),
+    );
     let protected_warn = workbench.protected_snapshots_exceed_limit();
     let mut controller = GuiController::new(workbench);
     if protected_warn {
@@ -162,5 +154,80 @@ mod tests {
         assert!(!default_recovery_root().as_os_str().is_empty());
 
         let _ = std::fs::remove_dir_all(&rec_root);
+    }
+
+    #[test]
+    fn test_startup_restores_persisted_config_custom_css_and_recent_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "vellmark-main-persist-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config_path = dir.join("config.toml");
+        let recent_path = dir.join("recent-files.txt");
+        let css_path = dir.join("custom.css");
+        let doc_existing = dir.join("existing.md");
+        let doc_missing = dir.join("deleted.md");
+
+        std::fs::write(&doc_existing, "# Existing\n").unwrap();
+        std::fs::write(
+            &css_path,
+            ":root { --bg-color: #102030; }\n.unsupported { position: fixed; }\n",
+        )
+        .unwrap();
+
+        let cfg = AppConfig {
+            follow_system_theme: false,
+            theme: vellmark_theme::BuiltinTheme::Academic,
+            max_content_width_px: 1080,
+            zoom_percent: 120,
+            custom_theme_path: Some(css_path.clone()),
+            ..AppConfig::default()
+        };
+        cfg.save_to_file(&config_path).unwrap();
+
+        let mut recent = RecentFilesList::new(10);
+        recent.record_open(&doc_missing);
+        recent.record_open(&doc_existing);
+        recent.save_to_file(&recent_path).unwrap();
+
+        let (wb, _) = build_initial_workbench_with_persistence(
+            &[],
+            None,
+            Some(config_path.clone()),
+            Some(recent_path.clone()),
+        );
+        assert_eq!(wb.config.max_content_width_px, 1080);
+        assert_eq!(wb.config.zoom_percent, 120);
+        assert_eq!(wb.config.custom_theme_path.as_deref(), Some(css_path.as_path()));
+        assert_eq!(
+            wb.theme.variables.get("--bg-color").map(String::as_str),
+            Some("#102030")
+        );
+        assert!(
+            !wb.theme.diagnostics.is_empty(),
+            "startup should capture custom CSS diagnostics"
+        );
+        assert_eq!(wb.recent_files.entries, vec![doc_existing.clone()]);
+
+        // Missing custom CSS file on startup safely falls back to configured built-in theme
+        std::fs::remove_file(&css_path).unwrap();
+        let (wb_fallback, _) = build_initial_workbench_with_persistence(
+            &[],
+            None,
+            Some(config_path),
+            Some(recent_path),
+        );
+        let academic = vellmark_theme::BuiltinTheme::Academic.load();
+        assert_eq!(
+            wb_fallback.theme.variables.get("--bg-color"),
+            academic.variables.get("--bg-color")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -27,9 +27,9 @@ use vellmark_core::{
     HistoricalBackupPolicy, HistoricalBackupReason, MergeConflictHunk,
     PendingRecoveryEntry, RecentFilesList, RecoveryMaintenanceReport, SaveOutcome, Selection,
     SessionError, archive_pending_recovery_to_history, clear_conflict_backups_for_path,
-    clear_historical_backups_for_path, delete_historical_backup, discard_pending_recovery_entry,
-    list_historical_backups, list_historical_backups_for_path, maintain_recovery_root,
-    paths_refer_to_same_file,
+    clear_historical_backups_for_path, delete_historical_backup, detect_and_decode,
+    discard_pending_recovery_entry, list_historical_backups, list_historical_backups_for_path,
+    maintain_recovery_root, paths_refer_to_same_file, read_historical_backup,
 };
 use vellmark_export::{
     HtmlExportMode, export_markdown_to_html_document, html_to_markdown,
@@ -682,9 +682,14 @@ struct MaintenanceJob {
 /// Top-level Vellmark multi-tab application workbench (PRD 4.5, 4.7, 4.8).
 pub struct AppWorkbench {
     pub config: AppConfig,
+    last_persisted_config: AppConfig,
+    pub config_path: Option<PathBuf>,
+    pub recent_files_path: Option<PathBuf>,
     pub workspace_root: Option<PathBuf>,
     pub file_tree: Option<FileTreeNode>,
     pub recent_files: RecentFilesList,
+    pending_recent_paths: Vec<PathBuf>,
+    pending_recent_prune: bool,
     pub recovery_root: Option<PathBuf>,
     pub history_policy: HistoricalBackupPolicy,
     pub last_recovery_maintenance: Option<RecoveryMaintenanceReport>,
@@ -693,6 +698,7 @@ pub struct AppWorkbench {
     pub system_prefers_dark: bool,
     pub theme: ThemeSheet,
     custom_theme_css: Option<String>,
+    custom_theme_stat: Option<(u64, Option<SystemTime>)>,
     next_tab_id: u64,
     recovery_session_tag: String,
     last_maintenance_unix_secs: Option<u64>,
@@ -708,11 +714,17 @@ impl Drop for AppWorkbench {
 impl AppWorkbench {
     pub fn new(config: AppConfig, recovery_root: Option<PathBuf>) -> Self {
         let theme = config.effective_builtin_theme(false).load();
+        let last_persisted_config = config.clone();
         Self {
             config,
+            last_persisted_config,
+            config_path: None,
+            recent_files_path: None,
             workspace_root: None,
             file_tree: None,
             recent_files: RecentFilesList::default(),
+            pending_recent_paths: Vec::new(),
+            pending_recent_prune: false,
             recovery_root,
             history_policy: HistoricalBackupPolicy::default(),
             last_recovery_maintenance: None,
@@ -721,11 +733,186 @@ impl AppWorkbench {
             system_prefers_dark: false,
             theme,
             custom_theme_css: None,
+            custom_theme_stat: None,
             next_tab_id: 1,
             recovery_session_tag: next_recovery_session_tag(),
             last_maintenance_unix_secs: None,
             pending_maintenance: None,
         }
+    }
+
+    pub fn set_persistence_paths(
+        &mut self,
+        config_path: Option<PathBuf>,
+        recent_files_path: Option<PathBuf>,
+    ) {
+        self.config_path = config_path;
+        self.recent_files_path = recent_files_path;
+        self.last_persisted_config = self.config.clone();
+    }
+
+    pub fn persist_config_with_timeout(&mut self, timeout: Duration) -> io::Result<()> {
+        let Some(path) = self.config_path.clone() else {
+            return Ok(());
+        };
+        crate::config::with_persistence_file_lock_timeout(&path, timeout, || {
+            let to_save = match AppConfig::load_from_file(&path) {
+                Ok(disk) => self
+                    .config
+                    .merge_modified_fields(&self.last_persisted_config, &disk),
+                Err(_) => self.config.clone(),
+            };
+            to_save.save_to_file(&path)
+        })?;
+        self.last_persisted_config = self.config.clone();
+        Ok(())
+    }
+
+    pub fn persist_config(&mut self) -> io::Result<()> {
+        self.persist_config_with_timeout(crate::config::DEFAULT_PERSISTENCE_LOCK_TIMEOUT)
+    }
+
+    /// Persist `config.toml` only when this instance actually modified `config` since startup
+    /// or its last save, preventing an idle older instance from clobbering newer settings.
+    pub fn persist_config_if_modified(&mut self) -> io::Result<()> {
+        self.persist_config_if_modified_with_timeout(crate::config::DEFAULT_PERSISTENCE_LOCK_TIMEOUT)
+    }
+
+    pub fn persist_config_if_modified_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        if self.config == self.last_persisted_config {
+            return Ok(());
+        }
+        self.persist_config_with_timeout(timeout)
+    }
+
+    pub fn persist_recent_files(&self) -> io::Result<()> {
+        match self.recent_files_path.as_deref() {
+            Some(path) => crate::config::with_persistence_file_lock(path, || {
+                self.recent_files.save_to_file(path)
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn update_and_persist_recent_files(
+        &mut self,
+        newly_recorded: &[PathBuf],
+        prune_missing: bool,
+    ) {
+        let _ = self.update_and_persist_recent_files_with_timeout(
+            newly_recorded,
+            prune_missing,
+            crate::config::DEFAULT_PERSISTENCE_LOCK_TIMEOUT,
+        );
+    }
+
+    fn update_and_persist_recent_files_with_timeout(
+        &mut self,
+        newly_recorded: &[PathBuf],
+        prune_missing: bool,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let max_entries = self.recent_files.max_entries;
+        let normalized_new: Vec<PathBuf> = newly_recorded
+            .iter()
+            .map(|p| normalize_recent_path(p))
+            .collect();
+
+        // Update in-memory list immediately so the UI stays responsive even if disk lock is busy.
+        for p in &normalized_new {
+            self.recent_files.record_open(p.clone());
+            self.pending_recent_paths.retain(|existing| existing != p);
+            self.pending_recent_paths.push(p.clone());
+        }
+        if self.pending_recent_paths.len() > max_entries {
+            let excess = self.pending_recent_paths.len() - max_entries;
+            self.pending_recent_paths.drain(0..excess);
+        }
+        if prune_missing {
+            self.recent_files.prune_missing();
+            self.pending_recent_prune = true;
+        }
+
+        let Some(recent_path) = self.recent_files_path.clone() else {
+            self.pending_recent_paths.clear();
+            self.pending_recent_prune = false;
+            return Ok(());
+        };
+
+        let pending_new = self.pending_recent_paths.clone();
+        let pending_prune = self.pending_recent_prune;
+        let prev_in_mem = self.recent_files.entries.clone();
+        let merged = crate::config::with_persistence_file_lock_timeout(
+            &recent_path,
+            timeout,
+            || {
+                let disk_entries = RecentFilesList::load_from_file(&recent_path, max_entries)
+                    .map(|list| list.entries)
+                    .unwrap_or_default();
+                let mut merged = RecentFilesList::new(max_entries);
+                let mut push_unique = |p: PathBuf| {
+                    if merged.entries.len() < max_entries && !merged.entries.contains(&p) {
+                        merged.entries.push(p);
+                    }
+                };
+                // Most recently recorded entries come first (in reverse order so last recorded is #0).
+                for p in pending_new.iter().rev() {
+                    push_unique(p.clone());
+                }
+                for p in disk_entries {
+                    push_unique(p);
+                }
+                for p in &prev_in_mem {
+                    push_unique(p.clone());
+                }
+                if pending_prune {
+                    merged.prune_missing();
+                }
+                merged.save_to_file(&recent_path)?;
+                Ok(merged)
+            },
+        )?;
+        self.recent_files = merged;
+        self.pending_recent_paths.clear();
+        self.pending_recent_prune = false;
+        Ok(())
+    }
+
+    /// True when config changes or recent-file updates are still waiting to be persisted to disk.
+    pub fn has_pending_persistence(&self) -> bool {
+        (self.config_path.is_some() && self.config != self.last_persisted_config)
+            || (self.recent_files_path.is_some()
+                && (!self.pending_recent_paths.is_empty() || self.pending_recent_prune))
+    }
+
+    /// Retry any config or recent-files writes that previously deferred due to lock contention.
+    pub fn flush_pending_persistence(&mut self) -> bool {
+        self.flush_pending_persistence_with_timeout(crate::config::DEFAULT_PERSISTENCE_LOCK_TIMEOUT)
+    }
+
+    pub fn flush_pending_persistence_with_timeout(&mut self, timeout: Duration) -> bool {
+        let mut flushed = false;
+        if self.config != self.last_persisted_config
+            && self.persist_config_if_modified_with_timeout(timeout).is_ok()
+        {
+            flushed = true;
+        }
+        if (!self.pending_recent_paths.is_empty() || self.pending_recent_prune)
+            && self
+                .update_and_persist_recent_files_with_timeout(&[], false, timeout)
+                .is_ok()
+        {
+            flushed = true;
+        }
+        flushed
+    }
+
+    pub fn record_recent_path(&mut self, path: impl Into<PathBuf>) {
+        let pb = path.into();
+        self.update_and_persist_recent_files(&[pb], false);
     }
 
     pub fn history_root(&self) -> Option<PathBuf> {
@@ -777,7 +964,7 @@ impl AppWorkbench {
         }) {
             let id = tab.id;
             self.active_tab_idx = Some(idx);
-            self.recent_files.record_open(canonical);
+            self.record_recent_path(canonical);
             return Ok(id);
         }
 
@@ -792,7 +979,7 @@ impl AppWorkbench {
             self.history_policy,
             std::time::Duration::from_millis(200),
         )?;
-        self.recent_files.record_open(canonical);
+        self.record_recent_path(canonical);
         self.tabs.push(DocumentTab::new(
             id,
             session,
@@ -903,7 +1090,7 @@ impl AppWorkbench {
     pub fn open_folder(&mut self, root: impl AsRef<Path>) -> io::Result<()> {
         let root_path = root.as_ref().to_path_buf();
         let tree = FileTreeNode::scan_dir(&root_path)?;
-        self.recent_files.record_open(&root_path);
+        self.record_recent_path(&root_path);
         self.workspace_root = Some(root_path);
         self.file_tree = Some(tree);
         Ok(())
@@ -924,7 +1111,7 @@ impl AppWorkbench {
     ) -> io::Result<PathBuf> {
         let created = FileTreeNode::create_document(parent_dir, file_name)?;
         let canonical = fs::canonicalize(&created).unwrap_or(created);
-        self.recent_files.record_open(canonical.clone());
+        self.record_recent_path(canonical.clone());
         let _ = self.refresh_file_tree();
         Ok(canonical)
     }
@@ -981,6 +1168,7 @@ impl AppWorkbench {
         FileTreeNode::rename_or_move(from, &to)?;
         let canonical_to = fs::canonicalize(&to).unwrap_or_else(|_| to.clone());
 
+        let mut updated_recent: Vec<PathBuf> = Vec::new();
         for (idx, rel) in affected_tabs {
             let updated = if rel.as_os_str().is_empty() {
                 canonical_to.clone()
@@ -991,12 +1179,12 @@ impl AppWorkbench {
             self.tabs[idx].session.apply_renamed_path(&updated);
             self.tabs[idx].sync_edit_activity_at(now);
             self.refresh_tab_conflict_backup_count(tab_id);
-            self.recent_files.record_open(updated);
+            updated_recent.push(updated);
         }
         if canonical_to.is_file() {
-            self.recent_files.record_open(canonical_to.clone());
+            updated_recent.push(canonical_to.clone());
         }
-        self.recent_files.prune_missing();
+        self.update_and_persist_recent_files(&updated_recent, true);
         let _ = self.refresh_file_tree();
         Ok(canonical_to)
     }
@@ -1039,7 +1227,7 @@ impl AppWorkbench {
             self.tabs[idx].session.on_external_deleted();
             self.tabs[idx].sync_edit_activity_at(now);
         }
-        self.recent_files.prune_missing();
+        self.update_and_persist_recent_files(&[], true);
         let _ = self.refresh_file_tree();
         Ok(())
     }
@@ -1126,6 +1314,81 @@ impl AppWorkbench {
         self.theme = ThemeSheet::parse_css(css);
     }
 
+    /// Load a custom theme stylesheet from `path`, returning its CSS-subset diagnostic count.
+    pub fn load_custom_theme_file(&mut self, path: &Path) -> io::Result<usize> {
+        let meta = fs::metadata(path)?;
+        if !meta.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "custom theme path is not a regular file",
+            ));
+        }
+        if meta.len() > 1_048_576 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "custom theme CSS exceeds 1 MiB limit",
+            ));
+        }
+        let css = fs::read_to_string(path)?;
+        self.config.follow_system_theme = false;
+        self.config.custom_theme_path = Some(path.to_path_buf());
+        self.custom_theme_stat = Some((meta.len(), meta.modified().ok()));
+        self.load_custom_theme_css(&css);
+        Ok(self.theme.diagnostics.len())
+    }
+
+    /// Apply configured custom CSS on startup when present, falling back to the built-in theme
+    /// if the configured CSS file cannot be read.
+    pub fn restore_configured_theme(&mut self) {
+        if self.config.follow_system_theme {
+            return;
+        }
+        let Some(path) = self.config.custom_theme_path.clone() else {
+            return;
+        };
+        if self.load_custom_theme_file(&path).is_err() {
+            self.select_builtin_theme(false, Some(self.config.theme));
+        }
+    }
+
+    /// Check whether an active custom CSS theme file changed on disk and hot-reload it.
+    ///
+    /// Uses `(len, modified)` stat pre-filtering on periodic ticks to avoid redundant disk reads
+    /// once the file's mtime has aged past coarse-timestamp granularity (`>= 2s`), while always
+    /// verifying content when `force` is true (e.g. window focus regained) or within the 2s window.
+    pub fn poll_custom_theme_reload(&mut self, force: bool) -> Option<(String, usize)> {
+        if self.config.follow_system_theme {
+            return None;
+        }
+        let path = self.config.custom_theme_path.clone()?;
+        let meta = fs::metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() > 1_048_576 {
+            return None;
+        }
+        let stat = (meta.len(), meta.modified().ok());
+        if !force && self.custom_theme_stat.as_ref() == Some(&stat) {
+            let mtime_settled = stat
+                .1
+                .and_then(|m| SystemTime::now().duration_since(m).ok())
+                .is_some_and(|age| age >= Duration::from_secs(2));
+            if mtime_settled {
+                return None;
+            }
+        }
+        let css = fs::read_to_string(&path).ok()?;
+        self.custom_theme_stat = Some(stat);
+        if self.custom_theme_css.as_deref() == Some(css.as_str()) {
+            return None;
+        }
+        self.load_custom_theme_css(&css);
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("custom.css")
+            .to_string();
+        Some((name, self.theme.diagnostics.len()))
+    }
+
     pub fn select_builtin_theme(
         &mut self,
         follow_system: bool,
@@ -1134,6 +1397,7 @@ impl AppWorkbench {
         self.config.follow_system_theme = follow_system;
         self.config.custom_theme_path = None;
         self.custom_theme_css = None;
+        self.custom_theme_stat = None;
         if let Some(theme) = theme_opt {
             self.config.theme = theme;
         }
@@ -1585,7 +1849,7 @@ impl AppWorkbench {
                         has_local_edits,
                     });
                 } else {
-                    self.recent_files.record_open(&new_path);
+                    self.record_recent_path(&new_path);
                     self.refresh_tab_conflict_backup_count(tab_id);
                     events.push(WorkbenchRuntimeEvent::Renamed {
                         tab_id,
@@ -1614,6 +1878,60 @@ impl AppWorkbench {
             self.refresh_all_conflict_backup_counts();
         }
         Ok(removed)
+    }
+
+    /// Restore a verified historical / conflict safety backup into a new untitled draft tab
+    /// without touching any original file on disk (PRD 4.5.1 F).
+    pub fn restore_history_backup_as_draft(&mut self, backup_path: &Path) -> Result<u64, String> {
+        let data = read_historical_backup(backup_path).map_err(|e| e.to_string())?;
+        let (text, line_ending, has_trailing_newline) = match data.entry.reason {
+            // Backups created directly from the in-memory UTF-8 editor buffer never contain a file BOM;
+            // decode verbatim as UTF-8 so a leading U+FEFF character in the document body is preserved.
+            HistoricalBackupReason::ConflictDiscardedMine
+            | HistoricalBackupReason::ConflictPreMergeMine
+            | HistoricalBackupReason::ClosedUnsaved
+            | HistoricalBackupReason::ClosedMissingUnsaved
+            | HistoricalBackupReason::UnrecoveredCrashSnapshot => {
+                let decoded = match std::str::from_utf8(&data.payload) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => String::from_utf8_lossy(&data.payload).into_owned(),
+                };
+                let eol = vellmark_core::LineEnding::detect_dominant(&decoded);
+                let trailing = decoded.ends_with('\n') || decoded.ends_with('\r');
+                (decoded, Some(eol), trailing)
+            }
+            HistoricalBackupReason::ConflictOverwrittenTheirs
+            | HistoricalBackupReason::Custom(_) => match detect_and_decode(&data.payload) {
+                Ok((decoded, meta)) => (
+                    decoded,
+                    Some(meta.dominant_line_ending),
+                    meta.has_trailing_newline,
+                ),
+                Err(_) => {
+                    let decoded = String::from_utf8_lossy(&data.payload).into_owned();
+                    let trailing = decoded.ends_with('\n') || decoded.ends_with('\r');
+                    (decoded, None, trailing)
+                }
+            },
+        };
+        let tab_id = self.new_document();
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            if let Some(eol) = line_ending {
+                tab.session.format.dominant_line_ending = eol;
+            }
+            tab.session.format.has_trailing_newline = has_trailing_newline;
+            if !text.is_empty() {
+                // Load backup text verbatim so mixed line endings are preserved rather than
+                // normalized through the interactive paste/typing path.
+                tab.session.buffer.reset_content(&text);
+                tab.session.state = DocState::Dirty;
+                tab.session.schedule_recovery_snapshot();
+                tab.view.selection = Selection::caret(0);
+                *tab.ast_cache.borrow_mut() = None;
+                tab.sync_edit_activity_at(Instant::now());
+            }
+        }
+        Ok(tab_id)
     }
 
     /// Explicitly remove all conflict-resolution safety backups for `source_path`.
@@ -1668,6 +1986,18 @@ impl AppWorkbench {
             .as_ref()
             .map(|r| r.join(format!("{}-tab-{tab_id}", self.recovery_session_tag)))
     }
+}
+
+fn normalize_recent_path(path: &Path) -> PathBuf {
+    if let Ok(canon) = fs::canonicalize(path) {
+        return canon;
+    }
+    if path.is_relative()
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        return cwd.join(path).components().collect();
+    }
+    path.components().collect()
 }
 
 fn push_runtime_save_event(
@@ -2530,6 +2860,217 @@ mod tests {
                 .any(|e| matches!(e, WorkbenchRuntimeEvent::AutoSavedClean { .. })),
             "deleted file transitioned back to Clean: {later_events:?}"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_open_folder_records_absolute_canonical_recent_path() {
+        let root = std::env::temp_dir().join(format!(
+            "vellmark-wb-rel-folder-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let notes = root.join("notes");
+        let recent_path = root.join("recent-files.txt");
+        fs::create_dir_all(&notes).unwrap();
+        let canonical_notes = fs::canonicalize(&notes).unwrap();
+
+        // Build a thread-safe relative path from current_dir -> canonical_notes without mutating CWD
+        let cwd = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let cwd_comps: Vec<_> = cwd.components().collect();
+        let target_comps: Vec<_> = canonical_notes.components().collect();
+        let common = cwd_comps
+            .iter()
+            .zip(target_comps.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let mut rel = PathBuf::new();
+        for _ in common..cwd_comps.len() {
+            rel.push("..");
+        }
+        for comp in &target_comps[common..] {
+            rel.push(comp.as_os_str());
+        }
+        assert!(rel.is_relative(), "expected relative path, got {}", rel.display());
+        assert!(rel.is_dir());
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), None);
+        wb.set_persistence_paths(None, Some(recent_path.clone()));
+        wb.open_folder(&rel).unwrap();
+
+        assert_eq!(wb.recent_files.entries.len(), 1);
+        assert!(wb.recent_files.entries[0].is_absolute());
+        assert_eq!(wb.recent_files.entries[0], canonical_notes);
+
+        let loaded = RecentFilesList::load_from_file(&recent_path, 10).unwrap();
+        assert_eq!(loaded.entries, vec![canonical_notes]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_concurrent_open_recent_files_lock_and_leading_feff_backup_restore() {
+        use std::sync::{Arc, Barrier};
+
+        let root = std::env::temp_dir().join(format!(
+            "vellmark-wb-concurrent-feff-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rec_root = root.join("recovery");
+        let recent_path = root.join("recent-files.txt");
+        fs::create_dir_all(&rec_root).unwrap();
+
+        // 1. Concurrent open_document across 4 threads synchronized by a Barrier
+        let mut expected_files = Vec::new();
+        for i in 0..4 {
+            let p = root.join(format!("doc_{i}.md"));
+            fs::write(&p, format!("# Doc {i}\n")).unwrap();
+            expected_files.push(fs::canonicalize(&p).unwrap());
+        }
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+        for p in &expected_files {
+            let b = Arc::clone(&barrier);
+            let rp = recent_path.clone();
+            let doc = p.clone();
+            handles.push(thread::spawn(move || {
+                let mut wb = AppWorkbench::new(AppConfig::default(), None);
+                wb.set_persistence_paths(None, Some(rp));
+                b.wait();
+                wb.open_document(&doc).unwrap();
+                // Simulate the app's retry/close flush if heavy fsync contention deferred persistence.
+                for _ in 0..10 {
+                    if !wb.has_pending_persistence() {
+                        break;
+                    }
+                    wb.flush_pending_persistence_with_timeout(Duration::from_millis(250));
+                }
+                assert!(!wb.has_pending_persistence());
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let persisted_recent = RecentFilesList::load_from_file(&recent_path, 10).unwrap();
+        assert_eq!(persisted_recent.entries.len(), 4);
+        for exp in &expected_files {
+            assert!(
+                persisted_recent.entries.contains(exp),
+                "missing concurrent recent entry {}",
+                exp.display()
+            );
+        }
+
+        // 2. Local editor buffer backup starting with U+FEFF preserves leading U+FEFF on restore
+        let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root.clone()));
+        let tab_id = wb.new_document();
+        wb.active_tab_mut()
+            .unwrap()
+            .edit(|ctx| ctx.insert_text("\u{FEFF}# Leading FEFF preserved\n"))
+            .unwrap();
+        assert!(wb.close_tab(tab_id, true));
+
+        let backups = wb.list_history_backups();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(backups[0].reason, HistoricalBackupReason::ClosedUnsaved);
+
+        let restored_id = wb
+            .restore_history_backup_as_draft(&backups[0].path)
+            .unwrap();
+        let restored = wb.tabs.iter().find(|t| t.id == restored_id).unwrap();
+        assert_eq!(
+            restored.session.buffer.to_string(),
+            "\u{FEFF}# Leading FEFF preserved\n"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_lock_contention_defers_persistence_without_blocking_ui_and_flushes_on_retry() {
+        let root = std::env::temp_dir().join(format!(
+            "vellmark-wb-deferred-persist-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        let recent_path = root.join("recent-files.txt");
+        let doc_a = root.join("a.md");
+        let doc_b = root.join("b.md");
+        fs::write(&doc_a, "# A\n").unwrap();
+        fs::write(&doc_b, "# B\n").unwrap();
+
+        // Peer holds OS locks on both config and recent-files sidecar lock files.
+        let cfg_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(".config.toml.vellmark.lock"))
+            .unwrap();
+        cfg_lock.lock().unwrap();
+        let rec_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(".recent-files.txt.vellmark.lock"))
+            .unwrap();
+        rec_lock.lock().unwrap();
+
+        let mut wb = AppWorkbench::new(AppConfig::default(), None);
+        wb.set_persistence_paths(Some(config_path.clone()), Some(recent_path.clone()));
+
+        // Opening a doc & changing config while peer holds locks returns promptly (< 300ms),
+        // updates in-memory state, and does NOT write unlocked to disk.
+        let start = Instant::now();
+        wb.open_document(&doc_a).unwrap();
+        wb.config.zoom_percent = 130;
+        let cfg_res = wb.persist_config();
+        assert_eq!(cfg_res.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "GUI-thread open/config persist must not block indefinitely on peer lock"
+        );
+        assert!(!config_path.exists());
+        assert!(!recent_path.exists());
+        assert_eq!(wb.recent_files.entries.len(), 1);
+
+        // Peer writes its own Dark theme + doc_b and releases the locks.
+        let peer_cfg = AppConfig {
+            follow_system_theme: false,
+            theme: vellmark_theme::BuiltinTheme::Dark,
+            ..AppConfig::default()
+        };
+        peer_cfg.save_to_file(&config_path).unwrap();
+        let mut peer_recent = RecentFilesList::new(10);
+        let canon_b = fs::canonicalize(&doc_b).unwrap();
+        let canon_a = fs::canonicalize(&doc_a).unwrap();
+        peer_recent.record_open(&canon_b);
+        peer_recent.save_to_file(&recent_path).unwrap();
+        let _ = cfg_lock.unlock();
+        let _ = rec_lock.unlock();
+        drop(cfg_lock);
+        drop(rec_lock);
+
+        // Deferred flush acquires locks, merges both config and recent-files, and persists cleanly.
+        assert!(wb.flush_pending_persistence());
+        let final_cfg = AppConfig::load_from_file(&config_path).unwrap();
+        assert_eq!(final_cfg.theme, vellmark_theme::BuiltinTheme::Dark);
+        assert!(!final_cfg.follow_system_theme);
+        assert_eq!(final_cfg.zoom_percent, 130);
+
+        let final_recent = RecentFilesList::load_from_file(&recent_path, 10).unwrap();
+        assert_eq!(final_recent.entries, vec![canon_a, canon_b]);
 
         let _ = fs::remove_dir_all(&root);
     }

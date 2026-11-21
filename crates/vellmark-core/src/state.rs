@@ -391,9 +391,20 @@ impl Drop for SaveWorker {
     }
 }
 
+fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    let meta = fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target is not a regular file",
+        ));
+    }
+    fs::read(path)
+}
+
 fn perform_versioned_disk_write(req: &SaveRequest) -> DiskWriteResult {
     if req.current_state == DocState::Conflict {
-        return match fs::read(&req.path) {
+        return match read_regular_file(&req.path) {
             Ok(disk_bytes) => {
                 let disk_stat = DiskFileStat::capture(&req.path);
                 let snap = match detect_and_decode(&disk_bytes) {
@@ -412,7 +423,7 @@ fn perform_versioned_disk_write(req: &SaveRequest) -> DiskWriteResult {
         };
     }
 
-    match fs::read(&req.path) {
+    match read_regular_file(&req.path) {
         Ok(disk_bytes) => match detect_and_decode(&disk_bytes) {
             Ok((disk_text, _)) => {
                 let disk_snap = DiskSnapshot::from_str(&disk_text);
@@ -825,7 +836,7 @@ impl DocumentSession {
         throttle_window: Duration,
     ) -> Result<Self, SessionError> {
         let path = normalize_session_path(path.as_ref());
-        let raw = fs::read(&path)?;
+        let raw = read_regular_file(&path)?;
         let disk_stat = DiskFileStat::capture(&path);
         let (text, format) = detect_and_decode(&raw)?;
         let buffer = TextBuffer::from_str(&text);
@@ -911,7 +922,7 @@ impl DocumentSession {
 
         let mut disk_stat = None;
         if let Some(p) = &path {
-            match fs::read(p) {
+            match read_regular_file(p) {
                 Ok(raw) => {
                     disk_stat = DiskFileStat::capture(p);
                     match detect_and_decode(&raw) {
@@ -1206,7 +1217,7 @@ impl DocumentSession {
         if let Some(current_path) = &self.path
             && paths_refer_to_same_file(current_path, &target) {
                 if self.state == DocState::Conflict {
-                    match fs::read(&target) {
+                    match read_regular_file(&target) {
                         Ok(disk_bytes) => {
                             self.disk_stat = DiskFileStat::capture(&target);
                             let snap = match detect_and_decode(&disk_bytes) {
@@ -1575,7 +1586,7 @@ impl DocumentSession {
             return ExternalSyncResult::NoChange;
         }
 
-        let disk_bytes = match fs::read(&path) {
+        let disk_bytes = match read_regular_file(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.disk_stat = None;
@@ -1730,7 +1741,7 @@ impl DocumentSession {
         };
 
         // 1. Verify disk still matches the `theirs` the user saw
-        let disk_bytes = match fs::read(&path) {
+        let disk_bytes = match read_regular_file(&path) {
             Ok(b) => {
                 self.disk_stat = DiskFileStat::capture(&path);
                 b
@@ -1828,7 +1839,7 @@ impl DocumentSession {
         };
 
         // Check if file still exists on disk
-        let initial_disk_bytes = match fs::read(&path) {
+        let initial_disk_bytes = match read_regular_file(&path) {
             Ok(b) => {
                 self.disk_stat = DiskFileStat::capture(&path);
                 b
@@ -1901,7 +1912,7 @@ impl DocumentSession {
             );
         }
 
-        let post_backup_bytes = match fs::read(&path) {
+        let post_backup_bytes = match read_regular_file(&path) {
             Ok(b) => {
                 self.disk_stat = DiskFileStat::capture(&path);
                 b
@@ -2387,6 +2398,7 @@ fn create_unique_atomic_temp_file_with_seq(
     existing_perms: Option<&fs::Permissions>,
     seq_source: &AtomicU64,
 ) -> std::io::Result<(PathBuf, File)> {
+    let _ = existing_perms;
     const MAX_ATTEMPTS: usize = 64;
     let pid = std::process::id();
     let mut last_already_exists = None;
@@ -3358,7 +3370,7 @@ impl DocumentSession {
             return AutoMergeOutcome::AbortedStillConflict("missing external snapshot".to_string());
         };
 
-        let disk_bytes = match fs::read(&path) {
+        let disk_bytes = match read_regular_file(&path) {
             Ok(b) => {
                 self.disk_stat = DiskFileStat::capture(&path);
                 b
@@ -5605,6 +5617,22 @@ mod tests {
             assert_eq!(link_err.kind(), std::io::ErrorKind::InvalidInput);
             let fifo_meta = fs::symlink_metadata(&fifo).unwrap();
             assert!(!fifo_meta.is_file() && !fifo_meta.is_dir());
+
+            // Opening a FIFO must also fail immediately rather than blocking the UI thread
+            let open_err = DocumentSession::open_file(&fifo, None)
+                .err()
+                .expect("opening a FIFO must fail");
+            assert!(matches!(
+                open_err,
+                SessionError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput
+            ));
+            let link_open_err = DocumentSession::open_file(&symlink, None)
+                .err()
+                .expect("opening a symlink to FIFO must fail");
+            assert!(matches!(
+                link_open_err,
+                SessionError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput
+            ));
         }
 
         let _ = fs::remove_dir_all(&root);
