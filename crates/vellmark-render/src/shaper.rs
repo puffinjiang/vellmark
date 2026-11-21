@@ -715,7 +715,6 @@ impl ShapedDocumentCache {
                         style_sig,
                         block_focused,
                         vp.focus_mode,
-                        show_toolbar,
                     );
                     let frame_seq = self.frame_seq;
                     if let Some(cached) = self.table_lru.get_mut(&table_key) {
@@ -727,7 +726,6 @@ impl ShapedDocumentCache {
                             avail_table_w,
                             style,
                             frame_seq,
-                            show_toolbar,
                         );
                         if self.table_lru.len() >= MAX_SHAPED_TABLE_CACHE {
                             evict_oldest_table_lru(&mut self.table_lru);
@@ -1330,7 +1328,7 @@ impl ShapedDocumentCache {
         )?;
         let avail_table_w = (ctx.content_width_px - 8.0).max(120.0);
         let style_sig = style_signature(ctx.style);
-        let key = shape_table_cache_key(&rows_display, avail_table_w, style_sig, true, false, false);
+        let key = shape_table_cache_key(&rows_display, avail_table_w, style_sig, true, false);
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let frame_seq = self.frame_seq;
         if let Some(cached) = self.table_lru.get_mut(&key) {
@@ -1342,7 +1340,6 @@ impl ShapedDocumentCache {
                 avail_table_w,
                 ctx.style,
                 frame_seq,
-                false,
             );
             if self.table_lru.len() >= MAX_SHAPED_TABLE_CACHE {
                 evict_oldest_table_lru(&mut self.table_lru);
@@ -3799,15 +3796,12 @@ fn shape_table_block(
     avail_table_w: f32,
     style: &ResolvedThemeStyle,
     frame_seq: u64,
-    show_toolbar: bool,
 ) -> CachedTableShape {
     let cell_pad_x = 12.0 * style.zoom_scale;
     let cell_pad_y = 7.0 * style.zoom_scale;
-    let top_pad_px = if show_toolbar {
-        28.0 * style.zoom_scale
-    } else {
-        6.0 * style.zoom_scale
-    };
+    // Always reserve consistent top clearance for the floating table toolbar so clicking
+    // into or out of a table never causes a 22px vertical layout jump.
+    let top_pad_px = 28.0 * style.zoom_scale;
     let bottom_pad_px = 6.0 * style.zoom_scale;
 
     let num_cols = rows_display
@@ -4119,7 +4113,6 @@ fn shape_table_cache_key(
     style_sig: u64,
     block_focused: bool,
     focus_mode: bool,
-    show_toolbar: bool,
 ) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     rows.len().hash(&mut h);
@@ -4145,7 +4138,6 @@ fn shape_table_cache_key(
     style_sig.hash(&mut h);
     block_focused.hash(&mut h);
     focus_mode.hash(&mut h);
-    show_toolbar.hash(&mut h);
     h.finish()
 }
 
@@ -5044,6 +5036,12 @@ mod tests {
         let scene_in =
             cache.build_editor_scene(&blocks, &style, &vp_in, |r| doc[r.start..r.end].to_string());
         assert_eq!(scene_in.table_buttons.len(), 10);
+        assert!(
+            (scene_out.total_height - scene_in.total_height).abs() < 0.01,
+            "focusing table must not shift document height: out={} vs in={}",
+            scene_out.total_height,
+            scene_in.total_height
+        );
         let tbl_rec = cache
             .last_hit_blocks
             .iter()

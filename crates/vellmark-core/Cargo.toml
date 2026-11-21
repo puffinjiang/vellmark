@@ -10,5 +10,6 @@ repository.workspace = true
 [dependencies]
 ropey.workspace = true
 crc32fast.workspace = true
+pulldown-cmark.workspace = true
 serde.workspace = true
 thiserror.workspace = true

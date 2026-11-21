@@ -5,7 +5,7 @@
 //! - Structural editing (`Backspace`, `Enter`, `Tab`, `Shift+Tab`) for headings, nested lists,
 //!   task lists, blockquotes, fenced code blocks, and tables (4.1.1 C & G)
 
-use crate::buffer::{ByteOffset, ByteRange, Selection, TextBuffer};
+use crate::buffer::{ByteOffset, ByteRange, CachedFencedCodeBlock, Selection, TextBuffer};
 use crate::encoding::{LineEnding, normalize_line_endings};
 use crate::table::{
     GfmTableContext, TableAlign, TableCellSpan, TableRowParsed, find_enclosing_gfm_table_at,
@@ -907,13 +907,12 @@ impl EditorContext<'_> {
         }
 
         let (line_start_before, _) = self.current_line_bounds();
-        let in_code_fence = self.is_offset_inside_fenced_code_block(line_start_before);
 
         // PRD 4.1.1 G #6: Inside a Markdown table line (outside code fence), typing `|` in WYSIWYG mode writes escaped `\|` to source.
         if *self.mode == ViewMode::Wysiwyg
-            && !in_code_fence
             && ch == '|'
             && self.is_caret_in_gfm_table_or_piped_row(line_start_before)
+            && !self.is_offset_inside_fenced_code_block(line_start_before)
         {
             let range = self.selection.range();
             let sel_before = *self.selection;
@@ -947,25 +946,33 @@ impl EditorContext<'_> {
         *self.selection = sel_after;
 
         // P2 fix: Only record WYSIWYG syntax conversion triggers when in `ViewMode::Wysiwyg` AND outside fenced code blocks!
-        if *self.mode == ViewMode::Wysiwyg && !in_code_fence {
-            let (line_start, line_end, _) = self.current_line_content_bounds();
-            let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
-            if ch == ' ' && self.selection.head == line_end {
-                if let Some(rel) = block_line_syntax_escape_offset(&line) {
-                    self.undo
-                        .record_syntax_trigger(line_start + rel, *self.selection);
+        if *self.mode == ViewMode::Wysiwyg {
+            if ch == ' ' {
+                let (line_start, line_end, _) = self.current_line_content_bounds();
+                if self.selection.head == line_end {
+                    let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
+                    if let Some(rel) = block_line_syntax_escape_offset(&line)
+                        && !self.is_offset_inside_fenced_code_block(line_start)
+                    {
+                        self.undo
+                            .record_syntax_trigger(line_start + rel, *self.selection);
+                    }
                 }
             } else if matches!(ch, '*' | '`' | '~') {
+                let (line_start, line_end, _) = self.current_line_content_bounds();
+                let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
                 let caret_in_line = self.selection.head.saturating_sub(line_start);
                 let escapes = detect_inline_conversion_escapes(&line, caret_in_line, ch);
-                if escapes.len() == 1 {
-                    self.undo
-                        .record_syntax_trigger(line_start + escapes[0], *self.selection);
-                } else if escapes.len() > 1 {
-                    let abs: Vec<ByteOffset> =
-                        escapes.into_iter().map(|rel| line_start + rel).collect();
-                    self.undo
-                        .record_syntax_trigger_offsets(abs, *self.selection);
+                if !escapes.is_empty() && !self.is_offset_inside_fenced_code_block(line_start) {
+                    if escapes.len() == 1 {
+                        self.undo
+                            .record_syntax_trigger(line_start + escapes[0], *self.selection);
+                    } else {
+                        let abs: Vec<ByteOffset> =
+                            escapes.into_iter().map(|rel| line_start + rel).collect();
+                        self.undo
+                            .record_syntax_trigger_offsets(abs, *self.selection);
+                    }
                 }
             }
         }
@@ -1019,10 +1026,16 @@ impl EditorContext<'_> {
                     return;
                 }
 
-            let in_code_fence = self.is_offset_inside_fenced_code_block(line_start);
+            let has_structural_prefix = heading_prefix_len(&line)
+                .is_some_and(|prefix_len| caret == line_start || caret == line_start + prefix_len)
+                || list_prefix_parts(&line).is_some_and(|(indent_bytes, marker_bytes)| {
+                    caret == line_start + indent_bytes + marker_bytes
+                })
+                || blockquote_demote_parts(&line)
+                    .is_some_and(|(content_start, _)| caret == line_start + content_start);
 
             // P2 fix: Inside a fenced code block, lines like `# comment` or `- item` are raw code, NOT Markdown headings/lists!
-            if !in_code_fence {
+            if has_structural_prefix && !self.is_offset_inside_fenced_code_block(line_start) {
                 // PRD 4.1.1 C & G #2: Backspace at start of heading text (either at `line_start` or right after `## `)
                 if let Some(prefix_len) = heading_prefix_len(&line)
                     && (caret == line_start || caret == line_start + prefix_len) {
@@ -1134,30 +1147,34 @@ impl EditorContext<'_> {
     pub fn tab(&mut self) {
         self.abort_ime_preedit();
         let (line_start, content_end, line_end) = self.current_line_content_bounds();
-        if *self.mode == ViewMode::Wysiwyg && !self.is_offset_inside_fenced_code_block(line_start) {
+        if *self.mode == ViewMode::Wysiwyg {
             let line = self.buffer.slice_to_string(ByteRange::new(line_start, content_end));
-            if list_prefix_parts(&line).is_some() {
-                let sel_before = *self.selection;
-                let sel_after = Selection::caret(self.selection.head + 2);
-                self.undo.apply_edit(
-                    self.buffer,
-                    ByteRange::empty(line_start),
-                    "  ",
-                    sel_before,
-                    sel_after,
-                    EditKind::Structural,
-                );
-                *self.selection = sel_after;
-                return;
-            }
-            let full = self.buffer.to_string();
-            if let Some(ctx) = find_enclosing_gfm_table_at(&full, line_start) {
-                self.tab_in_gfm_table(&full, &ctx);
-                return;
-            }
-            if is_standalone_piped_header(&line) {
-                self.tab_in_standalone_header(&full, line_start, line_end, &line);
-                return;
+            let is_list = list_prefix_parts(&line).is_some();
+            let has_pipe = line.contains('|');
+            if (is_list || has_pipe) && !self.is_offset_inside_fenced_code_block(line_start) {
+                if is_list {
+                    let sel_before = *self.selection;
+                    let sel_after = Selection::caret(self.selection.head + 2);
+                    self.undo.apply_edit(
+                        self.buffer,
+                        ByteRange::empty(line_start),
+                        "  ",
+                        sel_before,
+                        sel_after,
+                        EditKind::Structural,
+                    );
+                    *self.selection = sel_after;
+                    return;
+                }
+                let full = self.buffer.to_string();
+                if let Some(ctx) = find_enclosing_gfm_table_at(&full, line_start) {
+                    self.tab_in_gfm_table(&full, &ctx);
+                    return;
+                }
+                if is_standalone_piped_header(&line) {
+                    self.tab_in_standalone_header(&full, line_start, line_end, &line);
+                    return;
+                }
             }
         }
         // Fallback: insert 2 spaces
@@ -1181,11 +1198,15 @@ impl EditorContext<'_> {
     pub fn shift_tab(&mut self) {
         self.abort_ime_preedit();
         let (line_start, content_end, _) = self.current_line_content_bounds();
-        if self.is_offset_inside_fenced_code_block(line_start) {
+        let line = self.buffer.slice_to_string(ByteRange::new(line_start, content_end));
+        let list_parts = list_prefix_parts(&line);
+        let maybe_table = *self.mode == ViewMode::Wysiwyg && line.contains('|');
+        if (list_parts.is_none() && !maybe_table)
+            || self.is_offset_inside_fenced_code_block(line_start)
+        {
             return;
         }
-        let line = self.buffer.slice_to_string(ByteRange::new(line_start, content_end));
-        if let Some((indent_bytes, _)) = list_prefix_parts(&line) {
+        if let Some((indent_bytes, _)) = list_parts {
             if indent_bytes >= 2 {
                 let sel_before = *self.selection;
                 let new_head = self.selection.head.saturating_sub(2).max(line_start);
@@ -1262,10 +1283,15 @@ impl EditorContext<'_> {
             .slice_to_string(ByteRange::new(line_start, content_end));
 
         if *self.mode == ViewMode::Wysiwyg {
-            let in_code_fence = self.is_offset_inside_fenced_code_block(line_start);
+            let maybe_structural_line = list_prefix_parts(&line).is_some()
+                || line.contains('|')
+                || blockquote_demote_parts(&line).is_some()
+                || (caret == content_end
+                    && (parse_opening_code_fence(&line).is_some()
+                        || thematic_break_escape_offset(&line).is_some()));
 
-            // PRD 4.1.1 G #5: List item handling (only outside fenced code blocks)
-            if !in_code_fence {
+            // PRD 4.1.1 G #5: List/table/blockquote/fence/thematic-break handling (only outside fenced code blocks)
+            if maybe_structural_line && !self.is_offset_inside_fenced_code_block(line_start) {
                 if let Some((indent_bytes, marker_bytes)) = list_prefix_parts(&line) {
                     let content_after_marker = line[indent_bytes + marker_bytes..].trim();
                     if content_after_marker.is_empty() {
@@ -1543,8 +1569,9 @@ impl EditorContext<'_> {
 
             // PRD 4.1.1 G #7 & P2 fix: 3rd consecutive Enter at end of fenced code block exits the code block
             // in a SINGLE `Transaction` so a single `undo()` restores the exact pre-Enter state!
-            if let Some((strip_range, closing_fence_end)) =
-                self.check_third_enter_at_code_fence_end(caret)
+            if line.is_empty()
+                && let Some((strip_range, closing_fence_end)) =
+                    self.check_third_enter_at_code_fence_end(caret)
             {
                 let sel_before = *self.selection;
                 let removed_len = strip_range.len();
@@ -1686,9 +1713,12 @@ impl EditorContext<'_> {
     pub fn insert_table(&mut self, rows: usize, cols: usize) -> bool {
         self.abort_ime_preedit();
         self.normalize_selection_out_of_crlf();
+        let range = self.selection.range();
+        if self.range_intersects_fenced_code_block(range) {
+            return false;
+        }
         let total_rows = rows.clamp(1, 50);
         let total_cols = cols.clamp(1, 20);
-        let range = self.selection.range();
         let sel_before = *self.selection;
         let nl = self.dominant_line_ending();
 
@@ -2238,42 +2268,68 @@ impl EditorContext<'_> {
         (start, lf_end)
     }
 
-    /// Returns `Some((fence_char, fence_len))` if the line starting at `target_line_start` is inside
-    /// the body of an unclosed fenced code block (` ``` ` or `~~~`, tracking both fence character and
-    /// minimum opening length per CommonMark spec).
-    fn enclosing_fenced_code_block(&self, target_line_start: ByteOffset) -> Option<(u8, usize)> {
-        let full = self.buffer.to_string();
-        let bytes = full.as_bytes();
-        let mut pos = 0usize;
-        let mut active_fence: Option<(u8, usize)> = None;
-
-        while pos < bytes.len() {
-            let l_start = pos;
-            let mut l_end = pos;
-            while l_end < bytes.len() && bytes[l_end] != b'\n' {
-                l_end += 1;
-            }
-            let next_pos = if l_end < bytes.len() { l_end + 1 } else { l_end };
-            let line = full[l_start..l_end].trim_end_matches('\r');
-
-            if l_start == target_line_start {
-                return active_fence;
-            }
-
-            if let Some((f_char, f_len)) = active_fence {
-                if is_closing_code_fence(line, f_char, f_len) {
-                    active_fence = None;
-                }
-            } else if let Some((f_char, f_len)) = parse_opening_code_fence(line) {
-                active_fence = Some((f_char, f_len));
-            }
-            pos = next_pos;
+    fn ensure_fenced_code_blocks(&mut self) -> &[CachedFencedCodeBlock] {
+        if self.buffer.cached_fenced_blocks().is_none() {
+            let blocks = if rope_prefix_contains_fence_marker(
+                self.buffer.rope(),
+                self.buffer.len_bytes(),
+            ) {
+                parse_fenced_code_blocks(&self.buffer.to_string())
+            } else {
+                Vec::new()
+            };
+            self.buffer.set_cached_fenced_blocks(blocks);
         }
-        active_fence
+        self.buffer
+            .cached_fenced_blocks()
+            .expect("fenced blocks cache just populated")
     }
 
-    fn is_offset_inside_fenced_code_block(&self, target_line_start: ByteOffset) -> bool {
+    /// Returns `Some((fence_char, fence_len))` if the line starting at `target_line_start` is inside
+    /// the body of an unclosed fenced code block (` ``` ` or `~~~`, tracking fence character,
+    /// minimum opening length, blockquote/list-item containers, YAML front matter, and LF/CRLF/CR lines).
+    fn enclosing_fenced_code_block(&mut self, target_line_start: ByteOffset) -> Option<(u8, usize)> {
+        if target_line_start == 0 {
+            return None;
+        }
+        if self.buffer.cached_fenced_blocks().is_none()
+            && !rope_prefix_contains_fence_marker(self.buffer.rope(), target_line_start)
+        {
+            return None;
+        }
+        let len = self.buffer.len_bytes();
+        for block in self.ensure_fenced_code_blocks() {
+            if target_line_start > block.open_line_start
+                && (target_line_start < block.block_end
+                    || (!block.is_closed && block.block_end == len && target_line_start == len))
+            {
+                return Some((block.fence_char, block.fence_len));
+            }
+        }
+        None
+    }
+
+    fn is_offset_inside_fenced_code_block(&mut self, target_line_start: ByteOffset) -> bool {
         self.enclosing_fenced_code_block(target_line_start).is_some()
+    }
+
+    /// Returns `true` if inserting/replacing at `range` would write inside a fenced code block
+    /// or overwrite any part of an opening/closing code fence line (via CommonMark parsing with
+    /// closed byte-0 YAML front matter skipped).
+    fn range_intersects_fenced_code_block(&mut self, range: ByteRange) -> bool {
+        let len = self.buffer.len_bytes();
+        for block in self.ensure_fenced_code_blocks() {
+            if range.is_empty() {
+                if (range.start > block.open_line_start && range.start <= block.content_end)
+                    || (!block.is_closed && block.block_end == len && range.start == len)
+                {
+                    return true;
+                }
+            } else if range.start < block.block_end && range.end > block.open_line_start {
+                return true;
+            }
+        }
+        false
     }
 
     fn is_caret_in_gfm_table_or_piped_row(&self, line_start: ByteOffset) -> bool {
@@ -2316,7 +2372,7 @@ impl EditorContext<'_> {
     }
 
     fn check_third_enter_at_code_fence_end(
-        &self,
+        &mut self,
         caret: ByteOffset,
     ) -> Option<(ByteRange, ByteOffset)> {
         let full = self.buffer.to_string();
@@ -2386,6 +2442,184 @@ pub fn map_offset_across_reload(
     } else {
         new_suffix_start
     }
+}
+
+/// Split the next line starting at `pos`, handling LF (`\n`), CRLF (`\r\n`), and bare CR (`\r`).
+fn next_line_span_any_eol(bytes: &[u8], pos: usize) -> (usize, usize, usize) {
+    let mut end = pos;
+    while end < bytes.len() && bytes[end] != b'\n' && bytes[end] != b'\r' {
+        end += 1;
+    }
+    let next = if end < bytes.len() {
+        if bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n') {
+            end + 2
+        } else {
+            end + 1
+        }
+    } else {
+        end
+    };
+    (pos, end, next)
+}
+
+/// If `full` starts at byte 0 with a closed YAML front matter block (`---` at column 0 ... `---` / `...`),
+/// return the byte offset immediately after its closing delimiter line; otherwise return `0`.
+fn yaml_front_matter_end_offset(full: &str) -> usize {
+    let bytes = full.as_bytes();
+    if bytes.is_empty() {
+        return 0;
+    }
+    let (l0_start, l0_end, mut pos) = next_line_span_any_eol(bytes, 0);
+    if &full[l0_start..l0_end] != "---" {
+        return 0;
+    }
+    while pos < bytes.len() {
+        let (l_start, l_end, next_pos) = next_line_span_any_eol(bytes, pos);
+        let trimmed = full[l_start..l_end].trim();
+        if trimmed == "---" || trimmed == "..." {
+            return next_pos;
+        }
+        pos = next_pos;
+    }
+    0
+}
+
+/// Zero-allocation check for whether `rope[0..end_byte]` contains any ` ``` ` or `~~~` run.
+fn rope_prefix_contains_fence_marker(rope: &ropey::Rope, end_byte: usize) -> bool {
+    let clamped = end_byte.min(rope.len_bytes());
+    if clamped < 3 {
+        return false;
+    }
+    let mut last_ch = 0u8;
+    let mut run = 0usize;
+    for chunk in rope.byte_slice(0..clamped).chunks() {
+        for &b in chunk.as_bytes() {
+            if b == b'`' || b == b'~' {
+                if b == last_ch {
+                    run += 1;
+                    if run >= 3 {
+                        return true;
+                    }
+                } else {
+                    last_ch = b;
+                    run = 1;
+                }
+            } else {
+                last_ch = 0;
+                run = 0;
+            }
+        }
+    }
+    false
+}
+
+fn line_start_any_eol(bytes: &[u8], offset: usize) -> usize {
+    let mut i = offset.min(bytes.len());
+    while i > 0 && bytes[i - 1] != b'\n' && bytes[i - 1] != b'\r' {
+        i -= 1;
+    }
+    i
+}
+
+fn strip_single_trailing_eol_offset(bytes: &[u8], min_offset: usize, end: usize) -> usize {
+    if end <= min_offset {
+        return end;
+    }
+    if end >= min_offset + 2 && bytes[end - 2] == b'\r' && bytes[end - 1] == b'\n' {
+        end - 2
+    } else if bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r' {
+        end - 1
+    } else {
+        end
+    }
+}
+
+fn extract_fence_delimiter(opening_slice: &str) -> (u8, usize) {
+    let bytes = opening_slice.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i] != b'`' && bytes[i] != b'~' {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return (b'`', 3);
+    }
+    let ch = bytes[i];
+    let mut run = 0usize;
+    while i + run < bytes.len() && bytes[i + run] == ch {
+        run += 1;
+    }
+    (ch, run.max(3))
+}
+
+fn normalize_bare_cr_preserving_offsets(slice: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = slice.as_bytes();
+    let has_bare_cr = bytes
+        .iter()
+        .enumerate()
+        .any(|(i, &b)| b == b'\r' && bytes.get(i + 1) != Some(&b'\n'));
+    if !has_bare_cr {
+        return std::borrow::Cow::Borrowed(slice);
+    }
+    let mut out = bytes.to_vec();
+    for i in 0..out.len() {
+        if out[i] == b'\r' && out.get(i + 1) != Some(&b'\n') {
+            out[i] = b'\n';
+        }
+    }
+    std::borrow::Cow::Owned(String::from_utf8(out).expect("ASCII replacement preserves UTF-8"))
+}
+
+/// Extract all CommonMark fenced code block byte spans after skipping closed byte-0 YAML front matter.
+fn parse_fenced_code_blocks(full: &str) -> Vec<CachedFencedCodeBlock> {
+    let bytes = full.as_bytes();
+    let yaml_end = yaml_front_matter_end_offset(full);
+    let normalized = normalize_bare_cr_preserving_offsets(&full[yaml_end..]);
+
+    let mut blocks = Vec::new();
+    let mut current: Option<(ByteOffset, ByteOffset, ByteOffset, u8, usize)> = None;
+
+    for (event, rel_span) in
+        pulldown_cmark::Parser::new_ext(&normalized, pulldown_cmark::Options::empty())
+            .into_offset_iter()
+    {
+        match event {
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(
+                pulldown_cmark::CodeBlockKind::Fenced(_),
+            )) => {
+                let block_start = yaml_end + rel_span.start;
+                let block_end = yaml_end + rel_span.end;
+                let open_line_start = line_start_any_eol(bytes, block_start);
+                let (_, open_line_end, open_line_next) =
+                    next_line_span_any_eol(bytes, open_line_start);
+                let (fence_char, fence_len) =
+                    extract_fence_delimiter(&full[block_start.min(open_line_end)..open_line_end]);
+                current = Some((open_line_start, block_end, open_line_next, fence_char, fence_len));
+            }
+            pulldown_cmark::Event::Text(_) => {
+                if let Some((_, _, ref mut last_body_end, _, _)) = current {
+                    *last_body_end = (*last_body_end).max(yaml_end + rel_span.end);
+                }
+            }
+            pulldown_cmark::Event::End(pulldown_cmark::TagEnd::CodeBlock) => {
+                if let Some((open_line_start, block_end, last_body_end, fence_char, fence_len)) =
+                    current.take()
+                {
+                    let content_end =
+                        strip_single_trailing_eol_offset(bytes, open_line_start, block_end);
+                    blocks.push(CachedFencedCodeBlock {
+                        open_line_start,
+                        block_end,
+                        content_end,
+                        is_closed: last_body_end < block_end,
+                        fence_char,
+                        fence_len,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
 }
 
 /// Parse a CommonMark opening code fence (` ``` ` or `~~~` with up to 3 leading spaces, length >= 3).
@@ -4598,10 +4832,171 @@ mod tests {
             "| h1 | header2 |\r\n| --- | --- |\r\n| x | y |"
         );
 
-        let mut fence = EditorController::from_str("```md\n| a | b |\n| --- | --- |\n| 1 | 2 |\n```");
-        fence.set_caret(fence.buffer.to_string().find('1').unwrap());
+        let mut fence =
+            EditorController::from_str("```md\n| a | b |\n| --- | --- |\n| 1 | 2 |\n```\nafter");
+        let fence_src = fence.buffer.to_string();
+        // Inside body -> rejected
+        fence.set_caret(fence_src.find('1').unwrap());
+        assert!(!fence.insert_table(2, 2));
         assert!(!fence.insert_table_row_below());
         assert!(!fence.set_table_column_align(TableAlign::Right));
+        // End of opening fence line (` ```md| `) -> rejected
+        fence.set_caret(fence_src.find('\n').unwrap());
+        assert!(!fence.insert_table(2, 2));
+        // Selection from inside body across closing fence to `after` -> rejected
+        let inside_off = fence_src.find('1').unwrap();
+        let after_off = fence_src.find("after").unwrap() + 2;
+        fence.set_selection(inside_off, after_off);
+        assert!(!fence.insert_table(2, 2));
+        assert_eq!(fence.buffer.to_string(), fence_src);
+        // Caret on line after closing fence -> allowed
+        fence.set_caret(fence_src.len());
+        assert!(fence.insert_table(2, 2));
+
+        // Blockquote-nested fence: selection from inside across closing fence -> rejected; outside -> allowed
+        let bq_src = "> ```md\n> code line\n> ```\nafter";
+        let mut bq = EditorController::from_str(bq_src);
+        bq.set_selection(bq_src.find("code").unwrap(), bq_src.find("after").unwrap() + 2);
+        assert!(!bq.insert_table(2, 2));
+        assert_eq!(bq.buffer.to_string(), bq_src);
+        bq.set_caret(bq_src.len());
+        assert!(bq.insert_table(2, 2));
+
+        // Pure CR (`\r`) document: selection from inside across closing fence -> rejected; outside -> allowed
+        let cr_src = "```md\rcode line\r```\rafter";
+        let mut cr = EditorController::from_str(cr_src);
+        cr.set_selection(cr_src.find("code").unwrap(), cr_src.find("after").unwrap() + 2);
+        assert!(!cr.insert_table(2, 2));
+        assert_eq!(cr.buffer.to_string(), cr_src);
+        cr.set_caret(cr_src.len());
+        assert!(cr.insert_table(2, 2));
+
+        // YAML front matter containing a standalone ` ```md ` line must NOT block body table insertion
+        let yaml_src = "---\ntitle: demo\nnote: |\n  ```md\n---\n\nBody paragraph";
+        let mut yaml = EditorController::from_str(yaml_src);
+        yaml.set_caret(yaml_src.len());
+        assert!(yaml.insert_table(2, 2));
+        assert!(yaml.buffer.to_string().contains("| --- | --- |"));
+
+        // List-item nested fence (`- ```md`): selecting code body must still block table insertion
+        let list_src = "- ```md\n  code line\n  ```\nafter";
+        let mut list = EditorController::from_str(list_src);
+        let code_start = list_src.find("code").unwrap();
+        list.set_selection(code_start, code_start + 4);
+        assert!(!list.insert_table(2, 2));
+        assert_eq!(list.buffer.to_string(), list_src);
+        list.set_caret(list_src.len());
+        assert!(list.insert_table(2, 2));
+
+        // Indented `---` on line 0 is a thematic break, NOT YAML front matter, so the fence after it is protected
+        let indented_hr_src = "  ---\n```md\ncode line\n```\n---";
+        let mut hr = EditorController::from_str(indented_hr_src);
+        let hr_code = indented_hr_src.find("code").unwrap();
+        hr.set_selection(hr_code, hr_code + 4);
+        assert!(!hr.insert_table(2, 2));
+        assert_eq!(hr.buffer.to_string(), indented_hr_src);
+
+        // Continuation-line fenced code block inside unordered and ordered list items
+        for cont_src in [
+            "- Example\n\n    ```md\n    code line\n    ```\nafter",
+            "1. Example\n\n    ```md\n    code line\n    ```\nafter",
+            "- outer\n  - inner\n\n      ```md\n      code line\n      ```\nafter",
+        ] {
+            let mut ed_cont = EditorController::from_str(cont_src);
+            let c_start = cont_src.find("code").unwrap();
+            let after_start = cont_src.find("after").unwrap();
+            // Cross-closing-fence selection from code body into `after` must be rejected
+            ed_cont.set_selection(c_start, after_start + 2);
+            assert!(!ed_cont.insert_table(2, 2), "failed to block fence in: {cont_src}");
+            assert_eq!(ed_cont.buffer.to_string(), cont_src);
+            // Caret on `after` outside the list/fence succeeds
+            ed_cont.set_caret(cont_src.len());
+            assert!(ed_cont.insert_table(2, 2));
+        }
+
+        // Fence-like text inside a closed HTML comment must NOT block table insertion in body text
+        let html_comment_src = "<!--\n```md\n-->\n\nBody paragraph";
+        let mut html_comment = EditorController::from_str(html_comment_src);
+        html_comment.set_caret(html_comment_src.len());
+        assert!(html_comment.insert_table(2, 2));
+        assert!(html_comment.buffer.to_string().contains("| --- | --- |"));
+
+        // High-frequency typing (letters, spaces, Backspace, Enter) in normal paragraphs—even after
+        // fenced code blocks and in paragraphs containing inline code (`foo`)—must NOT trigger
+        // full-document Markdown fence parsing at all.
+        let mut big = String::from("```rs\nlet a = 1;\n```\n\n");
+        big.push_str(&"Paragraph text without code fences.\n".repeat(2000));
+        big.push_str("Use `foo` bar");
+        let mut big_ed = EditorController::from_str(&big);
+        big_ed.set_caret(big_ed.buffer.len_bytes());
+        for ch in " baz qux ".chars() {
+            big_ed.insert_char(ch);
+            assert!(
+                big_ed.buffer.cached_fenced_blocks().is_none(),
+                "plain paragraph insert_char({ch:?}) must not parse fenced blocks"
+            );
+        }
+        big_ed.backspace();
+        assert!(big_ed.buffer.cached_fenced_blocks().is_none());
+        big_ed.enter();
+        assert!(big_ed.buffer.cached_fenced_blocks().is_none());
+        // Explicit table command populates the exact-revision fence cache and blocks inside the fence.
+        let code_pos = big_ed.buffer.to_string().find("let a").unwrap();
+        big_ed.set_caret(code_pos);
+        assert!(!big_ed.insert_table(2, 2));
+        assert!(big_ed.buffer.cached_fenced_blocks().is_some());
+
+        // Deleting a plain char that completes an HTML block closer (`--x>` -> `-->`, `?x>` -> `?>`,
+        // `]]x>` -> `]]>`) must invalidate the fence cache so a newly exposed fenced code block blocks tables.
+        for (doc, needle) in [
+            ("<!--\nfoo --x>\n```md\ncode\n```", "x"),
+            ("<?pi\nfoo ?x>\n```md\ncode\n```", "x"),
+            ("<![CDATA[\nfoo ]]x>\n```md\ncode\n```", "x"),
+        ] {
+            let mut ed_close = EditorController::from_str(doc);
+            let code_pos = doc.find("code").unwrap();
+            assert!(!ed_close.ctx().range_intersects_fenced_code_block(ByteRange::empty(code_pos)));
+            assert!(ed_close.buffer.cached_fenced_blocks().is_some());
+            let x_pos = doc.find(needle).unwrap();
+            ed_close.set_caret(x_pos + 1);
+            ed_close.backspace();
+            assert!(ed_close.buffer.cached_fenced_blocks().is_none());
+            let new_code_pos = ed_close.buffer.to_string().find("code").unwrap();
+            ed_close.set_caret(new_code_pos);
+            assert!(!ed_close.insert_table(2, 2));
+        }
+
+        // Forming a Setext heading (`=x==` -> `===`) ends the paragraph before `<custom>`, allowing
+        // `<custom>` to open a Type-7 HTML block that absorbs the subsequent fence; cache must not stay stale.
+        let setext_doc = "Title\n=x==\n<custom>\n```md\ncode\n```";
+        let mut setext_ed = EditorController::from_str(setext_doc);
+        let setext_code = setext_doc.find("code").unwrap();
+        setext_ed.set_caret(setext_code);
+        assert!(!setext_ed.insert_table(2, 2));
+        assert!(setext_ed.buffer.cached_fenced_blocks().is_some());
+        let setext_x = setext_doc.find('x').unwrap();
+        setext_ed.set_caret(setext_x + 1);
+        setext_ed.backspace();
+        assert!(setext_ed.buffer.cached_fenced_blocks().is_none());
+        let after_setext_code = setext_ed.buffer.to_string().find("code").unwrap();
+        setext_ed.set_caret(after_setext_code);
+        assert!(setext_ed.insert_table(2, 2));
+
+        // Forming a thematic break (`_x__` -> `___`) similarly ends the paragraph before `<custom>`,
+        // letting `<custom>` open a Type-7 HTML block that absorbs the subsequent fence.
+        let tb_doc = "Title\n_x__\n<custom>\n```md\ncode\n```";
+        let mut tb_ed = EditorController::from_str(tb_doc);
+        let tb_code = tb_doc.find("code").unwrap();
+        tb_ed.set_caret(tb_code);
+        assert!(!tb_ed.insert_table(2, 2));
+        assert!(tb_ed.buffer.cached_fenced_blocks().is_some());
+        let tb_x = tb_doc.find('x').unwrap();
+        tb_ed.set_caret(tb_x + 1);
+        tb_ed.backspace();
+        assert!(tb_ed.buffer.cached_fenced_blocks().is_none());
+        let after_tb_code = tb_ed.buffer.to_string().find("code").unwrap();
+        tb_ed.set_caret(after_tb_code);
+        assert!(tb_ed.insert_table(2, 2));
     }
 
     #[test]

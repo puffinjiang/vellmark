@@ -219,6 +219,9 @@ fn expand_and_normalize_replacement(
 
 /// Replace a single match in `buffer` cleanly with undo history, normalizing inserted newlines
 /// to the document's dominant line ending.
+#[deprecated(
+    note = "use replace_match_in_buffer_with_line_ending to preserve single-line document EOL preferences"
+)]
 pub fn replace_match_in_buffer(
     buffer: &mut TextBuffer,
     undo: &mut UndoHistory,
@@ -270,6 +273,9 @@ pub fn replace_match_in_buffer_with_line_ending(
 
 /// Replace all matches in `buffer` inside a **single undo transaction** (PRD E-11), normalizing
 /// inserted newlines to the document's dominant line ending.
+#[deprecated(
+    note = "use replace_all_in_buffer_with_line_ending to preserve single-line document EOL preferences"
+)]
 pub fn replace_all_in_buffer(
     buffer: &mut TextBuffer,
     undo: &mut UndoHistory,
@@ -1386,13 +1392,14 @@ mod tests {
         assert_eq!(&text[wrapped_prev.range.start..wrapped_prev.range.end], "foo-30");
 
         // Replace All expands captures and collapses into ONE undoable transaction.
-        let out = replace_all_in_buffer(
+        let out = replace_all_in_buffer_with_line_ending(
             &mut buf,
             &mut undo,
             Selection::caret(10),
             r"foo-(\d+)",
             "item[$1]",
             opts,
+            LineEnding::Lf,
         )
         .unwrap();
         assert_eq!(out.replaced_count, 3);
@@ -1420,9 +1427,16 @@ mod tests {
         // Matches only before \r\n (at 3 and 8) and at EOF (13), never between \r and \n.
         assert_eq!(positions, vec![3, 8, 13]);
 
-        let out =
-            replace_all_in_buffer(&mut buf, &mut undo, Selection::caret(0), "$", "!", opts)
-                .unwrap();
+        let out = replace_all_in_buffer_with_line_ending(
+            &mut buf,
+            &mut undo,
+            Selection::caret(0),
+            "$",
+            "!",
+            opts,
+            LineEnding::Lf,
+        )
+        .unwrap();
         assert_eq!(out.replaced_count, 3);
         assert_eq!(buf.to_string(), "foo!\r\nbar!\r\nbaz!");
 

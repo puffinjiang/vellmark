@@ -66,11 +66,23 @@ impl Selection {
     }
 }
 
+/// Cached CommonMark fenced code block byte span for the current buffer revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CachedFencedCodeBlock {
+    pub open_line_start: ByteOffset,
+    pub block_end: ByteOffset,
+    pub content_end: ByteOffset,
+    pub is_closed: bool,
+    pub fence_char: u8,
+    pub fence_len: usize,
+}
+
 /// Rope-backed source text buffer with monotonic revision counter.
 #[derive(Debug, Clone)]
 pub struct TextBuffer {
     rope: Rope,
     revision: u64,
+    fenced_blocks_cache: Option<Vec<CachedFencedCodeBlock>>,
 }
 
 impl Default for TextBuffer {
@@ -84,6 +96,7 @@ impl TextBuffer {
         Self {
             rope: Rope::new(),
             revision: 0,
+            fenced_blocks_cache: None,
         }
     }
 
@@ -93,6 +106,7 @@ impl TextBuffer {
         Self {
             rope: Rope::from_str(text),
             revision: 0,
+            fenced_blocks_cache: None,
         }
     }
 
@@ -141,6 +155,14 @@ impl TextBuffer {
         self.rope.slice(start_char..end_char).to_string()
     }
 
+    pub(crate) fn cached_fenced_blocks(&self) -> Option<&[CachedFencedCodeBlock]> {
+        self.fenced_blocks_cache.as_deref()
+    }
+
+    pub(crate) fn set_cached_fenced_blocks(&mut self, blocks: Vec<CachedFencedCodeBlock>) {
+        self.fenced_blocks_cache = Some(blocks);
+    }
+
     /// Replace byte range `[range.start, range.end)` with `replacement`, returning the deleted text.
     pub fn replace_bytes(&mut self, range: ByteRange, replacement: &str) -> String {
         let start_char = self.rope.byte_to_char(range.start);
@@ -153,6 +175,7 @@ impl TextBuffer {
             self.rope.insert(start_char, replacement);
         }
         self.revision += 1;
+        self.fenced_blocks_cache = None;
         deleted
     }
 
@@ -160,6 +183,7 @@ impl TextBuffer {
     pub fn reset_content(&mut self, new_text: &str) {
         self.rope = Rope::from_str(new_text);
         self.revision += 1;
+        self.fenced_blocks_cache = None;
     }
 
     pub fn crc32(&self) -> u32 {

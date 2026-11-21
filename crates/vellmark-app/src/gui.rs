@@ -850,7 +850,7 @@ const PALETTE_COMMANDS: &[PaletteCommandEntry] = &[
     PaletteCommandEntry { id: PaletteCommandId::QuickOpen, label: "Go: Quick Open File...", shortcut: "Cmd/Ctrl+P" },
     PaletteCommandEntry { id: PaletteCommandId::GlobalSearch, label: "Search: Find in Workspace...", shortcut: "Cmd/Ctrl+Shift+F" },
     PaletteCommandEntry { id: PaletteCommandId::Find, label: "Edit: Find in Document", shortcut: "Cmd/Ctrl+F" },
-    PaletteCommandEntry { id: PaletteCommandId::FindAndReplace, label: "Edit: Find and Replace", shortcut: "Cmd/Ctrl+H" },
+    PaletteCommandEntry { id: PaletteCommandId::FindAndReplace, label: "Edit: Find and Replace", shortcut: "Cmd+Opt+F / Ctrl+H" },
     PaletteCommandEntry { id: PaletteCommandId::InsertTable, label: "Insert: Table...", shortcut: "Cmd/Ctrl+T" },
     PaletteCommandEntry { id: PaletteCommandId::InsertCodeBlock, label: "Insert / Edit: Code Block", shortcut: "Cmd+Option+C" },
     PaletteCommandEntry { id: PaletteCommandId::InsertLink, label: "Insert: Hyperlink...", shortcut: "Cmd/Ctrl+K" },
@@ -5363,7 +5363,7 @@ impl GuiController {
         }
     }
 
-    fn dispatch_editor(&mut self, action: EditorAction) {
+    fn dispatch_editor(&mut self, action: EditorAction) -> Option<bool> {
         self.find_focused = false;
         self.replace_focused = false;
         self.close_transient_prompts();
@@ -5372,12 +5372,16 @@ impl GuiController {
         let active_id = self.workbench.active_tab().map(|t| t.id);
         self.cancel_abandoned_tab_ime(active_id);
         let auto_align = self.workbench.config.table_auto_align;
-        if let Some(tab) = self.workbench.active_tab_mut() {
-            tab.view.table_auto_align = auto_align;
-            if let Err(e) = tab.dispatch(action) {
-                self.set_notice(format!("Read-only or blocked: {e}"));
-            } else {
+        let tab = self.workbench.active_tab_mut()?;
+        tab.view.table_auto_align = auto_align;
+        match tab.dispatch(action) {
+            Ok(changed) => {
                 self.pending_scroll_ensure_caret = true;
+                Some(changed)
+            }
+            Err(e) => {
+                self.set_notice(format!("Read-only or blocked: {e}"));
+                None
             }
         }
     }
@@ -6738,8 +6742,11 @@ impl GuiController {
                 return;
             };
             self.close_simple_prompt();
-            self.dispatch_editor(EditorAction::InsertTable { rows, cols });
-            self.set_notice(format!("Inserted {rows}×{cols} table"));
+            match self.dispatch_editor(EditorAction::InsertTable { rows, cols }) {
+                Some(true) => self.set_notice(format!("Inserted {rows}×{cols} table")),
+                Some(false) => self.set_notice("Cannot insert table inside a code block"),
+                None => {}
+            }
             return;
         }
 
@@ -9875,6 +9882,23 @@ Second duplicate body\n";
         gui.workbench.config.table_auto_align = false;
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
         assert!(!gui.workbench.active_tab().unwrap().view.table_auto_align);
+
+        // Confirming Insert Table prompt inside a fenced code block reports rejection instead of success
+        let code_doc = "```rust\nlet x = 1;\n```\n";
+        let tab = gui.workbench.active_tab_mut().unwrap();
+        tab.session.buffer.reset_content(code_doc);
+        tab.view.selection = Selection::caret(code_doc.find("let").unwrap());
+        gui.open_insert_table_prompt();
+        gui.insert_table_input = "2x2".to_string();
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            code_doc
+        );
+        assert!(gui
+            .status_notice
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("Cannot insert table")));
     }
 
     #[test]

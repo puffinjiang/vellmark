@@ -2395,10 +2395,10 @@ fn bounded_temp_name_prefix(file_name: &str) -> &str {
 fn create_unique_atomic_temp_file_with_seq(
     parent: &Path,
     prefix: &str,
-    existing_perms: Option<&fs::Permissions>,
+    private_mode: bool,
     seq_source: &AtomicU64,
 ) -> std::io::Result<(PathBuf, File)> {
-    let _ = existing_perms;
+    let _ = private_mode;
     const MAX_ATTEMPTS: usize = 64;
     let pid = std::process::id();
     let mut last_already_exists = None;
@@ -2411,8 +2411,9 @@ fn create_unique_atomic_temp_file_with_seq(
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            // Start private when updating an existing file so 0600 data is never world-readable.
-            if existing_perms.is_some() {
+            // Start private (0600) when updating an existing file or writing internal
+            // recovery/history artifacts so sensitive document drafts are never world-readable.
+            if private_mode {
                 opts.mode(0o600);
             }
         }
@@ -2437,14 +2438,22 @@ fn atomic_write_resolved(
     write_target: &Path,
     bytes: &[u8],
     existing_perms: Option<fs::Permissions>,
+    private_mode: bool,
 ) -> std::io::Result<()> {
-    atomic_write_resolved_with_seq(write_target, bytes, existing_perms, &NEXT_ATOMIC_TMP_SEQ)
+    atomic_write_resolved_with_seq(
+        write_target,
+        bytes,
+        existing_perms,
+        private_mode,
+        &NEXT_ATOMIC_TMP_SEQ,
+    )
 }
 
 fn atomic_write_resolved_with_seq(
     write_target: &Path,
     bytes: &[u8],
     existing_perms: Option<fs::Permissions>,
+    private_mode: bool,
     seq_source: &AtomicU64,
 ) -> std::io::Result<()> {
     let parent = match write_target.parent() {
@@ -2459,8 +2468,12 @@ fn atomic_write_resolved_with_seq(
 
     // Only clean up `tmp_path` after `create_unique_atomic_temp_file_with_seq` succeeds so an
     // existing colliding path is never removed on `AlreadyExists`.
-    let (tmp_path, mut f) =
-        create_unique_atomic_temp_file_with_seq(parent, prefix, existing_perms.as_ref(), seq_source)?;
+    let (tmp_path, mut f) = create_unique_atomic_temp_file_with_seq(
+        parent,
+        prefix,
+        private_mode || existing_perms.is_some(),
+        seq_source,
+    )?;
 
     let write_res = (|| -> std::io::Result<()> {
         f.write_all(bytes)?;
@@ -2495,10 +2508,11 @@ fn atomic_write_resolved_with_seq(
     Ok(())
 }
 
-/// Write an internal recovery/history artifact atomically without following symlinks at `target`.
+/// Write an internal recovery/history artifact atomically without following symlinks at `target`,
+/// using private `0600` permissions on Unix so unsaved drafts are never world-readable.
 pub(crate) fn atomic_write_internal_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let (write_target, _) = resolve_write_target_and_permissions(target, false, false)?;
-    atomic_write_resolved(&write_target, bytes, None)
+    atomic_write_resolved(&write_target, bytes, None, true)
 }
 
 /// Write to a unique temporary sibling file, preserve original file permissions, follow symlinks
@@ -2506,7 +2520,7 @@ pub(crate) fn atomic_write_internal_file(target: &Path, bytes: &[u8]) -> std::io
 /// Cleans up the temp file on any error so failed writes do not accumulate debris.
 pub fn atomic_write_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let (write_target, existing_perms) = resolve_write_target_and_permissions(target, true, true)?;
-    atomic_write_resolved(&write_target, bytes, existing_perms)
+    atomic_write_resolved(&write_target, bytes, existing_perms, false)
 }
 
 pub(crate) fn compute_bytes_crc32(bytes: &[u8]) -> u32 {
@@ -5568,7 +5582,7 @@ mod tests {
         fs::write(&collide_2, b"keep-2").unwrap();
 
         let seq = AtomicU64::new(1);
-        atomic_write_resolved_with_seq(&doc, b"written\n", None, &seq).unwrap();
+        atomic_write_resolved_with_seq(&doc, b"written\n", None, false, &seq).unwrap();
         assert_eq!(fs::read(&doc).unwrap(), b"written\n");
         assert_eq!(fs::read(&collide_1).unwrap(), b"keep-1");
         assert_eq!(fs::read(&collide_2).unwrap(), b"keep-2");
@@ -5584,6 +5598,7 @@ mod tests {
             &exhaust,
             b"should-fail",
             None,
+            false,
             &AtomicU64::new(1),
         )
         .unwrap_err();
@@ -5634,6 +5649,13 @@ mod tests {
                 SessionError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput
             ));
         }
+
+        // Internal recovery/history artifacts must be created with private 0600 permissions.
+        use std::os::unix::fs::PermissionsExt;
+        let rec_file = root.join("current.slot0.rec");
+        atomic_write_internal_file(&rec_file, b"private draft").unwrap();
+        let mode = fs::metadata(&rec_file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
 
         let _ = fs::remove_dir_all(&root);
     }
