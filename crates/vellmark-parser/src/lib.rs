@@ -144,7 +144,11 @@ pub fn parse_blocks(source: &str) -> Vec<BlockNode> {
                 while l_end < bytes.len() && bytes[l_end] != b'\n' {
                     l_end += 1;
                 }
-                let l_next = if l_end < bytes.len() { l_end + 1 } else { l_end };
+                let l_next = if l_end < bytes.len() {
+                    l_end + 1
+                } else {
+                    l_end
+                };
                 let l_str = source[l_start..l_end].trim_end_matches('\r').trim();
                 if l_str == "---" || l_str == "..." {
                     fm_close_end = Some(l_end);
@@ -175,7 +179,11 @@ pub fn parse_blocks(source: &str) -> Vec<BlockNode> {
                 while l_end < bytes.len() && bytes[l_end] != b'\n' {
                     l_end += 1;
                 }
-                let l_next = if l_end < bytes.len() { l_end + 1 } else { l_end };
+                let l_next = if l_end < bytes.len() {
+                    l_end + 1
+                } else {
+                    l_end
+                };
                 block_end = l_end;
                 after_fence_pos = l_next;
                 let candidate = source[l_start..l_end].trim_end_matches('\r');
@@ -405,7 +413,9 @@ pub fn copy_selection(source: &str, selection: Selection) -> CopyPayload {
 
     suffix_markers.reverse();
     let mut markdown = String::with_capacity(
-        prefix_markers.len() + (end - start) + suffix_markers.iter().map(|s| s.len()).sum::<usize>(),
+        prefix_markers.len()
+            + (end - start)
+            + suffix_markers.iter().map(|s| s.len()).sum::<usize>(),
     );
     markdown.push_str(&prefix_markers);
     markdown.push_str(&source[start..end]);
@@ -454,22 +464,25 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
 
         // Strong `**...**` (CommonMark left-flanking: content after `**` cannot be empty or start with whitespace)
         if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'*' {
-            if i + 2 < bytes.len() && !bytes[i + 2].is_ascii_whitespace()
+            if i + 2 < bytes.len()
+                && !bytes[i + 2].is_ascii_whitespace()
                 && let Some(rel_close) = find_closing_double(&bytes[i + 2..], b'*')
-                    && rel_close > 0 && !bytes[i + 2 + rel_close - 1].is_ascii_whitespace() {
-                        let close_idx = i + 2 + rel_close;
-                        spans.push(InlineSpan {
-                            kind: InlineKind::Strong,
-                            full_range: ByteRange::new(start + i, start + close_idx + 2),
-                            open_marker: ByteRange::new(start + i, start + i + 2),
-                            close_marker: ByteRange::new(start + close_idx, start + close_idx + 2),
-                        });
-                        // Also recursively scan inside the strong span for nested emphasis (PRD 4.1.1 A)
-                        let nested = parse_inlines(source, start + i + 2, start + close_idx);
-                        spans.extend(nested);
-                        i = close_idx + 2;
-                        continue;
-                    }
+                && rel_close > 0
+                && !bytes[i + 2 + rel_close - 1].is_ascii_whitespace()
+            {
+                let close_idx = i + 2 + rel_close;
+                spans.push(InlineSpan {
+                    kind: InlineKind::Strong,
+                    full_range: ByteRange::new(start + i, start + close_idx + 2),
+                    open_marker: ByteRange::new(start + i, start + i + 2),
+                    close_marker: ByteRange::new(start + close_idx, start + close_idx + 2),
+                });
+                // Also recursively scan inside the strong span for nested emphasis (PRD 4.1.1 A)
+                let nested = parse_inlines(source, start + i + 2, start + close_idx);
+                spans.extend(nested);
+                i = close_idx + 2;
+                continue;
+            }
             // Skip the entire run of consecutive `*` so `**` is not re-parsed as empty `*` + `*`
             while i < bytes.len() && bytes[i] == b'*' {
                 i += 1;
@@ -479,19 +492,22 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
 
         // Strikethrough `~~...~~`
         if i + 1 < bytes.len() && bytes[i] == b'~' && bytes[i + 1] == b'~' {
-            if i + 2 < bytes.len() && !bytes[i + 2].is_ascii_whitespace()
+            if i + 2 < bytes.len()
+                && !bytes[i + 2].is_ascii_whitespace()
                 && let Some(rel_close) = find_closing_double(&bytes[i + 2..], b'~')
-                    && rel_close > 0 && !bytes[i + 2 + rel_close - 1].is_ascii_whitespace() {
-                        let close_idx = i + 2 + rel_close;
-                        spans.push(InlineSpan {
-                            kind: InlineKind::Strikethrough,
-                            full_range: ByteRange::new(start + i, start + close_idx + 2),
-                            open_marker: ByteRange::new(start + i, start + i + 2),
-                            close_marker: ByteRange::new(start + close_idx, start + close_idx + 2),
-                        });
-                        i = close_idx + 2;
-                        continue;
-                    }
+                && rel_close > 0
+                && !bytes[i + 2 + rel_close - 1].is_ascii_whitespace()
+            {
+                let close_idx = i + 2 + rel_close;
+                spans.push(InlineSpan {
+                    kind: InlineKind::Strikethrough,
+                    full_range: ByteRange::new(start + i, start + close_idx + 2),
+                    open_marker: ByteRange::new(start + i, start + i + 2),
+                    close_marker: ByteRange::new(start + close_idx, start + close_idx + 2),
+                });
+                i = close_idx + 2;
+                continue;
+            }
             while i < bytes.len() && bytes[i] == b'~' {
                 i += 1;
             }
@@ -500,19 +516,23 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
 
         // Emphasis `*...*` (cannot be empty or start/end with whitespace)
         if bytes[i] == b'*'
-            && i + 1 < bytes.len() && bytes[i + 1] != b'*' && !bytes[i + 1].is_ascii_whitespace()
-                && let Some(rel_close) = find_closing_single(&bytes[i + 1..], b'*')
-                    && rel_close > 0 && !bytes[i + 1 + rel_close - 1].is_ascii_whitespace() {
-                        let close_idx = i + 1 + rel_close;
-                        spans.push(InlineSpan {
-                            kind: InlineKind::Emphasis,
-                            full_range: ByteRange::new(start + i, start + close_idx + 1),
-                            open_marker: ByteRange::new(start + i, start + i + 1),
-                            close_marker: ByteRange::new(start + close_idx, start + close_idx + 1),
-                        });
-                        i = close_idx + 1;
-                        continue;
-                    }
+            && i + 1 < bytes.len()
+            && bytes[i + 1] != b'*'
+            && !bytes[i + 1].is_ascii_whitespace()
+            && let Some(rel_close) = find_closing_single(&bytes[i + 1..], b'*')
+            && rel_close > 0
+            && !bytes[i + 1 + rel_close - 1].is_ascii_whitespace()
+        {
+            let close_idx = i + 1 + rel_close;
+            spans.push(InlineSpan {
+                kind: InlineKind::Emphasis,
+                full_range: ByteRange::new(start + i, start + close_idx + 1),
+                open_marker: ByteRange::new(start + i, start + i + 1),
+                close_marker: ByteRange::new(start + close_idx, start + close_idx + 1),
+            });
+            i = close_idx + 1;
+            continue;
+        }
 
         // Image `![alt](url)` and Link `[text](url)`
         let link_open_len = if bytes[i] == b'!' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
@@ -523,33 +543,33 @@ pub fn parse_inlines(source: &str, start: ByteOffset, end: ByteOffset) -> Vec<In
             None
         };
         if let Some((kind, open_len)) = link_open_len
-            && let Some(rel_bracket) = find_closing_single(&bytes[i + open_len..], b']') {
-                let close_bracket = i + open_len + rel_bracket;
-                if close_bracket + 1 < bytes.len() && bytes[close_bracket + 1] == b'('
-                    && let Some(close_paren) = find_matching_paren(&bytes[close_bracket + 2..]) {
-                        let inner = &source
-                            [start + close_bracket + 2..start + close_bracket + 2 + close_paren];
-                        if extract_link_destination(inner).is_some() {
-                            let span_end = close_bracket + 2 + close_paren + 1;
-                            spans.push(InlineSpan {
-                                kind,
-                                full_range: ByteRange::new(start + i, start + span_end),
-                                open_marker: ByteRange::new(start + i, start + i + open_len),
-                                close_marker: ByteRange::new(start + close_bracket, start + span_end),
-                            });
-                            if kind == InlineKind::Link && close_bracket > i + open_len {
-                                let nested = parse_inlines(
-                                    source,
-                                    start + i + open_len,
-                                    start + close_bracket,
-                                );
-                                spans.extend(nested);
-                            }
-                            i = span_end;
-                            continue;
-                        }
+            && let Some(rel_bracket) = find_closing_single(&bytes[i + open_len..], b']')
+        {
+            let close_bracket = i + open_len + rel_bracket;
+            if close_bracket + 1 < bytes.len()
+                && bytes[close_bracket + 1] == b'('
+                && let Some(close_paren) = find_matching_paren(&bytes[close_bracket + 2..])
+            {
+                let inner =
+                    &source[start + close_bracket + 2..start + close_bracket + 2 + close_paren];
+                if extract_link_destination(inner).is_some() {
+                    let span_end = close_bracket + 2 + close_paren + 1;
+                    spans.push(InlineSpan {
+                        kind,
+                        full_range: ByteRange::new(start + i, start + span_end),
+                        open_marker: ByteRange::new(start + i, start + i + open_len),
+                        close_marker: ByteRange::new(start + close_bracket, start + span_end),
+                    });
+                    if kind == InlineKind::Link && close_bracket > i + open_len {
+                        let nested =
+                            parse_inlines(source, start + i + open_len, start + close_bracket);
+                        spans.extend(nested);
                     }
+                    i = span_end;
+                    continue;
+                }
             }
+        }
 
         i += 1;
     }
@@ -675,9 +695,7 @@ fn validate_optional_link_title_tail(after_dest: &str) -> bool {
             return false;
         }
         if bytes[i] == close {
-            return after_ws[i + 1..]
-                .bytes()
-                .all(|b| b == b' ' || b == b'\t');
+            return after_ws[i + 1..].bytes().all(|b| b == b' ' || b == b'\t');
         }
         if bytes[i] == b'\r' || bytes[i] == b'\n' {
             return false;
@@ -807,7 +825,10 @@ fn shift_offset(off: ByteOffset, delta: isize) -> ByteOffset {
 }
 
 fn shift_range(range: ByteRange, delta: isize) -> ByteRange {
-    ByteRange::new(shift_offset(range.start, delta), shift_offset(range.end, delta))
+    ByteRange::new(
+        shift_offset(range.start, delta),
+        shift_offset(range.end, delta),
+    )
 }
 
 impl BlockNode {
@@ -928,7 +949,9 @@ impl IncrementalDoc {
         // Step back to a preceding blank-line boundary within a small lookback when
         // possible, ensuring setext/table/list continuations cannot leak leftward.
         let min_lookback = start_idx.saturating_sub(3);
-        while start_idx > min_lookback && !preceded_by_blank_line(&new_source, self.blocks[start_idx].range.start) {
+        while start_idx > min_lookback
+            && !preceded_by_blank_line(&new_source, self.blocks[start_idx].range.start)
+        {
             start_idx -= 1;
         }
         // If `start_idx` begins right after a Table block (e.g. merged/split without blank line)
@@ -939,8 +962,13 @@ impl IncrementalDoc {
                     && matches!(self.blocks[start_idx - 1].kind, BlockKind::Paragraph)
                     && self
                         .source
-                        .get(self.blocks[start_idx - 1].range.start..self.blocks[start_idx - 1].range.end)
-                        .is_some_and(|line| parse_table_cell_rel_ranges(line.trim_end_matches('\r')).is_some())))
+                        .get(
+                            self.blocks[start_idx - 1].range.start
+                                ..self.blocks[start_idx - 1].range.end,
+                        )
+                        .is_some_and(|line| {
+                            parse_table_cell_rel_ranges(line.trim_end_matches('\r')).is_some()
+                        })))
         {
             start_idx -= 1;
         }
@@ -1125,8 +1153,7 @@ fn compute_dirty_byte_span(old: &str, new: &str) -> (ByteOffset, ByteOffset, Byt
         suffix += 1;
     }
     while suffix > 0
-        && (!old.is_char_boundary(old.len() - suffix)
-            || !new.is_char_boundary(new.len() - suffix))
+        && (!old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix))
     {
         suffix -= 1;
     }
@@ -1234,7 +1261,8 @@ mod tests {
 
     #[test]
     fn test_prd_f04_extract_outline_ignores_frontmatter_and_code_fences() {
-        let md = "---\n# not a heading\n---\n# Chapter 1\n```sh\n# comment\n```\n## Section 1.1\nBody";
+        let md =
+            "---\n# not a heading\n---\n# Chapter 1\n```sh\n# comment\n```\n## Section 1.1\nBody";
         let outline = extract_outline(md);
         assert_eq!(outline.len(), 2);
         assert_eq!(outline[0].level, 1);
@@ -1284,11 +1312,9 @@ mod tests {
             "inline code should suppress bold/link parsing inside it"
         );
         assert!(
-            spans
-                .iter()
-                .any(|s| s.kind == InlineKind::Link
-                    && &code_src[s.full_range.start..s.full_range.end]
-                        == "[click **here**](https://example.com)"),
+            spans.iter().any(|s| s.kind == InlineKind::Link
+                && &code_src[s.full_range.start..s.full_range.end]
+                    == "[click **here**](https://example.com)"),
             "expected trailing link span"
         );
 
@@ -1360,7 +1386,12 @@ mod tests {
     ) -> IncrementalUpdate {
         let mut next = inc.source().to_string();
         next.replace_range(old_start..old_end, replacement);
-        let upd = inc.apply_edit(next.clone(), old_start, old_end, old_start + replacement.len());
+        let upd = inc.apply_edit(
+            next.clone(),
+            old_start,
+            old_end,
+            old_start + replacement.len(),
+        );
         assert_eq!(
             inc.blocks(),
             parse_blocks(&next).as_slice(),
@@ -1421,12 +1452,18 @@ mod tests {
 
         // 2. Edit inside a closed CodeFence without touching fence delimiters (partial reuse)
         let let_x = inc.source().find("let x = 1;").unwrap();
-        let fence_upd = apply_text_patch(&mut inc, let_x, let_x + "let x = 1;".len(), "let y = 42;\nprintln!(\"{y}\");");
+        let fence_upd = apply_text_patch(
+            &mut inc,
+            let_x,
+            let_x + "let x = 1;".len(),
+            "let y = 42;\nprintln!(\"{y}\");",
+        );
         assert!(!fence_upd.full_reparse);
         assert!(fence_upd.shifted_suffix_blocks >= 1);
 
         // 3. Delete blank line merging two paragraphs or splitting block
-        let tail_a = inc.source().find("Tail paragraph A\n\nTail").unwrap() + "Tail paragraph A".len();
+        let tail_a =
+            inc.source().find("Tail paragraph A\n\nTail").unwrap() + "Tail paragraph A".len();
         apply_text_patch(&mut inc, tail_a, tail_a + 1, "");
 
         // 4. Open a code fence mid-document and later close it
@@ -1464,7 +1501,12 @@ mod tests {
         // Edit right in the middle (#2500)
         let target = "Paragraph #2500";
         let pos = doc.find(target).unwrap();
-        let upd = apply_text_patch(&mut inc, pos, pos + target.len(), "## Heading 2500 Replaced");
+        let upd = apply_text_patch(
+            &mut inc,
+            pos,
+            pos + target.len(),
+            "## Heading 2500 Replaced",
+        );
         assert!(!upd.full_reparse);
         assert!(upd.reused_prefix_blocks > 4_900);
         assert!(upd.shifted_suffix_blocks > 4_900);
@@ -1570,11 +1612,15 @@ mod tests {
             vec![TableAlign::Left, TableAlign::Center, TableAlign::Right]
         );
         assert_eq!(
-            no_outer_pipes.get(nop_rows[0].cells[0].content_range.start..nop_rows[0].cells[0].content_range.end),
+            no_outer_pipes.get(
+                nop_rows[0].cells[0].content_range.start..nop_rows[0].cells[0].content_range.end
+            ),
             Some("Name")
         );
         assert_eq!(
-            no_outer_pipes.get(nop_rows[2].cells[1].content_range.start..nop_rows[2].cells[1].content_range.end),
+            no_outer_pipes.get(
+                nop_rows[2].cells[1].content_range.start..nop_rows[2].cells[1].content_range.end
+            ),
             Some("**Dev**")
         );
 
@@ -1588,7 +1634,10 @@ mod tests {
         );
         assert_eq!(ended_blocks[1].kind, BlockKind::Paragraph);
         assert_eq!(ended_blocks[2].kind, BlockKind::Table);
-        assert!(matches!(ended_blocks[3].kind, BlockKind::Heading { level: 1, .. }));
+        assert!(matches!(
+            ended_blocks[3].kind,
+            BlockKind::Heading { level: 1, .. }
+        ));
 
         // Incremental merge when typing delimiter row underneath contiguous paragraph lines.
         let base = "L1\nL2\nL3\nL4\n| A | B |\n";
@@ -1629,7 +1678,10 @@ mod tests {
         assert_eq!(ctx.delim_cols, 2);
         assert_eq!(ctx.rows.len(), 3);
         assert_eq!(ctx.row_idx, 2);
-        assert_eq!(&with_prefix[ctx.range.start..ctx.range.end], "| a | b |\n| - | - |\n| 1 | 2 |");
+        assert_eq!(
+            &with_prefix[ctx.range.start..ctx.range.end],
+            "| a | b |\n| - | - |\n| 1 | 2 |"
+        );
     }
 
     #[test]
@@ -1648,35 +1700,26 @@ mod tests {
                 "expected `{bad}` not to parse as Link, got {spans:?}"
             );
             let html = render_markdown_to_html(bad);
-            assert!(!html.contains("<a "), "pulldown-cmark unexpectedly linked `{bad}`: {html}");
+            assert!(
+                !html.contains("<a "),
+                "pulldown-cmark unexpectedly linked `{bad}`: {html}"
+            );
         }
 
         // Valid CommonMark links with escapes, angle brackets, titles, and parens parse & extract losslessly.
         let cases = [
-            (
-                "[t](https://example.com/a\\(b)",
-                "https://example.com/a(b",
-            ),
+            ("[t](https://example.com/a\\(b)", "https://example.com/a(b"),
             (
                 "[t](https://en.wikipedia.org/wiki/Rust_(programming_language))",
                 "https://en.wikipedia.org/wiki/Rust_(programming_language)",
             ),
-            (
-                "[t](<my file (1).md> \"Doc ) Title\")",
-                "my file (1).md",
-            ),
+            ("[t](<my file (1).md> \"Doc ) Title\")", "my file (1).md"),
             (
                 "[t](<http://example.com/a\\>b\\>> \"t\")",
                 "http://example.com/a>b>",
             ),
-            (
-                "[t](<my folder\\\\>)",
-                "my folder\\",
-            ),
-            (
-                "[t](http://example.com/a\\\\b)",
-                "http://example.com/a\\b",
-            ),
+            ("[t](<my folder\\\\>)", "my folder\\"),
+            ("[t](http://example.com/a\\\\b)", "http://example.com/a\\b"),
         ];
         for (md, expected_dest) in cases {
             let spans = parse_inlines(md, 0, md.len());
@@ -1686,9 +1729,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected Link span in `{md}`"));
             let close = &md[link.close_marker.start..link.close_marker.end];
             let inner = close.strip_prefix("](").unwrap().strip_suffix(')').unwrap();
-            assert_eq!(extract_link_destination(inner).as_deref(), Some(expected_dest));
+            assert_eq!(
+                extract_link_destination(inner).as_deref(),
+                Some(expected_dest)
+            );
             let html = render_markdown_to_html(md);
-            assert!(html.contains("<a href="), "expected HTML link for `{md}`: {html}");
+            assert!(
+                html.contains("<a href="),
+                "expected HTML link for `{md}`: {html}"
+            );
         }
     }
 }

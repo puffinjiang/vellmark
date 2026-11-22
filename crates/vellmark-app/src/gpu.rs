@@ -174,10 +174,11 @@ impl GlyphAtlas {
             SwashContent::SubpixelMask => {
                 let mut out = Vec::with_capacity((w * h * 4) as usize);
                 for chunk in img.data.as_chunks::<3>().0 {
-                    let lum =
-                        (0.299 * chunk[0] as f32 + 0.587 * chunk[1] as f32 + 0.114 * chunk[2] as f32)
-                            .round()
-                            .clamp(0.0, 255.0) as u8;
+                    let lum = (0.299 * chunk[0] as f32
+                        + 0.587 * chunk[1] as f32
+                        + 0.114 * chunk[2] as f32)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
                     out.extend_from_slice(&[255, 255, 255, lum]);
                 }
                 (out, false)
@@ -507,7 +508,11 @@ impl WgpuRenderer {
 
         let uniform = GlobalsUniform {
             viewport_size: [self.config.width as f32, self.config.height as f32],
-            is_srgb_target: if self.config.format.is_srgb() { 1.0 } else { 0.0 },
+            is_srgb_target: if self.config.format.is_srgb() {
+                1.0
+            } else {
+                0.0
+            },
             _pad: 0.0,
         };
         self.queue
@@ -642,13 +647,11 @@ impl WgpuRenderer {
         });
     }
 
-    fn push_glyph_instance(
-        &mut self,
-        g: &SceneGlyph,
-        scale: f32,
-        font_system: &mut FontSystem,
-    ) {
-        let Some(entry) = self.atlas.get_or_upload(font_system_queue(&self.queue), font_system, g.cache_key) else {
+    fn push_glyph_instance(&mut self, g: &SceneGlyph, scale: f32, font_system: &mut FontSystem) {
+        let Some(entry) =
+            self.atlas
+                .get_or_upload(font_system_queue(&self.queue), font_system, g.cache_key)
+        else {
             return;
         };
         let clip = g
@@ -805,8 +808,7 @@ impl WgpuRenderer {
                 break;
             };
             if let Some(old) = self.image_textures.remove(&victim) {
-                self.image_texture_bytes =
-                    self.image_texture_bytes.saturating_sub(old.byte_size);
+                self.image_texture_bytes = self.image_texture_bytes.saturating_sub(old.byte_size);
             }
         }
     }

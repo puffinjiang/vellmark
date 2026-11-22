@@ -171,7 +171,9 @@ impl ImageCache {
             return ImageLoadStatus::NetworkBlocked;
         }
         let key = CacheKey {
-            base_dir: (!is_self_contained_source(source)).then(|| base_dir.map(Path::to_path_buf)).flatten(),
+            base_dir: (!is_self_contained_source(source))
+                .then(|| base_dir.map(Path::to_path_buf))
+                .flatten(),
             source: source.to_string(),
         };
         match self.entries.get(&key) {
@@ -187,7 +189,9 @@ impl ImageCache {
     /// Returns decoded RGBA8 pixels for rendering a visible `SceneImage`.
     pub fn get_decoded(&mut self, base_dir: Option<&Path>, source: &str) -> Option<DecodedImage> {
         let key = CacheKey {
-            base_dir: (!is_self_contained_source(source)).then(|| base_dir.map(Path::to_path_buf)).flatten(),
+            base_dir: (!is_self_contained_source(source))
+                .then(|| base_dir.map(Path::to_path_buf))
+                .flatten(),
             source: source.to_string(),
         };
         self.use_seq = self.use_seq.wrapping_add(1);
@@ -410,10 +414,7 @@ fn fetch_remote_image_bytes(url: &str) -> Option<Vec<u8>> {
         ])
         .output()
         .ok()?;
-    if !out.status.success()
-        || out.stdout.is_empty()
-        || out.stdout.len() > MAX_IMAGE_SOURCE_BYTES
-    {
+    if !out.status.success() || out.stdout.is_empty() || out.stdout.len() > MAX_IMAGE_SOURCE_BYTES {
         return None;
     }
     Some(out.stdout)
@@ -582,7 +583,12 @@ mod tests {
         buf.into_inner()
     }
 
-    fn wait_for_cache(cache: &mut ImageCache, base: Option<&Path>, src: &str, allow_net: bool) -> ImageLoadStatus {
+    fn wait_for_cache(
+        cache: &mut ImageCache,
+        base: Option<&Path>,
+        src: &str,
+        allow_net: bool,
+    ) -> ImageLoadStatus {
         for _ in 0..100 {
             cache.drain_completed();
             let st = cache.status_for(base, src, allow_net);
@@ -615,7 +621,10 @@ mod tests {
 
         // 1. Relative percent-encoded local path decodes asynchronously & fires redraw callback.
         let rel = "./assets/my%20chart.png".to_string();
-        assert_eq!(cache.status_for(Some(&dir), &rel, true), ImageLoadStatus::Pending);
+        assert_eq!(
+            cache.status_for(Some(&dir), &rel, true),
+            ImageLoadStatus::Pending
+        );
         cache.request_images(Some(&dir), std::slice::from_ref(&rel), true);
         assert_eq!(
             wait_for_cache(&mut cache, Some(&dir), &rel, true),
@@ -660,7 +669,10 @@ mod tests {
     #[test]
     fn test_decode_base64_str_valid_and_invalid() {
         assert_eq!(decode_base64_str("SGVsbG8=", 64), Some(b"Hello".to_vec()));
-        assert_eq!(decode_base64_str("SGVs\n bG8h", 64), Some(b"Hello!".to_vec()));
+        assert_eq!(
+            decode_base64_str("SGVs\n bG8h", 64),
+            Some(b"Hello!".to_vec())
+        );
         assert_eq!(decode_base64_str("abc", 64), None);
         assert_eq!(decode_base64_str("SGVsbG8=", 2), None);
         assert_eq!(decode_base64_str("SGVs=G8=", 64), None);

@@ -112,17 +112,20 @@ impl ClipboardBackend for NativeClipboard {
                     image_png: None,
                 };
             }
-            let text = pb.stringForType(NSPasteboardTypeString).map(|s| s.to_string());
-            let html = pb.stringForType(NSPasteboardTypeHTML).map(|s| s.to_string());
+            let text = pb
+                .stringForType(NSPasteboardTypeString)
+                .map(|s| s.to_string());
+            let html = pb
+                .stringForType(NSPasteboardTypeHTML)
+                .map(|s| s.to_string());
             // Prefer text/HTML whenever present; read bitmap only when no text payload exists.
             let image_png = if text.is_none() {
                 pb.dataForType(NSPasteboardTypePNG)
                     .map(|d| d.bytes().to_vec())
                     .filter(|b| !b.is_empty() && b.len() <= MAX_CLIPBOARD_IMAGE_BYTES)
                     .or_else(|| {
-                        pb.dataForType(NSPasteboardTypeTIFF).and_then(|d| {
-                            decode_to_png_bytes(d.bytes(), image::ImageFormat::Tiff)
-                        })
+                        pb.dataForType(NSPasteboardTypeTIFF)
+                            .and_then(|d| decode_to_png_bytes(d.bytes(), image::ImageFormat::Tiff))
                     })
             } else {
                 None
@@ -196,11 +199,17 @@ impl ClipboardBackend for NativeClipboard {
             .or_else(|| read_cmd("xclip", &["-o", "-selection", "clipboard"]))
             .or_else(|| read_cmd("xsel", &["--clipboard", "--output"]));
         let html = read_cmd("wl-paste", &["--no-newline", "--type", "text/html"]).or_else(|| {
-            read_cmd("xclip", &["-o", "-selection", "clipboard", "-t", "text/html"])
+            read_cmd(
+                "xclip",
+                &["-o", "-selection", "clipboard", "-t", "text/html"],
+            )
         });
         let image_png = if text.is_none() {
             read_cmd_bytes("wl-paste", &["--no-newline", "--type", "image/png"]).or_else(|| {
-                read_cmd_bytes("xclip", &["-o", "-selection", "clipboard", "-t", "image/png"])
+                read_cmd_bytes(
+                    "xclip",
+                    &["-o", "-selection", "clipboard", "-t", "image/png"],
+                )
             })
         } else {
             None
@@ -343,7 +352,10 @@ mod tests {
             html: None,
             image_png: Some(vec![0x89, b'P', b'N', b'G']),
         });
-        assert_eq!(clip.read().image_png.as_deref(), Some(&[0x89, b'P', b'N', b'G'][..]));
+        assert_eq!(
+            clip.read().image_png.as_deref(),
+            Some(&[0x89, b'P', b'N', b'G'][..])
+        );
         clip.write("hello", Some("<b>hello</b>")).unwrap();
         let after = clip.read();
         assert_eq!(after.text.as_deref(), Some("hello"));

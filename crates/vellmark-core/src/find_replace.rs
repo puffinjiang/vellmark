@@ -86,7 +86,10 @@ pub fn find_next_match(
     if matches.is_empty() {
         return Ok(None);
     }
-    let found = matches.iter().find(|m| m.range.start >= from_offset).cloned();
+    let found = matches
+        .iter()
+        .find(|m| m.range.start >= from_offset)
+        .cloned();
     if found.is_some() || !wrap {
         Ok(found)
     } else {
@@ -515,7 +518,10 @@ enum CharMatcher {
     AnyNoNewline,
     AnyCharIncludingNewline,
     Single(char),
-    Class { negated: bool, items: Vec<ClassItem> },
+    Class {
+        negated: bool,
+        items: Vec<ClassItem>,
+    },
 }
 
 impl CharMatcher {
@@ -788,9 +794,9 @@ impl<'a> RegexParser<'a> {
     }
 
     fn parse_atom(&mut self) -> Result<Ast, FindError> {
-        let ch = self.bump().ok_or_else(|| {
-            FindError::InvalidRegex("unexpected end of regex".to_string())
-        })?;
+        let ch = self
+            .bump()
+            .ok_or_else(|| FindError::InvalidRegex("unexpected end of regex".to_string()))?;
         match ch {
             '*' | '+' | '?' | '{' => Err(FindError::InvalidRegex(format!(
                 "nothing to repeat before '{ch}'"
@@ -833,9 +839,9 @@ impl<'a> RegexParser<'a> {
     }
 
     fn parse_escape(&mut self) -> Result<Ast, FindError> {
-        let ch = self.bump().ok_or_else(|| {
-            FindError::InvalidRegex("trailing '\\' in pattern".to_string())
-        })?;
+        let ch = self
+            .bump()
+            .ok_or_else(|| FindError::InvalidRegex("trailing '\\' in pattern".to_string()))?;
         match ch {
             'd' => Ok(shorthand_class(false, ClassItem::Digit)),
             'D' => Ok(shorthand_class(false, ClassItem::NotDigit)),
@@ -863,7 +869,9 @@ impl<'a> RegexParser<'a> {
         let mut first = true;
         loop {
             let Some(ch) = self.bump() else {
-                return Err(FindError::InvalidRegex("unclosed '[' character class".to_string()));
+                return Err(FindError::InvalidRegex(
+                    "unclosed '[' character class".to_string(),
+                ));
             };
             if ch == ']' && !first {
                 break;
@@ -886,11 +894,17 @@ impl<'a> RegexParser<'a> {
         Ok(Ast::Matcher(CharMatcher::Class { negated, items }))
     }
 
-    fn finish_class_char(&mut self, start: char, items: &mut Vec<ClassItem>) -> Result<(), FindError> {
+    fn finish_class_char(
+        &mut self,
+        start: char,
+        items: &mut Vec<ClassItem>,
+    ) -> Result<(), FindError> {
         if self.peek() == Some('-') && !self.src[self.pos + 1..].starts_with(']') {
             self.bump(); // consume '-'
             let Some(next) = self.bump() else {
-                return Err(FindError::InvalidRegex("unclosed '[' character class".to_string()));
+                return Err(FindError::InvalidRegex(
+                    "unclosed '[' character class".to_string(),
+                ));
             };
             let end = if next == '\\' {
                 let esc = self.bump().ok_or_else(|| {
@@ -1057,17 +1071,18 @@ impl CompiledRegex {
                     }
                     Inst::Char(matcher) => {
                         if let Some(ch) = opt_ch
-                            && matcher.matches(ch, self.case_sensitive) {
-                                self.add_thread(
-                                    &mut next,
-                                    pc + 1,
-                                    slots,
-                                    text,
-                                    pos + char_len,
-                                    generation,
-                                    &mut seen,
-                                );
-                            }
+                            && matcher.matches(ch, self.case_sensitive)
+                        {
+                            self.add_thread(
+                                &mut next,
+                                pc + 1,
+                                slots,
+                                text,
+                                pos + char_len,
+                                generation,
+                                &mut seen,
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -1389,7 +1404,10 @@ mod tests {
         let wrapped_prev = find_prev_match(&text, r"foo-(\d+)", 0, true, opts)
             .unwrap()
             .unwrap();
-        assert_eq!(&text[wrapped_prev.range.start..wrapped_prev.range.end], "foo-30");
+        assert_eq!(
+            &text[wrapped_prev.range.start..wrapped_prev.range.end],
+            "foo-30"
+        );
 
         // Replace All expands captures and collapses into ONE undoable transaction.
         let out = replace_all_in_buffer_with_line_ending(

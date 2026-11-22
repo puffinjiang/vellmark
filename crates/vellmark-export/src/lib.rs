@@ -113,12 +113,12 @@ fn strip_forbidden_element(html: &str, tag_lower: &str) -> String {
                     if matches!(
                         after_close,
                         Some(b'>') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
-                    )
-                        && let Some(close_gt) = out[close_pos + close_pat.len()..].find('>') {
-                            out.replace_range(start..close_pos + close_pat.len() + close_gt + 1, "");
-                            removed = true;
-                            break;
-                        }
+                    ) && let Some(close_gt) = out[close_pos + close_pat.len()..].find('>')
+                    {
+                        out.replace_range(start..close_pos + close_pat.len() + close_gt + 1, "");
+                        removed = true;
+                        break;
+                    }
                     close_search = close_pos + close_pat.len();
                 } else {
                     break;
@@ -334,11 +334,12 @@ fn decode_html_entities(input: &str) -> String {
 
     while i < bytes.len() {
         if bytes[i] == b'&'
-            && let Some((ch, consumed)) = parse_entity_at(&input[i..]) {
-                out.push(ch);
-                i += consumed;
-                continue;
-            }
+            && let Some((ch, consumed)) = parse_entity_at(&input[i..])
+        {
+            out.push(ch);
+            i += consumed;
+            continue;
+        }
         let ch = input[i..].chars().next().unwrap();
         out.push(ch);
         i += ch.len_utf8();
@@ -385,8 +386,7 @@ fn parse_entity_at(s: &str) -> Option<(char, usize)> {
             (b"apos;".as_slice(), '\''),
             (b"nbsp;".as_slice(), ' '),
         ] {
-            if rest.len() >= name.len()
-                && rest.as_bytes()[..name.len()].eq_ignore_ascii_case(name)
+            if rest.len() >= name.len() && rest.as_bytes()[..name.len()].eq_ignore_ascii_case(name)
             {
                 return Some((ch, 1 + name.len()));
             }
@@ -418,211 +418,224 @@ pub fn html_to_markdown(html: &str) -> String {
 
     while i < bytes.len() {
         if bytes[i] == b'<'
-            && let Some(tag_end) = find_tag_end(&cleaned, i) {
-                let raw_tag = &cleaned[i..=tag_end];
-                i = tag_end + 1;
+            && let Some(tag_end) = find_tag_end(&cleaned, i)
+        {
+            let raw_tag = &cleaned[i..=tag_end];
+            i = tag_end + 1;
 
-                if raw_tag.starts_with("<!--") || raw_tag.starts_with("<!") || raw_tag.starts_with("<?") {
-                    continue;
-                }
+            if raw_tag.starts_with("<!--") || raw_tag.starts_with("<!") || raw_tag.starts_with("<?")
+            {
+                continue;
+            }
 
-                let is_closing = raw_tag.starts_with("</");
-                let inner_end = if raw_tag.ends_with("/>") {
-                    raw_tag.len() - 2
-                } else {
-                    raw_tag.len() - 1
-                };
-                let inner = raw_tag[if is_closing { 2 } else { 1 }..inner_end].trim();
-                let tag_name = inner
-                    .split(|c: char| c.is_ascii_whitespace())
-                    .next()
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
+            let is_closing = raw_tag.starts_with("</");
+            let inner_end = if raw_tag.ends_with("/>") {
+                raw_tag.len() - 2
+            } else {
+                raw_tag.len() - 1
+            };
+            let inner = raw_tag[if is_closing { 2 } else { 1 }..inner_end].trim();
+            let tag_name = inner
+                .split(|c: char| c.is_ascii_whitespace())
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
 
-                let in_table_cell = cell_buf.is_some();
-                let target: &mut String = cell_buf.as_mut().unwrap_or(&mut out);
+            let in_table_cell = cell_buf.is_some();
+            let target: &mut String = cell_buf.as_mut().unwrap_or(&mut out);
 
-                if !is_closing {
-                    match tag_name.as_str() {
-                        "h1" => push_block_prefix(target, "# "),
-                        "h2" => push_block_prefix(target, "## "),
-                        "h3" => push_block_prefix(target, "### "),
-                        "h4" => push_block_prefix(target, "#### "),
-                        "h5" => push_block_prefix(target, "##### "),
-                        "h6" => push_block_prefix(target, "###### "),
-                        "p" | "div" => {
-                            if !target.is_empty() && !target.ends_with("\n\n") && list_stack.is_empty() {
-                                if target.ends_with('\n') {
-                                    target.push('\n');
-                                } else {
-                                    target.push_str("\n\n");
-                                }
-                            }
-                        }
-                        "br" => {
-                            if in_table_cell {
-                                target.push(' ');
+            if !is_closing {
+                match tag_name.as_str() {
+                    "h1" => push_block_prefix(target, "# "),
+                    "h2" => push_block_prefix(target, "## "),
+                    "h3" => push_block_prefix(target, "### "),
+                    "h4" => push_block_prefix(target, "#### "),
+                    "h5" => push_block_prefix(target, "##### "),
+                    "h6" => push_block_prefix(target, "###### "),
+                    "p" | "div" => {
+                        if !target.is_empty() && !target.ends_with("\n\n") && list_stack.is_empty()
+                        {
+                            if target.ends_with('\n') {
+                                target.push('\n');
                             } else {
-                                target.push('\n');
-                            }
-                        }
-                        "hr" => {
-                            ensure_blank_line_before(target);
-                            target.push_str("---\n\n");
-                        }
-                        "strong" | "b" => target.push_str("**"),
-                        "em" | "i" => target.push('*'),
-                        "del" | "s" => target.push_str("~~"),
-                        "code" => {
-                            if !in_pre {
-                                target.push('`');
-                            } else if let Some(cls) = extract_tag_attr(raw_tag, "class")
-                                && let Some(lang) = cls.split_whitespace().find_map(|c| c.strip_prefix("language-"))
-                                    && target.ends_with("```\n") {
-                                        let insert_at = target.len() - 1;
-                                        target.insert_str(insert_at, lang);
-                                    }
-                        }
-                        "pre" => {
-                            ensure_blank_line_before(target);
-                            target.push_str("```\n");
-                            in_pre = true;
-                        }
-                        "blockquote" => {
-                            ensure_blank_line_before(target);
-                            in_blockquote = true;
-                            target.push_str("> ");
-                        }
-                        "ul" => {
-                            if list_stack.is_empty() && !target.is_empty() && !target.ends_with("\n\n")
-                                && !target.ends_with('\n') {
-                                    target.push('\n');
-                                }
-                            list_stack.push(None);
-                        }
-                        "ol" => {
-                            if list_stack.is_empty() && !target.is_empty() && !target.ends_with("\n\n")
-                                && !target.ends_with('\n') {
-                                    target.push('\n');
-                                }
-                            list_stack.push(Some(1));
-                        }
-                        "li" => {
-                            let depth = list_stack.len().saturating_sub(1);
-                            if !target.is_empty() && !target.ends_with('\n') {
-                                target.push('\n');
-                            }
-                            for _ in 0..depth {
-                                target.push_str("  ");
-                            }
-                            match list_stack.last_mut() {
-                                Some(Some(n)) => {
-                                    target.push_str(&format!("{n}. "));
-                                    *n += 1;
-                                }
-                                _ => target.push_str("- "),
-                            }
-                        }
-                        "a" => {
-                            let href = extract_tag_attr(raw_tag, "href").map(|v| decode_html_entities(&v));
-                            if href.is_some() {
-                                target.push('[');
-                            }
-                            link_stack.push(href);
-                        }
-                        "img" => {
-                            if let Some(src) = extract_tag_attr(raw_tag, "src") {
-                                let alt = extract_tag_attr(raw_tag, "alt")
-                                    .map(|s| decode_html_entities(&s))
-                                    .unwrap_or_default();
-                                let src = decode_html_entities(&src);
-                                target.push_str(&format!("![{alt}]({src})"));
-                            }
-                        }
-                        "table" => {
-                            in_table = true;
-                            table_rows.clear();
-                        }
-                        "tr" if in_table => {
-                            current_row.clear();
-                        }
-                        "th" | "td" if in_table => {
-                            cell_buf = Some(String::new());
-                        }
-                        _ => {}
-                    }
-                } else {
-                    match tag_name.as_str() {
-                        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "p" | "div" => {
-                            if !target.ends_with("\n\n") {
-                                if target.ends_with('\n') {
-                                    target.push('\n');
-                                } else if !target.is_empty() {
-                                    target.push_str("\n\n");
-                                }
-                            }
-                        }
-                        "strong" | "b" => target.push_str("**"),
-                        "em" | "i" => target.push('*'),
-                        "del" | "s" => target.push_str("~~"),
-                        "code" => {
-                            if !in_pre {
-                                target.push('`');
-                            }
-                        }
-                        "pre" => {
-                            if !target.ends_with('\n') {
-                                target.push('\n');
-                            }
-                            target.push_str("```\n\n");
-                            in_pre = false;
-                        }
-                        "blockquote" => {
-                            in_blockquote = false;
-                            if !target.ends_with("\n\n") {
                                 target.push_str("\n\n");
                             }
                         }
-                        "ul" | "ol" => {
-                            list_stack.pop();
-                            if list_stack.is_empty() && !target.ends_with("\n\n") {
-                                target.push('\n');
-                            }
-                        }
-                        "li" => {
-                            if !target.ends_with('\n') {
-                                target.push('\n');
-                            }
-                        }
-                        "a" => {
-                            if let Some(Some(href)) = link_stack.pop() {
-                                target.push_str(&format!("]({href})"));
-                            }
-                        }
-                        "th" | "td" if in_table => {
-                            if let Some(cell) = cell_buf.take() {
-                                current_row.push(cell.trim().replace('|', "\\|"));
-                            }
-                        }
-                        "tr" if in_table => {
-                            if !current_row.is_empty() {
-                                table_rows.push(std::mem::take(&mut current_row));
-                            }
-                        }
-                        "table" if in_table => {
-                            in_table = false;
-                            if !table_rows.is_empty() {
-                                ensure_blank_line_before(&mut out);
-                                out.push_str(&format_gfm_table_from_rows(&table_rows));
-                                out.push_str("\n\n");
-                            }
-                            table_rows.clear();
-                        }
-                        _ => {}
                     }
+                    "br" => {
+                        if in_table_cell {
+                            target.push(' ');
+                        } else {
+                            target.push('\n');
+                        }
+                    }
+                    "hr" => {
+                        ensure_blank_line_before(target);
+                        target.push_str("---\n\n");
+                    }
+                    "strong" | "b" => target.push_str("**"),
+                    "em" | "i" => target.push('*'),
+                    "del" | "s" => target.push_str("~~"),
+                    "code" => {
+                        if !in_pre {
+                            target.push('`');
+                        } else if let Some(cls) = extract_tag_attr(raw_tag, "class")
+                            && let Some(lang) = cls
+                                .split_whitespace()
+                                .find_map(|c| c.strip_prefix("language-"))
+                            && target.ends_with("```\n")
+                        {
+                            let insert_at = target.len() - 1;
+                            target.insert_str(insert_at, lang);
+                        }
+                    }
+                    "pre" => {
+                        ensure_blank_line_before(target);
+                        target.push_str("```\n");
+                        in_pre = true;
+                    }
+                    "blockquote" => {
+                        ensure_blank_line_before(target);
+                        in_blockquote = true;
+                        target.push_str("> ");
+                    }
+                    "ul" => {
+                        if list_stack.is_empty()
+                            && !target.is_empty()
+                            && !target.ends_with("\n\n")
+                            && !target.ends_with('\n')
+                        {
+                            target.push('\n');
+                        }
+                        list_stack.push(None);
+                    }
+                    "ol" => {
+                        if list_stack.is_empty()
+                            && !target.is_empty()
+                            && !target.ends_with("\n\n")
+                            && !target.ends_with('\n')
+                        {
+                            target.push('\n');
+                        }
+                        list_stack.push(Some(1));
+                    }
+                    "li" => {
+                        let depth = list_stack.len().saturating_sub(1);
+                        if !target.is_empty() && !target.ends_with('\n') {
+                            target.push('\n');
+                        }
+                        for _ in 0..depth {
+                            target.push_str("  ");
+                        }
+                        match list_stack.last_mut() {
+                            Some(Some(n)) => {
+                                target.push_str(&format!("{n}. "));
+                                *n += 1;
+                            }
+                            _ => target.push_str("- "),
+                        }
+                    }
+                    "a" => {
+                        let href =
+                            extract_tag_attr(raw_tag, "href").map(|v| decode_html_entities(&v));
+                        if href.is_some() {
+                            target.push('[');
+                        }
+                        link_stack.push(href);
+                    }
+                    "img" => {
+                        if let Some(src) = extract_tag_attr(raw_tag, "src") {
+                            let alt = extract_tag_attr(raw_tag, "alt")
+                                .map(|s| decode_html_entities(&s))
+                                .unwrap_or_default();
+                            let src = decode_html_entities(&src);
+                            target.push_str(&format!("![{alt}]({src})"));
+                        }
+                    }
+                    "table" => {
+                        in_table = true;
+                        table_rows.clear();
+                    }
+                    "tr" if in_table => {
+                        current_row.clear();
+                    }
+                    "th" | "td" if in_table => {
+                        cell_buf = Some(String::new());
+                    }
+                    _ => {}
                 }
-                continue;
+            } else {
+                match tag_name.as_str() {
+                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "p" | "div" => {
+                        if !target.ends_with("\n\n") {
+                            if target.ends_with('\n') {
+                                target.push('\n');
+                            } else if !target.is_empty() {
+                                target.push_str("\n\n");
+                            }
+                        }
+                    }
+                    "strong" | "b" => target.push_str("**"),
+                    "em" | "i" => target.push('*'),
+                    "del" | "s" => target.push_str("~~"),
+                    "code" => {
+                        if !in_pre {
+                            target.push('`');
+                        }
+                    }
+                    "pre" => {
+                        if !target.ends_with('\n') {
+                            target.push('\n');
+                        }
+                        target.push_str("```\n\n");
+                        in_pre = false;
+                    }
+                    "blockquote" => {
+                        in_blockquote = false;
+                        if !target.ends_with("\n\n") {
+                            target.push_str("\n\n");
+                        }
+                    }
+                    "ul" | "ol" => {
+                        list_stack.pop();
+                        if list_stack.is_empty() && !target.ends_with("\n\n") {
+                            target.push('\n');
+                        }
+                    }
+                    "li" => {
+                        if !target.ends_with('\n') {
+                            target.push('\n');
+                        }
+                    }
+                    "a" => {
+                        if let Some(Some(href)) = link_stack.pop() {
+                            target.push_str(&format!("]({href})"));
+                        }
+                    }
+                    "th" | "td" if in_table => {
+                        if let Some(cell) = cell_buf.take() {
+                            current_row.push(cell.trim().replace('|', "\\|"));
+                        }
+                    }
+                    "tr" if in_table => {
+                        if !current_row.is_empty() {
+                            table_rows.push(std::mem::take(&mut current_row));
+                        }
+                    }
+                    "table" if in_table => {
+                        in_table = false;
+                        if !table_rows.is_empty() {
+                            ensure_blank_line_before(&mut out);
+                            out.push_str(&format_gfm_table_from_rows(&table_rows));
+                            out.push_str("\n\n");
+                        }
+                        table_rows.clear();
+                    }
+                    _ => {}
+                }
             }
+            continue;
+        }
 
         // Plain text segment until next `<` (if `bytes[i] == b'<'` lacked a closing `>`, advance past `<`
         // so malformed fragments like `<p>1 < 2` never loop forever).
@@ -639,9 +652,8 @@ pub fn html_to_markdown(html: &str) -> String {
             target.push_str(&text);
         } else {
             // Collapse runs of whitespace in normal HTML text layout
-            let mut prev_ws = target.is_empty()
-                || target.ends_with([' ', '\n', '\t'])
-                || target.ends_with("> ");
+            let mut prev_ws =
+                target.is_empty() || target.ends_with([' ', '\n', '\t']) || target.ends_with("> ");
             for ch in text.chars() {
                 if ch.is_whitespace() {
                     if !prev_ws {
@@ -791,7 +803,11 @@ fn ensure_blank_line_before(target: &mut String) {
 }
 
 fn extract_tag_attr(tag: &str, wanted_attr: &str) -> Option<String> {
-    let inner_end = if tag.ends_with("/>") { tag.len() - 2 } else { tag.len() - 1 };
+    let inner_end = if tag.ends_with("/>") {
+        tag.len() - 2
+    } else {
+        tag.len() - 1
+    };
     let inner = &tag[1..inner_end];
     let split = inner
         .char_indices()

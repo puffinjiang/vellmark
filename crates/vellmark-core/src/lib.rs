@@ -21,17 +21,17 @@ pub use editor::{
     EditorAction, EditorContext, EditorController, EditorViewState, ViewMode,
     map_offset_across_reload,
 };
-pub use table::{
-    GfmTableContext, ScannedGfmTable, TableAlign, TableCellSpan, TableRowParsed,
-    find_enclosing_gfm_table_at, is_pipe_table_line, is_table_body_row_candidate,
-    parse_table_block, parse_table_cell_rel_ranges, parse_table_delimiter_alignments,
-    parse_table_delimiter_alignments_for_cells, scan_line_bounds, scan_line_content_bounds,
-    try_scan_gfm_table_from_line, unescaped_pipe_offsets,
-};
 pub use encoding::{
     DetectedEncoding, EncodingDecision, EncodingError, FileFormatMeta, LineEnding,
     detect_and_decode, encode_for_save, normalize_line_endings,
 };
+pub use find_replace::{
+    FindError, FindMatch, FindOptions, FindReplaceOutcome, find_all_matches, find_next_match,
+    find_prev_match, replace_all_in_buffer_with_line_ending,
+    replace_match_in_buffer_with_line_ending,
+};
+#[allow(deprecated)]
+pub use find_replace::{replace_all_in_buffer, replace_match_in_buffer};
 pub use recovery_history::{
     DEFAULT_BACKUP_MAX_AGE_SECS, DEFAULT_MAX_BACKUPS_PER_FILE, DEFAULT_MAX_TOTAL_HISTORY_BYTES,
     DEFAULT_ORPHAN_GRACE_SECS, HISTORICAL_BACKUPS_DIR_NAME, HistoricalBackupData,
@@ -51,12 +51,12 @@ pub use state::{
     paths_share_underlying_file, scan_recovery_root,
 };
 pub use stats::{DocumentStats, count_text_metrics};
-pub use find_replace::{
-    FindError, FindMatch, FindOptions, FindReplaceOutcome, find_all_matches, find_next_match,
-    find_prev_match, replace_all_in_buffer_with_line_ending,
-    replace_match_in_buffer_with_line_ending,
+pub use table::{
+    GfmTableContext, ScannedGfmTable, TableAlign, TableCellSpan, TableRowParsed,
+    find_enclosing_gfm_table_at, is_pipe_table_line, is_table_body_row_candidate,
+    parse_table_block, parse_table_cell_rel_ranges, parse_table_delimiter_alignments,
+    parse_table_delimiter_alignments_for_cells, scan_line_bounds, scan_line_content_bounds,
+    try_scan_gfm_table_from_line, unescaped_pipe_offsets,
 };
-#[allow(deprecated)]
-pub use find_replace::{replace_all_in_buffer, replace_match_in_buffer};
 pub use undo::{EditKind, EditOp, Transaction, UndoHistory, syntax_conversion_escape_op};
 pub use workspace::{FileTreeNode, RecentFilesList, is_supported_document};

@@ -122,36 +122,40 @@ pub fn detect_and_decode(raw: &[u8]) -> Result<(String, FileFormatMeta), Encodin
         }
     }
 
-    if raw.starts_with(&[0xFF, 0xFE]) && raw.len().is_multiple_of(2)
-        && let Some(text) = decode_utf16(&raw[2..], true) {
-            if text.contains('\0') {
-                return Err(EncodingError::BinaryFile);
-            }
-            // P0: UTF-16 with BOM is recognized as valid text (not rejected as binary!) and opened ReadOnly in P0.
-            let meta = FileFormatMeta {
-                decision: EncodingDecision::ReadOnly {
-                    candidate: DetectedEncoding::Utf16LeBom,
-                },
-                dominant_line_ending: LineEnding::detect_dominant(&text),
-                has_trailing_newline: text.ends_with('\n') || text.ends_with('\r'),
-            };
-            return Ok((text, meta));
+    if raw.starts_with(&[0xFF, 0xFE])
+        && raw.len().is_multiple_of(2)
+        && let Some(text) = decode_utf16(&raw[2..], true)
+    {
+        if text.contains('\0') {
+            return Err(EncodingError::BinaryFile);
         }
+        // P0: UTF-16 with BOM is recognized as valid text (not rejected as binary!) and opened ReadOnly in P0.
+        let meta = FileFormatMeta {
+            decision: EncodingDecision::ReadOnly {
+                candidate: DetectedEncoding::Utf16LeBom,
+            },
+            dominant_line_ending: LineEnding::detect_dominant(&text),
+            has_trailing_newline: text.ends_with('\n') || text.ends_with('\r'),
+        };
+        return Ok((text, meta));
+    }
 
-    if raw.starts_with(&[0xFE, 0xFF]) && raw.len().is_multiple_of(2)
-        && let Some(text) = decode_utf16(&raw[2..], false) {
-            if text.contains('\0') {
-                return Err(EncodingError::BinaryFile);
-            }
-            let meta = FileFormatMeta {
-                decision: EncodingDecision::ReadOnly {
-                    candidate: DetectedEncoding::Utf16BeBom,
-                },
-                dominant_line_ending: LineEnding::detect_dominant(&text),
-                has_trailing_newline: text.ends_with('\n') || text.ends_with('\r'),
-            };
-            return Ok((text, meta));
+    if raw.starts_with(&[0xFE, 0xFF])
+        && raw.len().is_multiple_of(2)
+        && let Some(text) = decode_utf16(&raw[2..], false)
+    {
+        if text.contains('\0') {
+            return Err(EncodingError::BinaryFile);
         }
+        let meta = FileFormatMeta {
+            decision: EncodingDecision::ReadOnly {
+                candidate: DetectedEncoding::Utf16BeBom,
+            },
+            dominant_line_ending: LineEnding::detect_dominant(&text),
+            has_trailing_newline: text.ends_with('\n') || text.ends_with('\r'),
+        };
+        return Ok((text, meta));
+    }
 
     // Step 2: BOM-less UTF-16 pattern check BEFORE raw NUL binary rejection
     if raw.len() >= 4 && raw.len().is_multiple_of(2) {
@@ -167,31 +171,35 @@ pub fn detect_and_decode(raw: &[u8]) -> Result<(String, FileFormatMeta), Encodin
             }
         }
         // >= 30% zero bytes on odd indices -> BOM-less UTF-16 LE candidate
-        if odd_zeros * 100 / pairs >= 30 && even_zeros == 0
+        if odd_zeros * 100 / pairs >= 30
+            && even_zeros == 0
             && let Some(text) = decode_utf16(raw, true)
-                && !text.contains('\0') {
-                    let meta = FileFormatMeta {
-                        decision: EncodingDecision::ReadOnly {
-                            candidate: DetectedEncoding::Utf16LeNoBom,
-                        },
-                        dominant_line_ending: LineEnding::detect_dominant(&text),
-                        has_trailing_newline: text.ends_with('\n') || text.ends_with('\r'),
-                    };
-                    return Ok((text, meta));
-                }
+            && !text.contains('\0')
+        {
+            let meta = FileFormatMeta {
+                decision: EncodingDecision::ReadOnly {
+                    candidate: DetectedEncoding::Utf16LeNoBom,
+                },
+                dominant_line_ending: LineEnding::detect_dominant(&text),
+                has_trailing_newline: text.ends_with('\n') || text.ends_with('\r'),
+            };
+            return Ok((text, meta));
+        }
         // >= 30% zero bytes on even indices -> BOM-less UTF-16 BE candidate
-        if even_zeros * 100 / pairs >= 30 && odd_zeros == 0
+        if even_zeros * 100 / pairs >= 30
+            && odd_zeros == 0
             && let Some(text) = decode_utf16(raw, false)
-                && !text.contains('\0') {
-                    let meta = FileFormatMeta {
-                        decision: EncodingDecision::ReadOnly {
-                            candidate: DetectedEncoding::Utf16BeNoBom,
-                        },
-                        dominant_line_ending: LineEnding::detect_dominant(&text),
-                        has_trailing_newline: text.ends_with('\n') || text.ends_with('\r'),
-                    };
-                    return Ok((text, meta));
-                }
+            && !text.contains('\0')
+        {
+            let meta = FileFormatMeta {
+                decision: EncodingDecision::ReadOnly {
+                    candidate: DetectedEncoding::Utf16BeNoBom,
+                },
+                dominant_line_ending: LineEnding::detect_dominant(&text),
+                has_trailing_newline: text.ends_with('\n') || text.ends_with('\r'),
+            };
+            return Ok((text, meta));
+        }
     }
 
     // Binary check on first 8 KB if not UTF-16
@@ -293,7 +301,10 @@ mod tests {
         );
         assert_eq!(meta.dominant_line_ending, LineEnding::CrLf);
         let saved = encode_for_save(&decoded, &meta).unwrap();
-        assert_eq!(saved, raw, "Round-trip save must be byte-for-byte identical");
+        assert_eq!(
+            saved, raw,
+            "Round-trip save must be byte-for-byte identical"
+        );
     }
 
     #[test]
@@ -341,8 +352,14 @@ mod tests {
 
     #[test]
     fn test_detect_dominant_or_preserves_fallback_when_no_newlines_or_tie() {
-        assert_eq!(LineEnding::detect_dominant_or("AB", LineEnding::CrLf), LineEnding::CrLf);
-        assert_eq!(LineEnding::detect_dominant_or("", LineEnding::Cr), LineEnding::Cr);
+        assert_eq!(
+            LineEnding::detect_dominant_or("AB", LineEnding::CrLf),
+            LineEnding::CrLf
+        );
+        assert_eq!(
+            LineEnding::detect_dominant_or("", LineEnding::Cr),
+            LineEnding::Cr
+        );
         assert_eq!(
             LineEnding::detect_dominant_or("a\nb\r\nc", LineEnding::CrLf),
             LineEnding::CrLf
@@ -361,8 +378,17 @@ mod tests {
             normalize_line_endings(single, LineEnding::CrLf),
             std::borrow::Cow::Borrowed(_)
         ));
-        assert_eq!(normalize_line_endings("a\nb\r\nc\rd", LineEnding::CrLf), "a\r\nb\r\nc\r\nd");
-        assert_eq!(normalize_line_endings("a\r\nb\rc\nd", LineEnding::Lf), "a\nb\nc\nd");
-        assert_eq!(normalize_line_endings("a\r\nb\nc", LineEnding::Cr), "a\rb\rc");
+        assert_eq!(
+            normalize_line_endings("a\nb\r\nc\rd", LineEnding::CrLf),
+            "a\r\nb\r\nc\r\nd"
+        );
+        assert_eq!(
+            normalize_line_endings("a\r\nb\rc\nd", LineEnding::Lf),
+            "a\nb\nc\nd"
+        );
+        assert_eq!(
+            normalize_line_endings("a\r\nb\nc", LineEnding::Cr),
+            "a\rb\rc"
+        );
     }
 }

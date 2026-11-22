@@ -280,9 +280,10 @@ language = \"{lang_name}\"\n",
 
     pub fn save_to_file(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
         vellmark_core::atomic_write_file(path, self.to_toml_string().as_bytes())
     }
 

@@ -251,11 +251,7 @@ pub fn parse_table_cell_rel_ranges(line: &str) -> Option<Vec<(usize, usize)>> {
         cells.push((cursor, ws_tail));
     }
 
-    if cells.is_empty() {
-        None
-    } else {
-        Some(cells)
-    }
+    if cells.is_empty() { None } else { Some(cells) }
 }
 
 /// Parse delimiter-row column alignments for pre-split `cell_ranges`.

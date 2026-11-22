@@ -1,8 +1,8 @@
 //! `vellmark-theme` parses the Vellmark CSS subset (PRD 6.6) and reports unsupported
 //! selectors or properties for the Theme Diagnostics panel (PRD S-03 & S-08).
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 const SUPPORTED_SELECTORS: &[&str] = &[
     ":root",
@@ -144,7 +144,9 @@ impl ThemeSheet {
                 let val = val.trim();
 
                 if let Some(var_name) = prop.strip_prefix("--") {
-                    sheet.variables.insert(format!("--{var_name}"), val.to_string());
+                    sheet
+                        .variables
+                        .insert(format!("--{var_name}"), val.to_string());
                     continue;
                 }
 
@@ -158,7 +160,8 @@ impl ThemeSheet {
                     sheet.diagnostics.push(ThemeDiagnostic {
                         selector: selector.clone(),
                         item: prop.to_string(),
-                        reason: "unsupported CSS property (layout controlled by editor)".to_string(),
+                        reason: "unsupported CSS property (layout controlled by editor)"
+                            .to_string(),
                     });
                 }
             }
@@ -284,7 +287,9 @@ mod tests {
                 "Builtin theme {theme:?} produced diagnostics: {:?}",
                 sheet.diagnostics
             );
-            let bg = sheet.resolve_property("#write", "background-color").unwrap();
+            let bg = sheet
+                .resolve_property("#write", "background-color")
+                .unwrap();
             let fg = sheet.resolve_property("#write", "color").unwrap();
             assert!(bg.starts_with('#'));
             assert!(fg.starts_with('#'));

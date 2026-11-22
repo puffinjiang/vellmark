@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 pub use config::default_recovery_root;
 use config::{AppConfig, default_config_path, default_recent_files_path};
-use gui::{GuiController, PROTECTED_SNAPSHOT_LIMIT_NOTICE, WELCOME_MARKDOWN, VellmarkApp};
+use gui::{GuiController, PROTECTED_SNAPSHOT_LIMIT_NOTICE, VellmarkApp, WELCOME_MARKDOWN};
 use vellmark_core::{RecentFilesList, Selection};
 use workbench::AppWorkbench;
 
@@ -35,7 +35,8 @@ fn build_initial_workbench_with_persistence(
     let mut workbench = AppWorkbench::new(config, recovery_root);
     workbench.restore_configured_theme();
     if let Some(recent_path) = recent_files_path.as_deref()
-        && let Ok(loaded) = RecentFilesList::load_from_file(recent_path, workbench.recent_files.max_entries)
+        && let Ok(loaded) =
+            RecentFilesList::load_from_file(recent_path, workbench.recent_files.max_entries)
     {
         workbench.recent_files = loaded;
         workbench.recent_files.prune_missing();
@@ -69,9 +70,10 @@ fn run_headless(paths: &[PathBuf]) {
     let (mut workbench, _) = build_initial_workbench_with_recovery(paths, None);
     if workbench.workspace_root.is_none()
         && let Ok(cwd) = std::env::current_dir()
-            && Path::new(&cwd).exists() {
-                let _ = workbench.open_folder(cwd);
-            }
+        && Path::new(&cwd).exists()
+    {
+        let _ = workbench.open_folder(cwd);
+    }
 
     let stats = workbench.active_tab().map(|t| t.stats());
     println!(
@@ -142,15 +144,18 @@ mod tests {
             let mut wb = AppWorkbench::new(AppConfig::default(), Some(rec_root.clone()));
             wb.new_document();
             let tab = wb.active_tab_mut().unwrap();
-            tab.edit(|ctx| ctx.insert_text("crash protected content")).unwrap();
+            tab.edit(|ctx| ctx.insert_text("crash protected content"))
+                .unwrap();
             tab.session.flush_current_recovery_snapshot().unwrap();
         }
 
-        let (wb2, recovered) =
-            build_initial_workbench_with_recovery(&[], Some(rec_root.clone()));
+        let (wb2, recovered) = build_initial_workbench_with_recovery(&[], Some(rec_root.clone()));
         assert_eq!(wb2.recovery_root.as_deref(), Some(rec_root.as_path()));
         assert_eq!(recovered, 1);
-        assert_eq!(wb2.tabs[0].session.buffer.to_string(), "crash protected content");
+        assert_eq!(
+            wb2.tabs[0].session.buffer.to_string(),
+            "crash protected content"
+        );
         assert!(!default_recovery_root().as_os_str().is_empty());
 
         let _ = std::fs::remove_dir_all(&rec_root);
@@ -203,7 +208,10 @@ mod tests {
         );
         assert_eq!(wb.config.max_content_width_px, 1080);
         assert_eq!(wb.config.zoom_percent, 120);
-        assert_eq!(wb.config.custom_theme_path.as_deref(), Some(css_path.as_path()));
+        assert_eq!(
+            wb.config.custom_theme_path.as_deref(),
+            Some(css_path.as_path())
+        );
         assert_eq!(
             wb.theme.variables.get("--bg-color").map(String::as_str),
             Some("#102030")

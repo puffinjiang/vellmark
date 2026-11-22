@@ -154,11 +154,7 @@ impl UndoHistory {
 
     /// Record a marker-only syntax conversion (where no extra text was auto-inserted, e.g. `## ` or `**bold**`)
     /// so that pressing `Cmd/Ctrl + Z` immediately escapes the trigger marker per PRD 4.1.1 B.1.
-    pub fn record_syntax_trigger(
-        &mut self,
-        escape_insert_at: ByteOffset,
-        selection: Selection,
-    ) {
+    pub fn record_syntax_trigger(&mut self, escape_insert_at: ByteOffset, selection: Selection) {
         self.redo_stack.clear();
         self.undo_stack.push(Transaction {
             ops: Vec::new(),
@@ -196,16 +192,21 @@ impl UndoHistory {
         self.redo_stack.clear();
 
         // Coalesce consecutive single-insert Typing transactions when adjacent (PRD E-06).
-        if tx.kind == EditKind::Typing && tx.ops.len() == 1 && tx.ops[0].deleted.is_empty()
+        if tx.kind == EditKind::Typing
+            && tx.ops.len() == 1
+            && tx.ops[0].deleted.is_empty()
             && let Some(prev) = self.undo_stack.last_mut()
-                && prev.kind == EditKind::Typing && prev.ops.len() == 1 && prev.ops[0].deleted.is_empty() {
-                    let prev_end = prev.ops[0].range.start + prev.ops[0].inserted.len();
-                    if tx.ops[0].range.start == prev_end && !tx.ops[0].inserted.contains('\n') {
-                        prev.ops[0].inserted.push_str(&tx.ops[0].inserted);
-                        prev.selection_after = tx.selection_after;
-                        return;
-                    }
-                }
+            && prev.kind == EditKind::Typing
+            && prev.ops.len() == 1
+            && prev.ops[0].deleted.is_empty()
+        {
+            let prev_end = prev.ops[0].range.start + prev.ops[0].inserted.len();
+            if tx.ops[0].range.start == prev_end && !tx.ops[0].inserted.contains('\n') {
+                prev.ops[0].inserted.push_str(&tx.ops[0].inserted);
+                prev.selection_after = tx.selection_after;
+                return;
+            }
+        }
 
         self.undo_stack.push(tx);
     }
@@ -318,7 +319,8 @@ fn fold_escape_into_prev_tx(prev: &mut Transaction, esc_pos: ByteOffset, esc_op:
         prev.selection_after = Selection::caret(prev.selection_after.head + 1);
         return;
     };
-    if esc_pos >= first_op.range.start && esc_pos <= first_op.range.start + first_op.inserted.len() {
+    if esc_pos >= first_op.range.start && esc_pos <= first_op.range.start + first_op.inserted.len()
+    {
         let rel = esc_pos - first_op.range.start;
         first_op.inserted.insert(rel, '\\');
         prev.selection_after = Selection::caret(prev.selection_after.head + 1);

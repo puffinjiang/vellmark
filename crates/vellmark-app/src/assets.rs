@@ -220,7 +220,9 @@ mod tests {
         assert!(p2.exists());
 
         // Reject traversal in assets_rel_dir
-        assert!(import_image_to_assets(Some(&doc_path), None, &src_img, "../outside", None).is_err());
+        assert!(
+            import_image_to_assets(Some(&doc_path), None, &src_img, "../outside", None).is_err()
+        );
 
         // Raw byte import (e.g. clipboard PNG) + supported extensions
         assert!(is_supported_image_extension(Path::new("snap.PNG")));

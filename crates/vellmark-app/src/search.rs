@@ -279,54 +279,57 @@ impl WorkspaceSearchWorker {
         let worker_notifier = Arc::clone(&notifier_slot);
         let handle = thread::Builder::new()
             .name("vellmark-ws-search".into())
-            .spawn(move || loop {
-                let req = {
-                    let (lock, cv) = &*worker_queue;
-                    let mut guard = match lock.lock() {
-                        Ok(g) => g,
-                        Err(e) => e.into_inner(),
-                    };
-                    loop {
-                        if guard.shutdown {
-                            return;
-                        }
-                        if let Some(req) = guard.pending.take() {
-                            guard.active_cancel = Some(Arc::clone(&req.cancel));
-                            break req;
-                        }
-                        guard = match cv.wait(guard) {
+            .spawn(move || {
+                loop {
+                    let req = {
+                        let (lock, cv) = &*worker_queue;
+                        let mut guard = match lock.lock() {
                             Ok(g) => g,
                             Err(e) => e.into_inner(),
                         };
-                    }
-                };
-                let _clear_active = ClearActiveCancel {
-                    queue: &worker_queue,
-                };
-
-                if req.cancel.load(Ordering::Acquire) {
-                    continue;
-                }
-                let result = global_workspace_search_with_cancel(
-                    &req.root,
-                    &req.query,
-                    req.case_sensitive,
-                    &req.cancel,
-                    max_results,
-                );
-                if req.cancel.load(Ordering::Acquire) {
-                    continue;
-                }
-                if tx
-                    .send(WorkspaceSearchResponse {
-                        req_id: req.req_id,
-                        result,
-                    })
-                    .is_ok()
-                    && let Ok(guard) = worker_notifier.lock()
-                        && let Some(cb) = &*guard {
-                            cb();
+                        loop {
+                            if guard.shutdown {
+                                return;
+                            }
+                            if let Some(req) = guard.pending.take() {
+                                guard.active_cancel = Some(Arc::clone(&req.cancel));
+                                break req;
+                            }
+                            guard = match cv.wait(guard) {
+                                Ok(g) => g,
+                                Err(e) => e.into_inner(),
+                            };
                         }
+                    };
+                    let _clear_active = ClearActiveCancel {
+                        queue: &worker_queue,
+                    };
+
+                    if req.cancel.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let result = global_workspace_search_with_cancel(
+                        &req.root,
+                        &req.query,
+                        req.case_sensitive,
+                        &req.cancel,
+                        max_results,
+                    );
+                    if req.cancel.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    if tx
+                        .send(WorkspaceSearchResponse {
+                            req_id: req.req_id,
+                            result,
+                        })
+                        .is_ok()
+                        && let Ok(guard) = worker_notifier.lock()
+                        && let Some(cb) = &*guard
+                    {
+                        cb();
+                    }
+                }
             })
             .ok();
 
@@ -516,8 +519,7 @@ mod tests {
 
         let cancelled = AtomicBool::new(true);
         let canceled_hits =
-            global_workspace_search_with_cancel(&root, "Vellmark", false, &cancelled, 100)
-                .unwrap();
+            global_workspace_search_with_cancel(&root, "Vellmark", false, &cancelled, 100).unwrap();
         assert!(canceled_hits.is_empty());
 
         let capped = global_workspace_search_with_cancel(
@@ -645,11 +647,7 @@ mod tests {
 
         // Greek Final_Sigma consistency: "ΟΣ" query ("ος") must match uppercase "ΟΣ",
         // prefix inside "ΚΟΣΜΟΣ", and lowercase medial/final sigma ("οσ" / "ος") identically.
-        fs::write(
-            root.join("greek.md"),
-            "ΟΣ\nΚΟΣΜΟΣ\nοσ\nκόσμος\n",
-        )
-        .unwrap();
+        fs::write(root.join("greek.md"), "ΟΣ\nΚΟΣΜΟΣ\nοσ\nκόσμος\n").unwrap();
         let greek_hits_upper = global_workspace_search(&root, "ΟΣ", false).unwrap();
         assert_eq!(greek_hits_upper.len(), 4);
         assert_eq!(greek_hits_upper[0].line_byte_offset, 0);

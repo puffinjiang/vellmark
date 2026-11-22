@@ -454,12 +454,16 @@ fn parse_historical_header_fields(
 }
 
 /// Read and CRC32-verify a historical backup entry's payload and optional `base` snapshot.
-pub fn read_historical_backup(path: impl AsRef<Path>) -> Result<HistoricalBackupData, SessionError> {
+pub fn read_historical_backup(
+    path: impl AsRef<Path>,
+) -> Result<HistoricalBackupData, SessionError> {
     let path = path.as_ref();
     let entry = match inspect_historical_entry_header(path) {
         HistoryHeaderInspect::Valid(entry) => entry,
         HistoryHeaderInspect::Corrupt => return Err(SessionError::CorruptedSnapshot),
-        HistoryHeaderInspect::IoError(kind) => return Err(SessionError::Io(std::io::Error::from(kind))),
+        HistoryHeaderInspect::IoError(kind) => {
+            return Err(SessionError::Io(std::io::Error::from(kind)));
+        }
     };
     let mut f = File::open(path)?;
     let mut raw = Vec::new();
@@ -488,10 +492,7 @@ pub fn read_historical_backup(path: impl AsRef<Path>) -> Result<HistoricalBackup
     let base_content = if entry.base_same_as_payload {
         String::from_utf8(payload_slice.to_vec()).ok()
     } else if entry.base_len > 0 {
-        Some(
-            String::from_utf8(base_slice.to_vec())
-                .map_err(|_| SessionError::CorruptedSnapshot)?,
-        )
+        Some(String::from_utf8(base_slice.to_vec()).map_err(|_| SessionError::CorruptedSnapshot)?)
     } else {
         None
     };
@@ -537,7 +538,10 @@ pub fn list_historical_backups_for_path(
     entries
 }
 
-fn compare_newest_first(a: &HistoricalBackupEntry, b: &HistoricalBackupEntry) -> std::cmp::Ordering {
+fn compare_newest_first(
+    a: &HistoricalBackupEntry,
+    b: &HistoricalBackupEntry,
+) -> std::cmp::Ordering {
     b.created_unix_secs
         .cmp(&a.created_unix_secs)
         .then_with(|| b.created_seq.cmp(&a.created_seq))
@@ -688,22 +692,21 @@ pub fn prune_historical_backups_at(
     let mut kept = Vec::with_capacity(live_after_per_file.len());
     for entry in live_after_per_file {
         let is_protected_new = protected_just_written.is_some_and(|p| p == entry.path);
-        if total_bytes > policy.max_total_bytes && !is_protected_new
-            && fs::remove_file(&entry.path).is_ok() {
-                total_bytes = total_bytes.saturating_sub(entry.file_size_bytes);
-                report.removed_global_cap += 1;
-                continue;
-            }
+        if total_bytes > policy.max_total_bytes
+            && !is_protected_new
+            && fs::remove_file(&entry.path).is_ok()
+        {
+            total_bytes = total_bytes.saturating_sub(entry.file_size_bytes);
+            report.removed_global_cap += 1;
+            continue;
+        }
         kept.push(entry);
     }
 
     // 4. Clean empty document subdirectories under `history_root`.
     if let Ok(read_dir) = fs::read_dir(history_root) {
         for sub in read_dir.flatten() {
-            if sub
-                .file_type()
-                .is_ok_and(|t| !t.is_symlink() && t.is_dir())
-            {
+            if sub.file_type().is_ok_and(|t| !t.is_symlink() && t.is_dir()) {
                 let _ = fs::remove_dir(sub.path());
             }
         }
@@ -739,9 +742,10 @@ pub fn measure_protected_snapshots_bytes(recovery_root: impl AsRef<Path>) -> u64
                 }
                 sum_dir_recursive(&path, depth + 1, total);
             } else if ft.is_file()
-                && let Ok(meta) = fs::symlink_metadata(&path) {
-                    *total = total.saturating_add(meta.len());
-                }
+                && let Ok(meta) = fs::symlink_metadata(&path)
+            {
+                *total = total.saturating_add(meta.len());
+            }
         }
     }
 
@@ -760,13 +764,7 @@ pub fn archive_pending_recovery_to_history(
     reason: HistoricalBackupReason,
     policy: HistoricalBackupPolicy,
 ) -> Result<PathBuf, SessionError> {
-    archive_pending_recovery_to_history_at(
-        history_root,
-        entry,
-        reason,
-        policy,
-        current_unix_secs(),
-    )
+    archive_pending_recovery_to_history_at(history_root, entry, reason, policy, current_unix_secs())
 }
 
 /// Deterministic clock-injected variant of [`archive_pending_recovery_to_history`].
@@ -833,9 +831,10 @@ pub fn delete_historical_backup(
     }
     fs::remove_file(&canon_target)?;
     if let Some(parent) = canon_target.parent()
-        && parent != canon_root {
-            let _ = fs::remove_dir(parent);
-        }
+        && parent != canon_root
+    {
+        let _ = fs::remove_dir(parent);
+    }
     Ok(true)
 }
 
@@ -854,9 +853,10 @@ fn clear_historical_backups_filtered(
             continue;
         }
         if let Some(parent) = entry.path.parent()
-            && parent != history_root {
-                candidate_dirs.insert(parent.to_path_buf());
-            }
+            && parent != history_root
+        {
+            candidate_dirs.insert(parent.to_path_buf());
+        }
         if fs::remove_file(&entry.path).is_ok() {
             removed += 1;
         }
@@ -958,7 +958,8 @@ fn maintain_dir_recursive(
                 }
                 let cp = item.path();
                 if ft.is_dir() {
-                    if cp.file_name().and_then(|s| s.to_str()) == Some(HISTORICAL_BACKUPS_DIR_NAME) {
+                    if cp.file_name().and_then(|s| s.to_str()) == Some(HISTORICAL_BACKUPS_DIR_NAME)
+                    {
                         continue;
                     }
                     maintain_dir_recursive(
@@ -1298,7 +1299,8 @@ mod tests {
     }
 
     #[test]
-    fn test_maintain_recovery_root_protects_current_snapshots_and_cleans_orphans_and_corrupt_files() {
+    fn test_maintain_recovery_root_protects_current_snapshots_and_cleans_orphans_and_corrupt_files()
+    {
         use crate::state::DocumentSession;
 
         let root = unique_temp_dir("maintain-root");
@@ -1337,7 +1339,11 @@ mod tests {
         let _ = report_clean;
         let orphan_dir = rec_root.join("session-empty-orphan");
         fs::create_dir_all(&orphan_dir).unwrap();
-        fs::write(orphan_dir.join(".current.slot0.rec.1.2.vellmark.tmp"), b"stale").unwrap();
+        fs::write(
+            orphan_dir.join(".current.slot0.rec.1.2.vellmark.tmp"),
+            b"stale",
+        )
+        .unwrap();
 
         fs::create_dir_all(&hist_root).unwrap();
         fs::write(hist_root.join("corrupt.hbak"), b"not valid history").unwrap();
@@ -1349,17 +1355,14 @@ mod tests {
             max_age_secs: 14 * 24 * 60 * 60,
             max_total_bytes: 16,
         };
-        let maint = maintain_recovery_root(
-            &rec_root,
-            &[],
-            small_policy,
-            0,
-            current_unix_secs(),
-        );
+        let maint = maintain_recovery_root(&rec_root, &[], small_policy, 0, current_unix_secs());
         assert!(maint.protected_exceeds_limit);
         assert!(maint.protected_snapshot_bytes > 16);
         assert_eq!(maint.history_prune.removed_corrupt_or_tmp, 2);
-        assert!(!orphan_dir.exists(), "empty orphan session dir must be cleaned");
+        assert!(
+            !orphan_dir.exists(),
+            "empty orphan session dir must be cleaned"
+        );
         assert!(
             DocumentSession::read_latest_intact_snapshot(&dirty_dir).is_some(),
             "protected dirty snapshot must NEVER be evicted even when exceeding budget"
@@ -1447,13 +1450,8 @@ mod tests {
         assert!(legacy_bak.exists());
 
         // Past 14-day TTL -> legacy conflict backup + empty dir are both cleaned!
-        let after_ttl = maintain_recovery_root(
-            &rec_root,
-            &[],
-            policy,
-            0,
-            now + policy.max_age_secs + 60,
-        );
+        let after_ttl =
+            maintain_recovery_root(&rec_root, &[], policy, 0, now + policy.max_age_secs + 60);
         assert_eq!(after_ttl.removed_legacy_backups, 1);
         assert!(!legacy_bak.exists());
         assert!(!legacy_dir.exists());
@@ -1491,10 +1489,7 @@ mod tests {
             session.archive_unsaved_on_close().unwrap();
         }
         assert_eq!(list_historical_backups(&hist_root).len(), 25);
-        assert_eq!(
-            list_historical_backups_for_path(&hist_root, None).len(),
-            25
-        );
+        assert_eq!(list_historical_backups_for_path(&hist_root, None).len(), 25);
 
         // 2. Single untitled draft writing > max_backups_per_file backups still stays bounded to cap.
         let tight_policy = HistoricalBackupPolicy {
@@ -1517,7 +1512,10 @@ mod tests {
             })
             .unwrap();
         }
-        assert_eq!(list_historical_backups_for_path(&single_hist, None).len(), 3);
+        assert_eq!(
+            list_historical_backups_for_path(&single_hist, None).len(),
+            3
+        );
         assert_eq!(clear_historical_backups_for_path(&hist_root, None), 25);
         assert!(list_historical_backups(&hist_root).is_empty());
 
@@ -1555,7 +1553,10 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(list_historical_backups_for_path(&crash_hist_root, None).len(), 25);
+        assert_eq!(
+            list_historical_backups_for_path(&crash_hist_root, None).len(),
+            25
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1598,12 +1599,7 @@ mod tests {
         let rest = &meta_json[start..];
         let colon = rest.find(':').unwrap();
         let end = rest.find([',', '}']).unwrap();
-        let updated_meta = format!(
-            "{}:{}{}",
-            &meta_json[..start + colon],
-            old_ts,
-            &rest[end..]
-        );
+        let updated_meta = format!("{}:{}{}", &meta_json[..start + colon], old_ts, &rest[end..]);
         fs::write(&meta_path, updated_meta).unwrap();
 
         let pending = scan_recovery_root(&rec_root);
@@ -1731,7 +1727,10 @@ mod tests {
         fs::create_dir_all(&slot_dir).unwrap();
         let oversized_slot = slot_dir.join("current.slot0.rec");
         fs::write(&oversized_slot, &big_junk).unwrap();
-        assert_eq!(inspect_slot_report_header(&oversized_slot), SlotInspect::Corrupt);
+        assert_eq!(
+            inspect_slot_report_header(&oversized_slot),
+            SlotInspect::Corrupt
+        );
         assert!(DocumentSession::read_latest_intact_snapshot(&slot_dir).is_none());
 
         let maint = maintain_recovery_root(
@@ -1815,7 +1814,10 @@ mod tests {
             current_unix_secs(),
         );
         let elapsed = started.elapsed();
-        eprintln!("32 MiB active + 512 KiB clean maintenance elapsed: {:?}", elapsed);
+        eprintln!(
+            "32 MiB active + 512 KiB clean maintenance elapsed: {:?}",
+            elapsed
+        );
 
         assert!(active_dir.exists());
         assert!(!clean_inactive_dir.exists());
@@ -1925,7 +1927,8 @@ mod tests {
         );
 
         // 2. Startup scan & recovery work identically on legacy V1 slots.
-        let restored_dirty = DocumentSession::read_latest_intact_snapshot(&legacy_dirty_dir).unwrap();
+        let restored_dirty =
+            DocumentSession::read_latest_intact_snapshot(&legacy_dirty_dir).unwrap();
         assert_eq!(restored_dirty.sequence, 0);
         assert_eq!(restored_dirty.revision, 7);
         assert_eq!(restored_dirty.content, "legacy dirty content");
@@ -2096,7 +2099,10 @@ mod tests {
             return;
         }
 
-        assert_eq!(inspect_slot_report_header(&dirty_slot), SlotInspect::Unreadable);
+        assert_eq!(
+            inspect_slot_report_header(&dirty_slot),
+            SlotInspect::Unreadable
+        );
         assert!(matches!(
             read_historical_backup(&hbak_path),
             Err(SessionError::Io(_))

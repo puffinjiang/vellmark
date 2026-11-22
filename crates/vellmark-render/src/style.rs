@@ -50,10 +50,18 @@ impl RgbaColor {
         let t = factor.clamp(0.0, 1.0);
         let inv = 1.0 - t;
         Self {
-            r: (self.r as f32 * t + bg.r as f32 * inv).round().clamp(0.0, 255.0) as u8,
-            g: (self.g as f32 * t + bg.g as f32 * inv).round().clamp(0.0, 255.0) as u8,
-            b: (self.b as f32 * t + bg.b as f32 * inv).round().clamp(0.0, 255.0) as u8,
-            a: (self.a as f32 * t + bg.a as f32 * inv).round().clamp(0.0, 255.0) as u8,
+            r: (self.r as f32 * t + bg.r as f32 * inv)
+                .round()
+                .clamp(0.0, 255.0) as u8,
+            g: (self.g as f32 * t + bg.g as f32 * inv)
+                .round()
+                .clamp(0.0, 255.0) as u8,
+            b: (self.b as f32 * t + bg.b as f32 * inv)
+                .round()
+                .clamp(0.0, 255.0) as u8,
+            a: (self.a as f32 * t + bg.a as f32 * inv)
+                .round()
+                .clamp(0.0, 255.0) as u8,
         }
     }
 
@@ -163,7 +171,12 @@ impl ResolvedThemeStyle {
 
         let bg_color = resolve_color_any(
             sheet,
-            &[("#write", "background-color"), ("#write", "background"), ("body", "background-color"), ("body", "background")],
+            &[
+                ("#write", "background-color"),
+                ("#write", "background"),
+                ("body", "background-color"),
+                ("body", "background"),
+            ],
         )
         .unwrap_or(RgbaColor::rgb(255, 255, 255));
         let is_dark = bg_color.luminance() < 0.45;
@@ -173,23 +186,22 @@ impl ResolvedThemeStyle {
         } else {
             RgbaColor::rgb(31, 35, 40)
         };
-        let text_color = resolve_color_any(
-            sheet,
-            &[("#write", "color"), ("body", "color")],
-        )
-        .unwrap_or(default_text);
+        let text_color = resolve_color_any(sheet, &[("#write", "color"), ("body", "color")])
+            .unwrap_or(default_text);
 
         // User config provides baseline font size; CSS `#write` overrides only if explicit, or scales via zoom.
-        let unzoomed_font_px = resolve_prop_any(sheet, &[("#write", "font-size"), ("body", "font-size")])
-            .and_then(|v| parse_css_length_px(&v, config_font_size_px))
-            .unwrap_or(config_font_size_px)
-            .clamp(10.0, 48.0);
+        let unzoomed_font_px =
+            resolve_prop_any(sheet, &[("#write", "font-size"), ("body", "font-size")])
+                .and_then(|v| parse_css_length_px(&v, config_font_size_px))
+                .unwrap_or(config_font_size_px)
+                .clamp(10.0, 48.0);
         let base_font_size_px = unzoomed_font_px * zoom_scale;
 
-        let line_height_ratio = resolve_prop_any(sheet, &[("#write", "line-height"), ("body", "line-height")])
-            .and_then(|v| parse_css_line_height_ratio(&v, unzoomed_font_px))
-            .unwrap_or(config_line_height_ratio)
-            .clamp(1.1, 3.0);
+        let line_height_ratio =
+            resolve_prop_any(sheet, &[("#write", "line-height"), ("body", "line-height")])
+                .and_then(|v| parse_css_line_height_ratio(&v, unzoomed_font_px))
+                .unwrap_or(config_line_height_ratio)
+                .clamp(1.1, 3.0);
         let base_line_height_px = (base_font_size_px * line_height_ratio).max(16.0);
 
         let unzoomed_max_w = resolve_prop_any(sheet, &[("#write", "max-width")])
@@ -198,39 +210,42 @@ impl ResolvedThemeStyle {
             .clamp(360.0, 2200.0);
         let max_content_width_px = unzoomed_max_w * zoom_scale;
 
-        let base_font_family = resolve_prop_any(sheet, &[("#write", "font-family"), ("body", "font-family")])
-            .map(|s| first_css_font_name(&s))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "sans-serif".to_string());
-        let mono_font_family = resolve_prop_any(sheet, &[("pre", "font-family"), ("code", "font-family")])
-            .map(|s| first_css_font_name(&s))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "monospace".to_string());
+        let base_font_family =
+            resolve_prop_any(sheet, &[("#write", "font-family"), ("body", "font-family")])
+                .map(|s| first_css_font_name(&s))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "sans-serif".to_string());
+        let mono_font_family =
+            resolve_prop_any(sheet, &[("pre", "font-family"), ("code", "font-family")])
+                .map(|s| first_css_font_name(&s))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "monospace".to_string());
 
-        let link_color = resolve_color_any(sheet, &[("a", "color")])
-            .unwrap_or(if is_dark {
-                RgbaColor::rgb(110, 179, 255)
-            } else {
-                RgbaColor::rgb(9, 105, 218)
-            });
+        let link_color = resolve_color_any(sheet, &[("a", "color")]).unwrap_or(if is_dark {
+            RgbaColor::rgb(110, 179, 255)
+        } else {
+            RgbaColor::rgb(9, 105, 218)
+        });
         let link_underline = resolve_prop_any(sheet, &[("a", "text-decoration")])
             .map(|v| v.contains("underline"))
             .unwrap_or(true);
 
         let selection_bg = resolve_color_any(
             sheet,
-            &[("::selection", "background-color"), ("::selection", "background")],
+            &[
+                ("::selection", "background-color"),
+                ("::selection", "background"),
+            ],
         )
         .map(|c| if c.a == 255 { c.with_alpha(96) } else { c })
         .unwrap_or_else(|| link_color.with_alpha(if is_dark { 90 } else { 70 }));
 
-        let inline_code_color = resolve_color_any(sheet, &[("code", "color")]).unwrap_or(
-            if is_dark {
+        let inline_code_color =
+            resolve_color_any(sheet, &[("code", "color")]).unwrap_or(if is_dark {
                 RgbaColor::rgb(240, 168, 180)
             } else {
                 RgbaColor::rgb(185, 58, 92)
-            },
-        );
+            });
         let inline_code_bg = resolve_color_any(
             sheet,
             &[("code", "background-color"), ("code", "background")],
@@ -241,28 +256,24 @@ impl ResolvedThemeStyle {
             RgbaColor::rgba(175, 184, 193, 56)
         });
 
-        let code_block_bg = resolve_color_any(
-            sheet,
-            &[("pre", "background-color"), ("pre", "background")],
-        )
-        .unwrap_or(if is_dark {
-            bg_color.adjust(10)
-        } else {
-            bg_color.adjust(-10)
-        });
-        let code_block_text =
-            resolve_color_any(sheet, &[("pre", "color")]).unwrap_or(text_color);
-        let code_block_border = resolve_color_any(
-            sheet,
-            &[("pre", "border-color"), ("pre", "border")],
-        )
-        .unwrap_or_else(|| bg_color.lerp(text_color, 0.85));
+        let code_block_bg =
+            resolve_color_any(sheet, &[("pre", "background-color"), ("pre", "background")])
+                .unwrap_or(if is_dark {
+                    bg_color.adjust(10)
+                } else {
+                    bg_color.adjust(-10)
+                });
+        let code_block_text = resolve_color_any(sheet, &[("pre", "color")]).unwrap_or(text_color);
+        let code_block_border =
+            resolve_color_any(sheet, &[("pre", "border-color"), ("pre", "border")])
+                .unwrap_or_else(|| bg_color.lerp(text_color, 0.85));
 
-        let code_font_size_px = resolve_prop_any(sheet, &[("pre", "font-size"), ("code", "font-size")])
-            .and_then(|v| parse_css_length_px(&v, unzoomed_font_px))
-            .map(|px| px * zoom_scale)
-            .unwrap_or(base_font_size_px * 0.88)
-            .max(11.0);
+        let code_font_size_px =
+            resolve_prop_any(sheet, &[("pre", "font-size"), ("code", "font-size")])
+                .and_then(|v| parse_css_length_px(&v, unzoomed_font_px))
+                .map(|px| px * zoom_scale)
+                .unwrap_or(base_font_size_px * 0.88)
+                .max(11.0);
         let code_line_height_px = (code_font_size_px * 1.55).max(16.0);
 
         let (bq_width, bq_border_from_shorthand) = resolve_prop_any(
@@ -271,42 +282,58 @@ impl ResolvedThemeStyle {
         )
         .map(|v| parse_css_border(&v, unzoomed_font_px))
         .unwrap_or((None, None));
-        let blockquote_border = resolve_color_any(
-            sheet,
-            &[("blockquote", "border-left-color")],
-        )
-        .or(bq_border_from_shorthand)
-        .unwrap_or_else(|| text_color.lerp(bg_color, 0.28));
-        let blockquote_border_width = resolve_prop_any(
-            sheet,
-            &[("blockquote", "border-left-width")],
-        )
-        .and_then(|v| parse_css_length_px(&v, unzoomed_font_px))
-        .or(bq_width)
-        .unwrap_or(3.5)
-        * zoom_scale;
+        let blockquote_border = resolve_color_any(sheet, &[("blockquote", "border-left-color")])
+            .or(bq_border_from_shorthand)
+            .unwrap_or_else(|| text_color.lerp(bg_color, 0.28));
+        let blockquote_border_width =
+            resolve_prop_any(sheet, &[("blockquote", "border-left-width")])
+                .and_then(|v| parse_css_length_px(&v, unzoomed_font_px))
+                .or(bq_width)
+                .unwrap_or(3.5)
+                * zoom_scale;
         let blockquote_text = resolve_color_any(sheet, &[("blockquote", "color")])
             .unwrap_or_else(|| text_color.lerp(bg_color, 0.72));
         let blockquote_bg = resolve_color_any(
             sheet,
-            &[("blockquote", "background-color"), ("blockquote", "background")],
+            &[
+                ("blockquote", "background-color"),
+                ("blockquote", "background"),
+            ],
         );
 
         let hr_color = resolve_color_any(
             sheet,
-            &[("hr", "background-color"), ("hr", "border-color"), ("hr", "color")],
+            &[
+                ("hr", "background-color"),
+                ("hr", "border-color"),
+                ("hr", "color"),
+            ],
         )
         .unwrap_or_else(|| text_color.lerp(bg_color, 0.22));
         let table_border = resolve_color_any(
             sheet,
-            &[("td", "border-color"), ("th", "border-color"), ("table", "border-color")],
+            &[
+                ("td", "border-color"),
+                ("th", "border-color"),
+                ("table", "border-color"),
+            ],
         )
         .unwrap_or_else(|| text_color.lerp(bg_color, 0.25));
         let table_header_bg = resolve_color_any(
             sheet,
-            &[("th", "background-color"), ("th", "background"), ("thead", "background-color")],
+            &[
+                ("th", "background-color"),
+                ("th", "background"),
+                ("thead", "background-color"),
+            ],
         )
-        .unwrap_or_else(|| if is_dark { bg_color.adjust(12) } else { bg_color.adjust(-8) });
+        .unwrap_or_else(|| {
+            if is_dark {
+                bg_color.adjust(12)
+            } else {
+                bg_color.adjust(-8)
+            }
+        });
 
         let default_heading_scales = [2.0_f32, 1.55, 1.32, 1.15, 1.05, 0.96];
         let headings = std::array::from_fn(|idx| {
@@ -327,8 +354,8 @@ impl ResolvedThemeStyle {
             let (bb_w, bb_c) = resolve_prop_any(sheet, &[(&sel, "border-bottom")])
                 .map(|v| parse_css_border(&v, unzoomed_font_px))
                 .unwrap_or((None, None));
-            let bottom_border_color = resolve_color_any(sheet, &[(&sel, "border-bottom-color")])
-                .or(bb_c);
+            let bottom_border_color =
+                resolve_color_any(sheet, &[(&sel, "border-bottom-color")]).or(bb_c);
             let bottom_border_width = if bottom_border_color.is_some() {
                 bb_w.unwrap_or(1.0) * zoom_scale
             } else {
@@ -394,7 +421,12 @@ impl ResolvedThemeStyle {
     }
 
     /// Dim inactive block colors smoothly in Focus Mode (`PRD 4.7 V-01`).
-    pub fn apply_focus_mode(&self, color: RgbaColor, is_focused: bool, focus_mode: bool) -> RgbaColor {
+    pub fn apply_focus_mode(
+        &self,
+        color: RgbaColor,
+        is_focused: bool,
+        focus_mode: bool,
+    ) -> RgbaColor {
         if !focus_mode || is_focused {
             color
         } else {
@@ -409,12 +441,28 @@ fn derive_ui_chrome(
     accent: RgbaColor,
     is_dark: bool,
 ) -> UiChromeColors {
-    let sidebar_bg = if is_dark { doc_bg.adjust(-8) } else { doc_bg.adjust(-9) };
-    let tab_bar_bg = if is_dark { doc_bg.adjust(-12) } else { doc_bg.adjust(-14) };
+    let sidebar_bg = if is_dark {
+        doc_bg.adjust(-8)
+    } else {
+        doc_bg.adjust(-9)
+    };
+    let tab_bar_bg = if is_dark {
+        doc_bg.adjust(-12)
+    } else {
+        doc_bg.adjust(-14)
+    };
     let status_bar_bg = doc_bg.adjust(-10);
-    let panel_bg = if is_dark { doc_bg.adjust(8) } else { doc_bg.adjust(-4) };
+    let panel_bg = if is_dark {
+        doc_bg.adjust(8)
+    } else {
+        doc_bg.adjust(-4)
+    };
     let border = doc_text.lerp(doc_bg, 0.16);
-    let hover_bg = if is_dark { doc_bg.adjust(14) } else { doc_bg.adjust(-18) };
+    let hover_bg = if is_dark {
+        doc_bg.adjust(14)
+    } else {
+        doc_bg.adjust(-18)
+    };
     UiChromeColors {
         is_dark,
         window_bg: doc_bg,
@@ -441,9 +489,11 @@ fn resolve_prop_any(sheet: &ThemeSheet, queries: &[(&str, &str)]) -> Option<Stri
 }
 
 fn resolve_color_any(sheet: &ThemeSheet, queries: &[(&str, &str)]) -> Option<RgbaColor> {
-    queries
-        .iter()
-        .find_map(|(sel, prop)| sheet.resolve_property(sel, prop).and_then(|v| parse_css_color(&v)))
+    queries.iter().find_map(|(sel, prop)| {
+        sheet
+            .resolve_property(sel, prop)
+            .and_then(|v| parse_css_color(&v))
+    })
 }
 
 fn first_css_font_name(raw: &str) -> String {
@@ -495,7 +545,10 @@ pub fn parse_css_color(raw: &str) -> Option<RgbaColor> {
     }
 
     let lower = s.to_ascii_lowercase();
-    if let Some(inner) = lower.strip_prefix("rgba(").and_then(|t| t.strip_suffix(')')) {
+    if let Some(inner) = lower
+        .strip_prefix("rgba(")
+        .and_then(|t| t.strip_suffix(')'))
+    {
         let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
         if parts.len() == 4 {
             let r = parts[0].parse::<f32>().ok()?.round().clamp(0.0, 255.0) as u8;
@@ -574,9 +627,10 @@ fn parse_css_border(raw: &str, base_px: f32) -> (Option<f32>, Option<RgbaColor>)
     let mut color = None;
     // Handle `rgba(...)` or `rgb(...)` without splitting inside parens.
     if let Some(rgb_start) = raw.find("rgb")
-        && let Some(close) = raw[rgb_start..].find(')') {
-            color = parse_css_color(&raw[rgb_start..=rgb_start + close]);
-        }
+        && let Some(close) = raw[rgb_start..].find(')')
+    {
+        color = parse_css_color(&raw[rgb_start..=rgb_start + close]);
+    }
     for token in raw.split_whitespace() {
         if width.is_none() && (token.ends_with("px") || token.ends_with("em")) {
             width = parse_css_length_px(token, base_px);
@@ -595,7 +649,10 @@ mod tests {
 
     #[test]
     fn test_css_color_and_length_parsing() {
-        assert_eq!(parse_css_color("#abc"), Some(RgbaColor::rgb(0xaa, 0xbb, 0xcc)));
+        assert_eq!(
+            parse_css_color("#abc"),
+            Some(RgbaColor::rgb(0xaa, 0xbb, 0xcc))
+        );
         assert_eq!(
             parse_css_color("rgba(10, 20, 30, 0.5)"),
             Some(RgbaColor::new(10, 20, 30, 128))

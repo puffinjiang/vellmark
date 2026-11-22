@@ -11,9 +11,8 @@ pub mod syntax;
 
 pub use shaper::{
     CodeBlockButtonHit, CodeBlockButtonKind, DrawList, EditorHitTarget, EditorSceneResult,
-    EditorViewport, ImageLoadStatus, ImageStatusResolver, Rect, SceneGlyph, SceneImage,
-    SceneRect, ShapedDocumentCache, TableButtonHit, TableButtonKind, VisualTextMap,
-    shape_ui_text_into,
+    EditorViewport, ImageLoadStatus, ImageStatusResolver, Rect, SceneGlyph, SceneImage, SceneRect,
+    ShapedDocumentCache, TableButtonHit, TableButtonKind, VisualTextMap, shape_ui_text_into,
 };
 pub use style::{HeadingStyle, ResolvedThemeStyle, RgbaColor, UiChromeColors};
 pub use syntax::{
@@ -61,7 +60,11 @@ pub struct DocumentLayout {
 
 impl DocumentLayout {
     /// Build block layout from parsed `BlockNode`s and current `Selection`.
-    pub fn compute(parsed_blocks: &[BlockNode], selection: Selection, base_line_height: f32) -> Self {
+    pub fn compute(
+        parsed_blocks: &[BlockNode],
+        selection: Selection,
+        base_line_height: f32,
+    ) -> Self {
         let mut blocks = Vec::with_capacity(parsed_blocks.len());
         let mut y = 0.0f32;
         let line_h = base_line_height.max(16.0);
@@ -112,13 +115,8 @@ impl DocumentLayout {
         let min_y = (scroll_y - overscan).max(0.0);
         let max_y = scroll_y + viewport_height + overscan;
 
-        let start_idx = self
-            .blocks
-            .partition_point(|b| b.y + b.height < min_y);
-        let end_idx = self
-            .blocks
-            .partition_point(|b| b.y <= max_y)
-            .max(start_idx);
+        let start_idx = self.blocks.partition_point(|b| b.y + b.height < min_y);
+        let end_idx = self.blocks.partition_point(|b| b.y <= max_y).max(start_idx);
         &self.blocks[start_idx..end_idx]
     }
 }
@@ -154,7 +152,11 @@ mod tests {
         // Viewport showing y=[240.0..480.0] with 0 overscan only renders ~11 blocks out of 100
         let visible = layout.visible_blocks(240.0, 240.0, 0.0);
         assert!(visible.len() <= 12);
-        assert!(visible.iter().all(|b| b.y + b.height >= 240.0 && b.y <= 480.0));
+        assert!(
+            visible
+                .iter()
+                .all(|b| b.y + b.height >= 240.0 && b.y <= 480.0)
+        );
 
         // Typewriter mode centers cursor vertically
         let tw_scroll = typewriter_scroll_y(500.0, 24.0, 600.0);

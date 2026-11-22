@@ -9,7 +9,15 @@ use std::path::{Path, PathBuf};
 const SUPPORTED_EXTENSIONS: &[&str] = &["md", "markdown", "txt"];
 
 /// Directories ignored when scanning a workspace folder.
-const IGNORED_DIRS: &[&str] = &[".git", ".hg", ".svn", "target", "node_modules", ".idea", ".vscode"];
+const IGNORED_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "target",
+    "node_modules",
+    ".idea",
+    ".vscode",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileTreeNode {
@@ -306,7 +314,10 @@ mod tests {
 
         let dangling_dest = root.join("dangling_link.md");
         symlink(root.join("missing_target.md"), &dangling_dest).unwrap();
-        assert!(!dangling_dest.exists(), "dangling symlink target should not exist");
+        assert!(
+            !dangling_dest.exists(),
+            "dangling symlink target should not exist"
+        );
         assert!(fs::symlink_metadata(&dangling_dest).is_ok());
 
         let err = FileTreeNode::rename_or_move(&src, &dangling_dest)
@@ -349,8 +360,7 @@ mod tests {
         assert_eq!(loaded_small.entries, vec![p4, p3]);
 
         // Missing file loads as empty list without error
-        let missing =
-            RecentFilesList::load_from_file(&root.join("does-not-exist.txt"), 5).unwrap();
+        let missing = RecentFilesList::load_from_file(&root.join("does-not-exist.txt"), 5).unwrap();
         assert!(missing.entries.is_empty());
 
         let _ = fs::remove_dir_all(&root);

@@ -192,7 +192,11 @@ pub fn highlight_code_slice(
 
 fn select_theme(theme_set: &ThemeSet, is_dark: bool) -> &Theme {
     let preferred = if is_dark {
-        ["base16-ocean.dark", "base16-eighties.dark", "Solarized (dark)"]
+        [
+            "base16-ocean.dark",
+            "base16-eighties.dark",
+            "Solarized (dark)",
+        ]
     } else {
         ["InspiredGitHub", "Solarized (light)", "base16-ocean.light"]
     };
@@ -208,11 +212,7 @@ fn select_theme(theme_set: &ThemeSet, is_dark: bool) -> &Theme {
         .expect("syntect default ThemeSet always contains at least one theme")
 }
 
-fn ensure_readable_contrast(
-    fg: RgbaColor,
-    bg: RgbaColor,
-    fallback: RgbaColor,
-) -> RgbaColor {
+fn ensure_readable_contrast(fg: RgbaColor, bg: RgbaColor, fallback: RgbaColor) -> RgbaColor {
     if fg.a < 16 {
         return fallback;
     }
@@ -244,10 +244,7 @@ fn canonical_alias(token: &str) -> &str {
     }
 }
 
-fn resolve_syntax_for_token<'a>(
-    ss: &'a SyntaxSet,
-    raw_token: &str,
-) -> Option<&'a SyntaxReference> {
+fn resolve_syntax_for_token<'a>(ss: &'a SyntaxSet, raw_token: &str) -> Option<&'a SyntaxReference> {
     let mapped = canonical_alias(raw_token);
     if let Some(syn) = ss
         .find_syntax_by_token(mapped)
@@ -349,8 +346,7 @@ mod tests {
         );
         assert!(dark_spans.len() >= 4);
 
-        let distinct_colors: HashSet<RgbaColor> =
-            light_spans.iter().map(|s| s.color).collect();
+        let distinct_colors: HashSet<RgbaColor> = light_spans.iter().map(|s| s.color).collect();
         assert!(
             distinct_colors.len() >= 2,
             "expected distinct token colors for keywords/strings/comments"

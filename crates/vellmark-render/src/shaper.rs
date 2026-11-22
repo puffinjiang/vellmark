@@ -223,7 +223,11 @@ impl VisualTextMap {
 
     /// Convert a `cosmic-text` `(line_i, byte_in_line)` cursor into global `display_text` byte index.
     pub fn line_col_to_visual(&self, line_i: usize, col_byte: usize) -> usize {
-        let line_start = self.line_starts.get(line_i).copied().unwrap_or(self.display_text.len());
+        let line_start = self
+            .line_starts
+            .get(line_i)
+            .copied()
+            .unwrap_or(self.display_text.len());
         let next_start = self
             .line_starts
             .get(line_i + 1)
@@ -586,8 +590,8 @@ impl ShapedDocumentCache {
         self.block_scale_y.reserve(blocks.len());
 
         let mut y = 24.0 * style.zoom_scale;
-        let width_chars = ((content_width_px - 32.0).max(80.0) / (style.base_font_size_px * 0.54))
-            .max(12.0);
+        let width_chars =
+            ((content_width_px - 32.0).max(80.0) / (style.base_font_size_px * 0.54)).max(12.0);
         for node in blocks {
             let est = estimate_block_height(node, style, width_chars);
             self.block_ranges.push(node.range);
@@ -683,8 +687,15 @@ impl ShapedDocumentCache {
         // Determine if caret sits at a trailing empty line past the final block (e.g., after `\n`).
         let caret_after_last_block = blocks
             .last()
-            .map(|last| vp.view.ime_preedit.is_some() && vp.view.ime_composition_selection.map(|s| s.head > last.range.end).unwrap_or(false)
-                || base_caret > last.range.end)
+            .map(|last| {
+                vp.view.ime_preedit.is_some()
+                    && vp
+                        .view
+                        .ime_composition_selection
+                        .map(|s| s.head > last.range.end)
+                        .unwrap_or(false)
+                    || base_caret > last.range.end
+            })
             .unwrap_or(false);
 
         let mut y_cursor_shift = 0.0f32;
@@ -694,7 +705,8 @@ impl ShapedDocumentCache {
             let raw_text = read_slice(node.range);
             let block_focused = node.range.contains_inclusive(exp_sel.head);
 
-            if matches!(node.kind, BlockKind::Table) && vp.view.mode != ViewMode::Source
+            if matches!(node.kind, BlockKind::Table)
+                && vp.view.mode != ViewMode::Source
                 && let Some(table_display) = build_table_display(
                     node,
                     &raw_text,
@@ -703,92 +715,93 @@ impl ShapedDocumentCache {
                     style,
                     block_focused,
                     vp.focus_mode,
-                ) {
-                    let avail_table_w = (vp.content_width_px - 8.0).max(120.0);
-                    let show_toolbar = block_focused
-                        && vp.view.ime_preedit.is_none()
-                        && vp.view.selection.is_caret()
-                        && !caret_after_last_block;
-                    let table_key = shape_table_cache_key(
-                        &table_display,
-                        avail_table_w,
-                        style_sig,
-                        block_focused,
-                        vp.focus_mode,
-                    );
-                    let frame_seq = self.frame_seq;
-                    if let Some(cached) = self.table_lru.get_mut(&table_key) {
-                        cached.last_used_frame = frame_seq;
-                    } else {
-                        let shaped = shape_table_block(
-                            &mut self.font_system,
-                            table_display,
-                            avail_table_w,
-                            style,
-                            frame_seq,
-                        );
-                        if self.table_lru.len() >= MAX_SHAPED_TABLE_CACHE {
-                            evict_oldest_table_lru(&mut self.table_lru);
-                        }
-                        self.table_lru.insert(table_key, shaped);
-                    }
-
-                    let table = self.table_lru.get(&table_key).expect("just inserted");
-                    let measured_h = table.total_height.max(style.base_line_height_px);
-                    update_block_height_metric(
-                        idx,
-                        block_y,
-                        measured_h,
-                        &mut self.block_ys,
-                        &mut self.block_heights,
-                        &mut y_cursor_shift,
-                        &mut any_height_changed,
-                        &mut first_changed_idx,
-                    );
-
-                    let screen_top_y = vp.doc_rect.y + block_y - vp.scroll_y;
-                    let table_left_x = vp.content_left_x + 4.0;
-                    let table_top_y = screen_top_y + table.top_pad_px;
-
-                    emit_table_scene(
+                )
+            {
+                let avail_table_w = (vp.content_width_px - 8.0).max(120.0);
+                let show_toolbar = block_focused
+                    && vp.view.ime_preedit.is_none()
+                    && vp.view.selection.is_caret()
+                    && !caret_after_last_block;
+                let table_key = shape_table_cache_key(
+                    &table_display,
+                    avail_table_w,
+                    style_sig,
+                    block_focused,
+                    vp.focus_mode,
+                );
+                let frame_seq = self.frame_seq;
+                if let Some(cached) = self.table_lru.get_mut(&table_key) {
+                    cached.last_used_frame = frame_seq;
+                } else {
+                    let shaped = shape_table_block(
                         &mut self.font_system,
-                        table,
-                        node,
-                        block_y,
-                        screen_top_y,
-                        table_left_x,
-                        table_top_y,
-                        caret_after_last_block,
-                        base_caret,
-                        sel,
-                        vp,
+                        table_display,
+                        avail_table_w,
                         style,
-                        block_focused,
-                        show_toolbar,
-                        &mut draw,
-                        &mut caret_doc_y,
-                        &mut caret_line_height,
-                        &mut ime_cursor_area,
-                        &mut table_buttons,
+                        frame_seq,
                     );
-
-                    self.last_hit_blocks.push(HitBlockRecord {
-                        is_table: true,
-                        shape_hash: table_key,
-                        row_rect: Rect::new(
-                            vp.doc_rect.x,
-                            screen_top_y,
-                            vp.doc_rect.w,
-                            measured_h.max(style.base_line_height_px),
-                        ),
-                        text_origin_x: table_left_x,
-                        text_origin_y: table_top_y,
-                        checkbox_rect: None,
-                        block_range: node.range,
-                        src_end_fallback: node.range.end,
-                    });
-                    continue;
+                    if self.table_lru.len() >= MAX_SHAPED_TABLE_CACHE {
+                        evict_oldest_table_lru(&mut self.table_lru);
+                    }
+                    self.table_lru.insert(table_key, shaped);
                 }
+
+                let table = self.table_lru.get(&table_key).expect("just inserted");
+                let measured_h = table.total_height.max(style.base_line_height_px);
+                update_block_height_metric(
+                    idx,
+                    block_y,
+                    measured_h,
+                    &mut self.block_ys,
+                    &mut self.block_heights,
+                    &mut y_cursor_shift,
+                    &mut any_height_changed,
+                    &mut first_changed_idx,
+                );
+
+                let screen_top_y = vp.doc_rect.y + block_y - vp.scroll_y;
+                let table_left_x = vp.content_left_x + 4.0;
+                let table_top_y = screen_top_y + table.top_pad_px;
+
+                emit_table_scene(
+                    &mut self.font_system,
+                    table,
+                    node,
+                    block_y,
+                    screen_top_y,
+                    table_left_x,
+                    table_top_y,
+                    caret_after_last_block,
+                    base_caret,
+                    sel,
+                    vp,
+                    style,
+                    block_focused,
+                    show_toolbar,
+                    &mut draw,
+                    &mut caret_doc_y,
+                    &mut caret_line_height,
+                    &mut ime_cursor_area,
+                    &mut table_buttons,
+                );
+
+                self.last_hit_blocks.push(HitBlockRecord {
+                    is_table: true,
+                    shape_hash: table_key,
+                    row_rect: Rect::new(
+                        vp.doc_rect.x,
+                        screen_top_y,
+                        vp.doc_rect.w,
+                        measured_h.max(style.base_line_height_px),
+                    ),
+                    text_origin_x: table_left_x,
+                    text_origin_y: table_top_y,
+                    checkbox_rect: None,
+                    block_range: node.range,
+                    src_end_fallback: node.range.end,
+                });
+                continue;
+            }
 
             let display = build_block_display(
                 node,
@@ -807,14 +820,24 @@ impl ShapedDocumentCache {
                 &display,
                 avail_w,
                 style_sig,
-                matches!(node.kind, BlockKind::CodeFence { .. } | BlockKind::YamlFrontMatter),
+                matches!(
+                    node.kind,
+                    BlockKind::CodeFence { .. } | BlockKind::YamlFrontMatter
+                ),
             );
 
             let frame_seq = self.frame_seq;
             if let Some(cached) = self.shaped_lru.get_mut(&key) {
                 cached.last_used_frame = frame_seq;
             } else {
-                let shaped = shape_block(&mut self.font_system, display, avail_w, style, key, frame_seq);
+                let shaped = shape_block(
+                    &mut self.font_system,
+                    display,
+                    avail_w,
+                    style,
+                    key,
+                    frame_seq,
+                );
                 if self.shaped_lru.len() >= MAX_SHAPED_BLOCK_CACHE {
                     evict_oldest_lru(&mut self.shaped_lru);
                 }
@@ -861,7 +884,8 @@ impl ShapedDocumentCache {
                         vp.content_width_px - 8.0,
                         measured_h - 2.0,
                     );
-                    draw.rects.push(SceneRect::solid(bg_rect, bq_bg).with_clip(Some(vp.doc_rect)));
+                    draw.rects
+                        .push(SceneRect::solid(bg_rect, bq_bg).with_clip(Some(vp.doc_rect)));
                 }
                 let bar = Rect::new(
                     vp.content_left_x + 6.0,
@@ -870,7 +894,8 @@ impl ShapedDocumentCache {
                     (measured_h - 6.0).max(12.0),
                 );
                 draw.rects.push(
-                    SceneRect::rounded(bar, style.blockquote_border, 1.5).with_clip(Some(vp.doc_rect)),
+                    SceneRect::rounded(bar, style.blockquote_border, 1.5)
+                        .with_clip(Some(vp.doc_rect)),
                 );
             }
             if let Some(level) = shaped.display.heading_level {
@@ -914,7 +939,14 @@ impl ShapedDocumentCache {
                 };
                 draw.rects.push(
                     SceneRect::rounded(cb_rect, fill, 3.0)
-                        .with_border(1.5, if checked { style.link_color } else { style.muted_marker_color })
+                        .with_border(
+                            1.5,
+                            if checked {
+                                style.link_color
+                            } else {
+                                style.muted_marker_color
+                            },
+                        )
                         .with_clip(Some(vp.doc_rect)),
                 );
                 if checked {
@@ -969,16 +1001,15 @@ impl ShapedDocumentCache {
             let owns_caret = !caret_after_last_block
                 && (owns_ime
                     || (node.range.contains_inclusive(base_caret)
-                        && (idx + 1 == blocks.len() || blocks[idx + 1].range.start != base_caret || base_caret <= node.range.end)));
+                        && (idx + 1 == blocks.len()
+                            || blocks[idx + 1].range.start != base_caret
+                            || base_caret <= node.range.end)));
             if owns_caret && ime_cursor_area.is_none() {
-                let target_vis = shaped
-                    .map
-                    .active_ime_caret_visual()
-                    .unwrap_or_else(|| {
-                        shaped
-                            .map
-                            .source_to_visual_rebased(base_caret, node.range.start)
-                    });
+                let target_vis = shaped.map.active_ime_caret_visual().unwrap_or_else(|| {
+                    shaped
+                        .map
+                        .source_to_visual_rebased(base_caret, node.range.start)
+                });
                 let cur_rect = caret_rect_in_buffer(
                     &shaped.buffer,
                     &shaped.map,
@@ -1026,55 +1057,58 @@ impl ShapedDocumentCache {
             let origin_y = vp.doc_rect.y + last_y - vp.scroll_y;
             let mut caret_x = origin_x;
             if let Some(preedit) = &vp.view.ime_preedit
-                && !preedit.is_empty() {
-                    let pre_w = shape_ui_text_into(
-                        &mut self.font_system,
-                        preedit,
-                        origin_x,
-                        origin_y,
-                        style.base_font_size_px,
-                        style.base_line_height_px,
-                        400,
-                        style.text_color,
-                        Some((vp.content_width_px - 24.0).max(80.0)),
-                        Some(vp.doc_rect),
-                        vp.scale_factor,
-                        &mut draw.glyphs,
-                    );
-                    draw.rects.push(
-                        SceneRect::solid(
-                            Rect::new(origin_x, origin_y, pre_w, style.base_line_height_px),
-                            style.ime_preedit_bg,
-                        )
-                        .with_clip(Some(vp.doc_rect)),
-                    );
-                    draw.rects.push(
-                        SceneRect::solid(
-                            Rect::new(
-                                origin_x,
-                                origin_y + style.base_line_height_px - 2.0,
-                                pre_w,
-                                2.0,
-                            ),
-                            style.ime_underline_color,
-                        )
-                        .with_clip(Some(vp.doc_rect)),
-                    );
-                    caret_x += pre_w;
-                }
+                && !preedit.is_empty()
+            {
+                let pre_w = shape_ui_text_into(
+                    &mut self.font_system,
+                    preedit,
+                    origin_x,
+                    origin_y,
+                    style.base_font_size_px,
+                    style.base_line_height_px,
+                    400,
+                    style.text_color,
+                    Some((vp.content_width_px - 24.0).max(80.0)),
+                    Some(vp.doc_rect),
+                    vp.scale_factor,
+                    &mut draw.glyphs,
+                );
+                draw.rects.push(
+                    SceneRect::solid(
+                        Rect::new(origin_x, origin_y, pre_w, style.base_line_height_px),
+                        style.ime_preedit_bg,
+                    )
+                    .with_clip(Some(vp.doc_rect)),
+                );
+                draw.rects.push(
+                    SceneRect::solid(
+                        Rect::new(
+                            origin_x,
+                            origin_y + style.base_line_height_px - 2.0,
+                            pre_w,
+                            2.0,
+                        ),
+                        style.ime_underline_color,
+                    )
+                    .with_clip(Some(vp.doc_rect)),
+                );
+                caret_x += pre_w;
+            }
             let cur_rect = Rect::new(caret_x, origin_y, 2.0, style.base_line_height_px);
             caret_doc_y = last_y;
             caret_line_height = style.base_line_height_px;
             ime_cursor_area = Some(cur_rect);
             if vp.show_caret {
-                draw.rects
-                    .push(SceneRect::solid(cur_rect, style.caret_color).with_clip(Some(vp.doc_rect)));
+                draw.rects.push(
+                    SceneRect::solid(cur_rect, style.caret_color).with_clip(Some(vp.doc_rect)),
+                );
             }
         }
 
         // Propagate height changes linearly to remaining suffix offsets only when needed.
         if any_height_changed && first_changed_idx < blocks.len() {
-            let mut acc_y = self.block_ys[first_changed_idx] + self.block_heights[first_changed_idx];
+            let mut acc_y =
+                self.block_ys[first_changed_idx] + self.block_heights[first_changed_idx];
             for i in (first_changed_idx + 1)..self.block_ys.len() {
                 self.block_ys[i] = acc_y;
                 acc_y += self.block_heights[i];
@@ -1195,21 +1229,22 @@ impl ShapedDocumentCache {
         };
         if matches!(blocks[block_idx].kind, BlockKind::Table) && view.mode != ViewMode::Source {
             if let Some(table_key) = self.shape_table_for_nav(block_idx, &nav_ctx, &mut read_slice)
-                && let Some(table) = self.table_lru.get(&table_key) {
-                    match move_caret_vertical_in_table(
-                        table,
-                        blocks[block_idx].range.start,
-                        caret,
-                        direction,
-                        preferred_x,
-                        style,
-                    ) {
-                        TableNavOutcome::Moved(off, tx) => return (off, Some(tx)),
-                        TableNavOutcome::Exited(tx) => {
-                            crossed_target_x = Some(tx);
-                        }
+                && let Some(table) = self.table_lru.get(&table_key)
+            {
+                match move_caret_vertical_in_table(
+                    table,
+                    blocks[block_idx].range.start,
+                    caret,
+                    direction,
+                    preferred_x,
+                    style,
+                ) {
+                    TableNavOutcome::Moved(off, tx) => return (off, Some(tx)),
+                    TableNavOutcome::Exited(tx) => {
+                        crossed_target_x = Some(tx);
                     }
                 }
+            }
         } else {
             let cur_offset = self.shape_single_for_nav(block_idx, &nav_ctx, &mut read_slice);
             let Some((cur_shaped, caret_vis)) = cur_offset else {
@@ -1262,30 +1297,32 @@ impl ShapedDocumentCache {
             block_idx - 1
         } else {
             if block_idx + 1 >= blocks.len() {
-                return (self.last_source_len.max(blocks[block_idx].range.end), Some(target_x));
+                return (
+                    self.last_source_len.max(blocks[block_idx].range.end),
+                    Some(target_x),
+                );
             }
             block_idx + 1
         };
 
-        if matches!(blocks[next_idx].kind, BlockKind::Table) && view.mode != ViewMode::Source
+        if matches!(blocks[next_idx].kind, BlockKind::Table)
+            && view.mode != ViewMode::Source
             && let Some(table_key) = self.shape_table_for_nav(next_idx, &nav_ctx, &mut read_slice)
-                && let Some(table) = self.table_lru.get(&table_key) {
-                    return (
-                        enter_table_from_adjacent(
-                            table,
-                            blocks[next_idx].range.start,
-                            direction,
-                            target_x,
-                        ),
-                        Some(target_x),
-                    );
-                }
+            && let Some(table) = self.table_lru.get(&table_key)
+        {
+            return (
+                enter_table_from_adjacent(table, blocks[next_idx].range.start, direction, target_x),
+                Some(target_x),
+            );
+        }
 
         if let Some((adj_shaped, _)) =
             self.shape_single_for_nav(next_idx, &nav_ctx, &mut read_slice)
         {
             let target_y = if direction < 0 {
-                (adj_shaped.total_height - adj_shaped.display.bottom_pad_px - style.base_line_height_px * 0.4)
+                (adj_shaped.total_height
+                    - adj_shaped.display.bottom_pad_px
+                    - style.base_line_height_px * 0.4)
                     .max(2.0)
             } else {
                 2.0
@@ -1317,15 +1354,8 @@ impl ShapedDocumentCache {
     {
         let node = ctx.blocks.get(block_idx)?;
         let raw = read_slice(node.range);
-        let rows_display = build_table_display(
-            node,
-            &raw,
-            ctx.view,
-            ctx.exp_sel,
-            ctx.style,
-            true,
-            false,
-        )?;
+        let rows_display =
+            build_table_display(node, &raw, ctx.view, ctx.exp_sel, ctx.style, true, false)?;
         let avail_table_w = (ctx.content_width_px - 8.0).max(120.0);
         let style_sig = style_signature(ctx.style);
         let key = shape_table_cache_key(&rows_display, avail_table_w, style_sig, true, false);
@@ -1372,21 +1402,34 @@ impl ShapedDocumentCache {
             false,
             None,
         );
-        let caret_vis = display
-            .map
-            .source_to_visual(ctx.view.selection.head.clamp(node.range.start, node.range.end));
+        let caret_vis = display.map.source_to_visual(
+            ctx.view
+                .selection
+                .head
+                .clamp(node.range.start, node.range.end),
+        );
         let avail_w = (ctx.content_width_px - display.left_indent_px - 24.0).max(80.0);
         let style_sig = style_signature(ctx.style);
         let key = shape_cache_key(
             &display,
             avail_w,
             style_sig,
-            matches!(node.kind, BlockKind::CodeFence { .. } | BlockKind::YamlFrontMatter),
+            matches!(
+                node.kind,
+                BlockKind::CodeFence { .. } | BlockKind::YamlFrontMatter
+            ),
         );
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let frame_seq = self.frame_seq;
         if !self.shaped_lru.contains_key(&key) {
-            let shaped = shape_block(&mut self.font_system, display, avail_w, ctx.style, key, frame_seq);
+            let shaped = shape_block(
+                &mut self.font_system,
+                display,
+                avail_w,
+                ctx.style,
+                key,
+                frame_seq,
+            );
             self.shaped_lru.insert(key, shaped);
         }
         self.shaped_lru.get(&key).map(|s| (s, caret_vis))
@@ -1555,7 +1598,12 @@ fn emit_code_block_chrome(
     let header_bottom_y = box_rect.y + header_h;
     draw.rects.push(
         SceneRect::solid(
-            Rect::new(box_rect.x + 1.0, header_bottom_y, (box_rect.w - 2.0).max(1.0), 1.0),
+            Rect::new(
+                box_rect.x + 1.0,
+                header_bottom_y,
+                (box_rect.w - 2.0).max(1.0),
+                1.0,
+            ),
             style.code_block_border,
         )
         .with_clip(Some(vp.doc_rect)),
@@ -1764,7 +1812,9 @@ fn emit_block_images(
                     clip: Some(vp.doc_rect),
                 });
             }
-            ImageLoadStatus::Pending | ImageLoadStatus::Failed | ImageLoadStatus::NetworkBlocked => {
+            ImageLoadStatus::Pending
+            | ImageLoadStatus::Failed
+            | ImageLoadStatus::NetworkBlocked => {
                 draw.rects.push(
                     SceneRect::rounded(card_rect, style.code_block_bg, radius)
                         .with_border(1.0, style.code_block_border)
@@ -1935,33 +1985,32 @@ fn render_text_buffer_contents(
     }
 
     if let Some(pre_vis) = map.preedit_visual_range()
-        && !pre_vis.is_empty() {
-            let c0 = map.visual_to_line_col(pre_vis.start);
-            let c1 = map.visual_to_line_col(pre_vis.end);
-            for run in buffer.layout_runs() {
-                for (hx, hw) in run.highlight(c0, c1) {
-                    let bg = Rect::new(
-                        text_origin_x + hx,
-                        text_origin_y + run.line_top,
-                        hw,
-                        run.line_height,
-                    );
-                    draw.rects.push(
-                        SceneRect::solid(bg, style.ime_preedit_bg).with_clip(Some(vp.doc_rect)),
-                    );
-                    let ul = Rect::new(
-                        text_origin_x + hx,
-                        text_origin_y + run.line_top + run.line_height - 2.0,
-                        hw,
-                        2.0,
-                    );
-                    draw.rects.push(
-                        SceneRect::solid(ul, style.ime_underline_color)
-                            .with_clip(Some(vp.doc_rect)),
-                    );
-                }
+        && !pre_vis.is_empty()
+    {
+        let c0 = map.visual_to_line_col(pre_vis.start);
+        let c1 = map.visual_to_line_col(pre_vis.end);
+        for run in buffer.layout_runs() {
+            for (hx, hw) in run.highlight(c0, c1) {
+                let bg = Rect::new(
+                    text_origin_x + hx,
+                    text_origin_y + run.line_top,
+                    hw,
+                    run.line_height,
+                );
+                draw.rects
+                    .push(SceneRect::solid(bg, style.ime_preedit_bg).with_clip(Some(vp.doc_rect)));
+                let ul = Rect::new(
+                    text_origin_x + hx,
+                    text_origin_y + run.line_top + run.line_height - 2.0,
+                    hw,
+                    2.0,
+                );
+                draw.rects.push(
+                    SceneRect::solid(ul, style.ime_underline_color).with_clip(Some(vp.doc_rect)),
+                );
             }
         }
+    }
 
     let scale = vp.scale_factor.max(0.5);
     for run in buffer.layout_runs() {
@@ -2042,9 +2091,10 @@ fn emit_table_scene(
             let rel_caret = base_caret - node.range.start;
             find_table_cell_for_rel_caret(table, rel_caret).map(|(r, c)| {
                 let cell = &table.rows[r].cells[c];
-                let vis = cell
-                    .map
-                    .source_to_visual_rebased(base_caret, node.range.start + cell.rel_src_range.start);
+                let vis = cell.map.source_to_visual_rebased(
+                    base_caret,
+                    node.range.start + cell.rel_src_range.start,
+                );
                 (r, c, vis)
             })
         })
@@ -2149,7 +2199,13 @@ fn emit_table_scene(
                     rect: hit_r,
                 });
             }
-            cur_x += pill_w + gap_x + if extra_gap { 4.0 * style.zoom_scale } else { 0.0 };
+            cur_x += pill_w
+                + gap_x
+                + if extra_gap {
+                    4.0 * style.zoom_scale
+                } else {
+                    0.0
+                };
         }
     }
 
@@ -2189,7 +2245,12 @@ fn emit_table_scene(
         let line_y = table_top_y + row.y_rel + row.h - thick * 0.5;
         draw.rects.push(
             SceneRect::solid(
-                Rect::new(table_left_x + 1.0, line_y, (table.table_w - 2.0).max(1.0), thick),
+                Rect::new(
+                    table_left_x + 1.0,
+                    line_y,
+                    (table.table_w - 2.0).max(1.0),
+                    thick,
+                ),
                 style.table_border,
             )
             .with_clip(Some(vp.doc_rect)),
@@ -2290,24 +2351,25 @@ fn emit_table_scene(
 
     // Active caret / IME anchor inside this table
     if ime_cursor_area.is_none()
-        && let Some((r_idx, c_idx, target_vis)) = target_cell {
-            let cur_rect = table_cell_caret_rect(
-                table,
-                r_idx,
-                c_idx,
-                target_vis,
-                table_left_x,
-                table_top_y,
-                style,
-            );
-            *caret_doc_y = block_y + (cur_rect.y - screen_top_y);
-            *caret_line_height = cur_rect.h;
-            *ime_cursor_area = Some(cur_rect);
-            if vp.show_caret {
-                draw.rects
-                    .push(SceneRect::solid(cur_rect, style.caret_color).with_clip(Some(vp.doc_rect)));
-            }
+        && let Some((r_idx, c_idx, target_vis)) = target_cell
+    {
+        let cur_rect = table_cell_caret_rect(
+            table,
+            r_idx,
+            c_idx,
+            target_vis,
+            table_left_x,
+            table_top_y,
+            style,
+        );
+        *caret_doc_y = block_y + (cur_rect.y - screen_top_y);
+        *caret_line_height = cur_rect.h;
+        *ime_cursor_area = Some(cur_rect);
+        if vp.show_caret {
+            draw.rects
+                .push(SceneRect::solid(cur_rect, style.caret_color).with_clip(Some(vp.doc_rect)));
         }
+    }
 }
 
 fn find_table_ime_cell(table: &CachedTableShape) -> Option<(usize, usize, usize)> {
@@ -2494,13 +2556,10 @@ fn move_caret_vertical_in_table(
         return TableNavOutcome::Exited(preferred_x.unwrap_or(16.0));
     };
     let cell = &table.rows[r_idx].cells[c_idx];
-    let vis = cell
-        .map
-        .active_ime_caret_visual()
-        .unwrap_or_else(|| {
-            cell.map
-                .source_to_visual_rebased(caret, block_start + cell.rel_src_range.start)
-        });
+    let vis = cell.map.active_ime_caret_visual().unwrap_or_else(|| {
+        cell.map
+            .source_to_visual_rebased(caret, block_start + cell.rel_src_range.start)
+    });
     let cur_rect = table_cell_caret_rect(table, r_idx, c_idx, vis, 4.0, 0.0, style);
     let target_x = preferred_x.unwrap_or(cur_rect.x);
     let cell_top = table.rows[r_idx].y_rel + table.cell_pad_y;
@@ -2535,22 +2594,23 @@ fn move_caret_vertical_in_table(
             target_col -= 1;
         }
         if let Some(next_cell) = next_row.cells.get(target_col)
-            && !next_cell.is_placeholder {
-                let target_y = if direction < 0 {
-                    next_cell
-                        .buffer
-                        .layout_runs()
-                        .last()
-                        .map(|r| r.line_top + r.line_height * 0.5)
-                        .unwrap_or(2.0)
-                } else {
-                    2.0
-                };
-                return TableNavOutcome::Moved(
-                    hit_cell_at_target_x(next_cell, block_start, target_x, target_y),
-                    target_x,
-                );
-            }
+            && !next_cell.is_placeholder
+        {
+            let target_y = if direction < 0 {
+                next_cell
+                    .buffer
+                    .layout_runs()
+                    .last()
+                    .map(|r| r.line_top + r.line_height * 0.5)
+                    .unwrap_or(2.0)
+            } else {
+                2.0
+            };
+            return TableNavOutcome::Moved(
+                hit_cell_at_target_x(next_cell, block_start, target_x, target_y),
+                target_x,
+            );
+        }
     }
 
     TableNavOutcome::Exited(target_x)
@@ -2584,7 +2644,9 @@ fn enter_table_from_adjacent(
     let cell_idx = real_cells
         .iter()
         .copied()
-        .find(|&i| tx_in_table >= row.cells[i].x_rel && tx_in_table <= row.cells[i].x_rel + row.cells[i].w)
+        .find(|&i| {
+            tx_in_table >= row.cells[i].x_rel && tx_in_table <= row.cells[i].x_rel + row.cells[i].w
+        })
         .unwrap_or_else(|| {
             if tx_in_table < row.cells[real_cells[0]].x_rel {
                 real_cells[0]
@@ -2648,7 +2710,10 @@ fn build_block_display(
     let mut base_monospace = false;
 
     match &node.kind {
-        BlockKind::Heading { level, prefix_range } => {
+        BlockKind::Heading {
+            level,
+            prefix_range,
+        } => {
             heading_level = Some(*level);
             let hs = &style.headings[((*level).clamp(1, 6) - 1) as usize];
             base_font_size = hs.font_size_px;
@@ -2763,7 +2828,8 @@ fn build_block_display(
                         + 14.0 * style.zoom_scale)
                         .round()
                         .max(30.0 * style.zoom_scale);
-                    left_indent_px = 8.0 * style.zoom_scale + code_gutter_w + 10.0 * style.zoom_scale;
+                    left_indent_px =
+                        8.0 * style.zoom_scale + code_gutter_w + 10.0 * style.zoom_scale;
                 } else {
                     left_indent_px = 16.0 * style.zoom_scale;
                 }
@@ -2792,7 +2858,10 @@ fn build_block_display(
 
                 // PRD 4.1.1 F #9: Freeze heavy token highlighting while IME preedit targets this block.
                 let ime_targets_block = view.ime_preedit.is_some() && {
-                    let comp_range = view.ime_composition_selection.unwrap_or(view.selection).range();
+                    let comp_range = view
+                        .ime_composition_selection
+                        .unwrap_or(view.selection)
+                        .range();
                     node.range.contains_inclusive(comp_range.start)
                 };
                 if !ime_targets_block && !layout.body_range.is_empty() {
@@ -2845,9 +2914,21 @@ fn build_block_display(
             .collect();
         let max_img_w = (content_width_px - left_indent_px - 28.0).clamp(120.0, 760.0);
         for span in &img_spans {
-            let local_end = span.full_range.end.saturating_sub(block_start).min(block_len);
-            let open_end_rel = span.open_marker.end.saturating_sub(block_start).min(block_len);
-            let close_start_rel = span.close_marker.start.saturating_sub(block_start).min(block_len);
+            let local_end = span
+                .full_range
+                .end
+                .saturating_sub(block_start)
+                .min(block_len);
+            let open_end_rel = span
+                .open_marker
+                .end
+                .saturating_sub(block_start)
+                .min(block_len);
+            let close_start_rel = span
+                .close_marker
+                .start
+                .saturating_sub(block_start)
+                .min(block_len);
             let inner_start = (close_start_rel + 2).min(local_end);
             let inner_end = local_end.saturating_sub(1).max(inner_start);
             let Some(src) = extract_link_destination(&raw_text[inner_start..inner_end]) else {
@@ -2869,10 +2950,18 @@ fn build_block_display(
 
         if node.kind == BlockKind::Paragraph && img_spans.len() == 1 {
             let only = img_spans[0];
-            let local_start = only.full_range.start.saturating_sub(block_start).min(block_len);
-            let local_end = only.full_range.end.saturating_sub(block_start).min(block_len);
-            let standalone =
-                raw_text[..local_start].trim().is_empty() && raw_text[local_end..].trim().is_empty();
+            let local_start = only
+                .full_range
+                .start
+                .saturating_sub(block_start)
+                .min(block_len);
+            let local_end = only
+                .full_range
+                .end
+                .saturating_sub(block_start)
+                .min(block_len);
+            let standalone = raw_text[..local_start].trim().is_empty()
+                && raw_text[local_end..].trim().is_empty();
             if standalone && !only.should_expand_markers(exp_sel) {
                 if block_len > 0 {
                     hidden.push(0..block_len);
@@ -2882,8 +2971,7 @@ fn build_block_display(
         }
     }
 
-    let disallow_past_end =
-        matches!(node.kind, BlockKind::Paragraph if raw_text.is_empty());
+    let disallow_past_end = matches!(node.kind, BlockKind::Paragraph if raw_text.is_empty());
     let syn_ref = code_syntax
         .as_ref()
         .map(|(body_abs_start, vec)| (*body_abs_start, vec.as_slice()));
@@ -3008,11 +3096,7 @@ fn parse_code_fence_structure(raw_text: &str) -> CodeFenceStructure {
     }
 }
 
-fn compute_image_display_size(
-    status: ImageLoadStatus,
-    max_w: f32,
-    zoom_scale: f32,
-) -> (f32, f32) {
+fn compute_image_display_size(status: ImageLoadStatus, max_w: f32, zoom_scale: f32) -> (f32, f32) {
     let max_h = (520.0 * zoom_scale).max(200.0);
     match status {
         ImageLoadStatus::Loaded { width, height } if width > 0 && height > 0 => {
@@ -3058,7 +3142,8 @@ fn collect_fragment_display(
     let mut rebased_inlines: Vec<(InlineKind, ByteRange)> = Vec::new();
 
     for span in inlines_abs {
-        if span.full_range.end <= frag_range_abs.start || span.full_range.start >= frag_range_abs.end
+        if span.full_range.end <= frag_range_abs.start
+            || span.full_range.start >= frag_range_abs.end
         {
             continue;
         }
@@ -3099,8 +3184,14 @@ fn collect_fragment_display(
             }
         }
 
-        let s_abs = span.full_range.start.clamp(frag_range_abs.start, frag_range_abs.end);
-        let e_abs = span.full_range.end.clamp(frag_range_abs.start, frag_range_abs.end);
+        let s_abs = span
+            .full_range
+            .start
+            .clamp(frag_range_abs.start, frag_range_abs.end);
+        let e_abs = span
+            .full_range
+            .end
+            .clamp(frag_range_abs.start, frag_range_abs.end);
         if s_abs < e_abs {
             rebased_inlines.push((
                 span.kind,
@@ -3113,39 +3204,41 @@ fn collect_fragment_display(
     }
 
     let merged_hidden = merge_ranges(hidden);
-    let mut map = build_visual_text_map(map_base_offset, frag_raw, &merged_hidden, synthetic_prefix);
+    let mut map =
+        build_visual_text_map(map_base_offset, frag_raw, &merged_hidden, synthetic_prefix);
 
     let mut preedit_vis_range: Option<Range<usize>> = None;
-    if allow_ime
-        && let Some(preedit) = &view.ime_preedit {
-            let comp_sel = view.ime_composition_selection.unwrap_or(view.selection);
-            let comp_range = comp_sel.range();
-            let owns_comp = frag_range_abs.contains_inclusive(comp_range.start)
-                && !(disallow_past_end && comp_range.start > frag_range_abs.end);
-            if owns_comp {
-                let c_start_mapped = ((comp_range
-                    .start
-                    .clamp(frag_range_abs.start, frag_range_abs.end)) as isize
-                    + delta) as usize;
-                let c_end_mapped = ((comp_range
-                    .end
-                    .clamp(frag_range_abs.start, frag_range_abs.end)) as isize
-                    + delta) as usize;
-                let v_start = map.source_to_visual(c_start_mapped);
-                let v_end = map.source_to_visual(c_end_mapped);
-                map.display_text.replace_range(v_start..v_end, preedit);
-                let new_v_end = v_start + preedit.len();
-                map.line_starts = compute_line_starts(&map.display_text);
-                map.ime_splice = Some(ImeSplice {
-                    vis_start: v_start,
-                    vis_end: new_v_end,
-                    comp_src_start: c_start_mapped,
-                    comp_src_end: c_end_mapped,
-                    preedit_caret_vis: new_v_end,
-                });
-                preedit_vis_range = Some(v_start..new_v_end);
-            }
+    if allow_ime && let Some(preedit) = &view.ime_preedit {
+        let comp_sel = view.ime_composition_selection.unwrap_or(view.selection);
+        let comp_range = comp_sel.range();
+        let owns_comp = frag_range_abs.contains_inclusive(comp_range.start)
+            && !(disallow_past_end && comp_range.start > frag_range_abs.end);
+        if owns_comp {
+            let c_start_mapped = ((comp_range
+                .start
+                .clamp(frag_range_abs.start, frag_range_abs.end))
+                as isize
+                + delta) as usize;
+            let c_end_mapped = ((comp_range
+                .end
+                .clamp(frag_range_abs.start, frag_range_abs.end))
+                as isize
+                + delta) as usize;
+            let v_start = map.source_to_visual(c_start_mapped);
+            let v_end = map.source_to_visual(c_end_mapped);
+            map.display_text.replace_range(v_start..v_end, preedit);
+            let new_v_end = v_start + preedit.len();
+            map.line_starts = compute_line_starts(&map.display_text);
+            map.ime_splice = Some(ImeSplice {
+                vis_start: v_start,
+                vis_end: new_v_end,
+                comp_src_start: c_start_mapped,
+                comp_src_end: c_end_mapped,
+                preedit_caret_vis: new_v_end,
+            });
+            preedit_vis_range = Some(v_start..new_v_end);
         }
+    }
 
     let spans = build_display_spans_with_inlines(
         &rebased_inlines,
@@ -3193,10 +3286,12 @@ fn build_table_display(
         None
     };
 
-    let ime_comp_start = view
-        .ime_preedit
-        .as_ref()
-        .map(|_| view.ime_composition_selection.unwrap_or(view.selection).range().start);
+    let ime_comp_start = view.ime_preedit.as_ref().map(|_| {
+        view.ime_composition_selection
+            .unwrap_or(view.selection)
+            .range()
+            .start
+    });
     let mut ime_assigned = false;
 
     let mut out_rows = Vec::with_capacity(visible_indices.len());
@@ -3218,30 +3313,32 @@ fn build_table_display(
                 let mut rel_s = cell.content_range.start;
                 let mut rel_e = cell.content_range.end;
                 if let Some(abs_c) = active_caret_abs
-                    && abs_c >= node.range.start {
-                        let rel_c = abs_c - node.range.start;
-                        if rel_c >= cell.raw_range.start && rel_c <= cell.raw_range.end {
-                            let raw_slice = &raw_text[cell.raw_range.start..cell.raw_range.end];
-                            let lead_cap = if raw_slice.starts_with(' ') {
-                                cell.raw_range.start + 1
-                            } else {
-                                cell.raw_range.start
-                            };
-                            let tail_cap = if raw_slice.len() >= 2 && raw_slice.ends_with(' ') {
-                                cell.raw_range.end - 1
-                            } else {
-                                cell.raw_range.end
-                            };
-                            if rel_c < rel_s {
-                                rel_s = rel_c.max(lead_cap);
-                            }
-                            if rel_c > rel_e {
-                                rel_e = rel_c.min(tail_cap).max(rel_s);
-                            }
+                    && abs_c >= node.range.start
+                {
+                    let rel_c = abs_c - node.range.start;
+                    if rel_c >= cell.raw_range.start && rel_c <= cell.raw_range.end {
+                        let raw_slice = &raw_text[cell.raw_range.start..cell.raw_range.end];
+                        let lead_cap = if raw_slice.starts_with(' ') {
+                            cell.raw_range.start + 1
+                        } else {
+                            cell.raw_range.start
+                        };
+                        let tail_cap = if raw_slice.len() >= 2 && raw_slice.ends_with(' ') {
+                            cell.raw_range.end - 1
+                        } else {
+                            cell.raw_range.end
+                        };
+                        if rel_c < rel_s {
+                            rel_s = rel_c.max(lead_cap);
+                        }
+                        if rel_c > rel_e {
+                            rel_e = rel_c.min(tail_cap).max(rel_s);
                         }
                     }
+                }
                 let rel_src = ByteRange::new(rel_s, rel_e);
-                let cell_abs_src = ByteRange::new(node.range.start + rel_s, node.range.start + rel_e);
+                let cell_abs_src =
+                    ByteRange::new(node.range.start + rel_s, node.range.start + rel_e);
                 let cell_abs_raw = ByteRange::new(
                     node.range.start + cell.raw_range.start,
                     node.range.start + cell.raw_range.end,
@@ -3347,10 +3444,11 @@ fn merge_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
     let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
     for r in ranges {
         if let Some(last) = merged.last_mut()
-            && r.start <= last.end {
-                last.end = last.end.max(r.end);
-                continue;
-            }
+            && r.start <= last.end
+        {
+            last.end = last.end.max(r.end);
+            continue;
+        }
         merged.push(r);
     }
     merged
@@ -3368,9 +3466,10 @@ fn build_visual_text_map(
 
     let mut first_content_local = 0usize;
     if let Some(h0) = hidden.first()
-        && h0.start == 0 {
-            first_content_local = h0.end;
-        }
+        && h0.start == 0
+    {
+        first_content_local = h0.end;
+    }
     if let Some(syn) = synthetic_prefix {
         let vs = display_text.len();
         display_text.push_str(syn);
@@ -3584,15 +3683,21 @@ fn build_display_spans_with_inlines(
                         }
                         InlineKind::Link => {
                             if !in_marker {
-                                color =
-                                    style.apply_focus_mode(style.link_color, is_focused, focus_mode);
+                                color = style.apply_focus_mode(
+                                    style.link_color,
+                                    is_focused,
+                                    focus_mode,
+                                );
                                 underline = style.link_underline;
                             }
                         }
                         InlineKind::Image => {
                             if !in_marker {
-                                color =
-                                    style.apply_focus_mode(style.link_color, is_focused, focus_mode);
+                                color = style.apply_focus_mode(
+                                    style.link_color,
+                                    is_focused,
+                                    focus_mode,
+                                );
                             }
                         }
                     }
@@ -3693,9 +3798,10 @@ fn shape_rich_text_buffer(
         text_height = text_height.max(run.line_top + run.line_height);
     }
     if run_count == 0
-        && let Some(fb) = empty_fallback_height {
-            text_height = fb;
-        }
+        && let Some(fb) = empty_fallback_height
+    {
+        text_height = fb;
+    }
 
     let mut inline_code_rects = Vec::new();
     for sp in spans {
@@ -3776,8 +3882,7 @@ fn shape_block(
     } else {
         (cur_img_y - text_height).max(0.0)
     };
-    let total_height =
-        text_height + images_height + display.top_pad_px + display.bottom_pad_px;
+    let total_height = text_height + images_height + display.top_pad_px + display.bottom_pad_px;
 
     CachedBlockShape {
         last_used_frame: frame_seq,
@@ -4014,12 +4119,18 @@ fn estimate_block_height(node: &BlockNode, style: &ResolvedThemeStyle, width_cha
         }
         BlockKind::ThematicBreak => 16.0 * style.zoom_scale + 8.0,
         BlockKind::CodeFence { .. } | BlockKind::YamlFrontMatter => {
-            let est_lines = (node.range.len() as f32 / (width_chars * 0.6).max(12.0)).clamp(2.0, 200.0);
+            let est_lines =
+                (node.range.len() as f32 / (width_chars * 0.6).max(12.0)).clamp(2.0, 200.0);
             est_lines * style.code_line_height_px + 40.0 * style.zoom_scale
         }
         BlockKind::Table => {
-            let est_rows = ((node.range.len() as f32 / (width_chars * 0.7).max(20.0)).ceil().max(1.0) - 0.5).max(1.0);
-            est_rows * (style.base_line_height_px + 14.0 * style.zoom_scale) + 12.0 * style.zoom_scale
+            let est_rows = ((node.range.len() as f32 / (width_chars * 0.7).max(20.0))
+                .ceil()
+                .max(1.0)
+                - 0.5)
+                .max(1.0);
+            est_rows * (style.base_line_height_px + 14.0 * style.zoom_scale)
+                + 12.0 * style.zoom_scale
         }
         _ => {
             let est_lines = (node.range.len() as f32 / width_chars).ceil().max(1.0);
@@ -4081,12 +4192,7 @@ fn hash_map_and_spans(
     spans.hash(h);
 }
 
-fn shape_cache_key(
-    display: &BlockDisplay,
-    avail_w: f32,
-    style_sig: u64,
-    code_box: bool,
-) -> u64 {
+fn shape_cache_key(display: &BlockDisplay, avail_w: f32, style_sig: u64, code_box: bool) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     hash_map_and_spans(&mut h, &display.map, &display.spans);
     avail_w.to_bits().hash(&mut h);
@@ -4130,7 +4236,10 @@ fn shape_table_cache_key(
             }
             .hash(&mut h);
             cell.rel_raw_range.len().hash(&mut h);
-            cell.rel_src_range.start.saturating_sub(cell.rel_raw_range.start).hash(&mut h);
+            cell.rel_src_range
+                .start
+                .saturating_sub(cell.rel_raw_range.start)
+                .hash(&mut h);
             hash_map_and_spans(&mut h, &cell.map, &cell.spans);
         }
     }
@@ -4210,7 +4319,10 @@ mod tests {
             None,
         );
         assert_eq!(d_expanded.map.display_text, "## 标题 **加粗** 正文");
-        assert_eq!(d_expanded.map.source_to_visual(caret_in_bold), caret_in_bold);
+        assert_eq!(
+            d_expanded.map.source_to_visual(caret_in_bold),
+            caret_in_bold
+        );
     }
 
     #[test]
@@ -4342,7 +4454,8 @@ mod tests {
             active_find: None,
             image_status: None,
         };
-        let scene = cache.build_editor_scene(&blocks, &style, &vp, |r| doc[r.start..r.end].to_string());
+        let scene =
+            cache.build_editor_scene(&blocks, &style, &vp, |r| doc[r.start..r.end].to_string());
         // Caret placed in 3rd paragraph (block 4) must position caret_doc_y below block 2!
         assert!(
             scene.caret_doc_y > cache.block_ys[2],
@@ -4361,7 +4474,8 @@ mod tests {
             match hit {
                 EditorHitTarget::Text(off) => {
                     assert!(
-                        off >= blocks[target_idx].range.start && off <= blocks[target_idx].range.end,
+                        off >= blocks[target_idx].range.start
+                            && off <= blocks[target_idx].range.end,
                         "clicking block {target_idx} ({:?}) mapped to wrong offset {off} (block 0 is {:?})",
                         blocks[target_idx].range,
                         blocks[0].range
@@ -4410,7 +4524,8 @@ mod tests {
 
     #[test]
     fn test_identical_visual_text_with_different_link_urls_do_not_collide_in_cache() {
-        let doc = "[click](https://a.dev)\n\n[click](https://very-long-url.example.com/path/to/page)";
+        let doc =
+            "[click](https://a.dev)\n\n[click](https://very-long-url.example.com/path/to/page)";
         let blocks = parse_blocks(doc);
         assert_eq!(blocks.len(), 3);
 
@@ -4437,7 +4552,10 @@ mod tests {
         let _ = cache.build_editor_scene(&blocks, &style, &vp, |r| doc[r.start..r.end].to_string());
         let rec2 = cache.last_hit_blocks[2];
         let hit2 = cache
-            .hit_test(rec2.text_origin_x + 40.0, rec2.row_rect.y + rec2.row_rect.h * 0.5)
+            .hit_test(
+                rec2.text_origin_x + 40.0,
+                rec2.row_rect.y + rec2.row_rect.h * 0.5,
+            )
             .expect("hit 2");
         let EditorHitTarget::Text(off) = hit2 else {
             panic!("expected text hit");
@@ -4487,7 +4605,8 @@ mod tests {
             active_find: None,
             image_status: None,
         };
-        let scene = cache.build_editor_scene(&blocks, &style, &vp, |r| doc[r.start..r.end].to_string());
+        let scene =
+            cache.build_editor_scene(&blocks, &style, &vp, |r| doc[r.start..r.end].to_string());
 
         // Table renders outer border, header background, row & column dividers using theme table styles.
         let header_bg_count = scene
@@ -4545,8 +4664,13 @@ mod tests {
             view: &delim_view,
             ..vp
         };
-        let _ = cache.build_editor_scene(&blocks, &style, &delim_vp, |r| doc[r.start..r.end].to_string());
-        let delim_tbl = cache.table_lru.get(&cache.last_hit_blocks[2].shape_hash).unwrap();
+        let _ = cache.build_editor_scene(&blocks, &style, &delim_vp, |r| {
+            doc[r.start..r.end].to_string()
+        });
+        let delim_tbl = cache
+            .table_lru
+            .get(&cache.last_hit_blocks[2].shape_hash)
+            .unwrap();
         assert_eq!(delim_tbl.rows.len(), 3);
         assert!(delim_tbl.rows.iter().all(|r| !r.is_delimiter));
         assert!(
@@ -4626,7 +4750,10 @@ mod tests {
             vp.content_width_px,
             |r| doc[r.start..r.end].to_string(),
         );
-        assert_eq!(down3, blocks[3].range.start, "Down from table exited to blank line block");
+        assert_eq!(
+            down3, blocks[3].range.start,
+            "Down from table exited to blank line block"
+        );
         let (down4, _) = cache.move_caret_vertical(
             down3,
             1,
@@ -4652,7 +4779,9 @@ mod tests {
             view: &src_view,
             ..vp
         };
-        let _ = cache.build_editor_scene(&blocks, &style, &src_vp, |r| doc[r.start..r.end].to_string());
+        let _ = cache.build_editor_scene(&blocks, &style, &src_vp, |r| {
+            doc[r.start..r.end].to_string()
+        });
         assert!(!cache.last_hit_blocks[2].is_table);
     }
 
@@ -4691,15 +4820,30 @@ mod tests {
             wide_body_doc[r.start..r.end].to_string()
         });
         assert!(
-            scene.draw.rects.iter().any(|r| r.color == style.caret_color),
+            scene
+                .draw
+                .rects
+                .iter()
+                .any(|r| r.color == style.caret_color),
             "caret rect must still be emitted safely when caret sits in unrendered col 3"
         );
-        let tbl = cache.table_lru.get(&cache.last_hit_blocks[0].shape_hash).unwrap();
+        let tbl = cache
+            .table_lru
+            .get(&cache.last_hit_blocks[0].shape_hash)
+            .unwrap();
         assert_eq!(tbl.rows.len(), 2);
         assert_eq!(tbl.rows[0].cells.len(), 2);
         assert_eq!(tbl.rows[1].cells.len(), 2);
-        let hdr_texts: Vec<&str> = tbl.rows[0].cells.iter().map(|c| c.map.display_text.as_str()).collect();
-        let body_texts: Vec<&str> = tbl.rows[1].cells.iter().map(|c| c.map.display_text.as_str()).collect();
+        let hdr_texts: Vec<&str> = tbl.rows[0]
+            .cells
+            .iter()
+            .map(|c| c.map.display_text.as_str())
+            .collect();
+        let body_texts: Vec<&str> = tbl.rows[1]
+            .cells
+            .iter()
+            .map(|c| c.map.display_text.as_str())
+            .collect();
         assert_eq!(hdr_texts, vec!["a", "b"]);
         assert_eq!(body_texts, vec!["1", "2"]);
 
@@ -4776,14 +4920,19 @@ mod tests {
             doc[r.start..r.end].to_string()
         });
         assert_eq!(scene_outside.code_block_buttons.len(), 2);
-        assert!(scene_outside
-            .code_block_buttons
-            .iter()
-            .any(|b| b.kind == CodeBlockButtonKind::LanguagePicker && b.current_language == "rust"));
-        assert!(scene_outside
-            .code_block_buttons
-            .iter()
-            .any(|b| b.kind == CodeBlockButtonKind::ToggleLineNumbers));
+        assert!(
+            scene_outside
+                .code_block_buttons
+                .iter()
+                .any(|b| b.kind == CodeBlockButtonKind::LanguagePicker
+                    && b.current_language == "rust")
+        );
+        assert!(
+            scene_outside
+                .code_block_buttons
+                .iter()
+                .any(|b| b.kind == CodeBlockButtonKind::ToggleLineNumbers)
+        );
 
         let rec = cache.last_hit_blocks[fence_idx];
         let shaped_collapsed = cache.shaped_lru.get(&rec.shape_hash).unwrap();
@@ -4791,8 +4940,12 @@ mod tests {
             shaped_collapsed.map.display_text,
             "fn main() {\n    let msg = \"hi\";\n}"
         );
-        let distinct_colors: std::collections::HashSet<RgbaColor> =
-            shaped_collapsed.display.spans.iter().map(|s| s.color).collect();
+        let distinct_colors: std::collections::HashSet<RgbaColor> = shaped_collapsed
+            .display
+            .spans
+            .iter()
+            .map(|s| s.color)
+            .collect();
         assert!(
             distinct_colors.len() >= 2,
             "expected multi-color syntect token spans in WYSIWYG code block"
@@ -4896,7 +5049,8 @@ mod tests {
 
     #[test]
     fn test_wysiwyg_image_collapse_expand_aspect_ratio_and_placeholders() {
-        let doc = "Intro\n\n![Arch Diagram](./assets/arch.png)\n\n![Missing](https://example.com/a.png)";
+        let doc =
+            "Intro\n\n![Arch Diagram](./assets/arch.png)\n\n![Missing](https://example.com/a.png)";
         let blocks = parse_blocks(doc);
         let style = ResolvedThemeStyle::default();
         let mut cache = ShapedDocumentCache::new();
@@ -4947,7 +5101,10 @@ mod tests {
         assert_eq!(img.source, "./assets/arch.png");
         // 1200x600 scaled down into <=740px width maintains exact 2:1 aspect ratio.
         let ratio = img.rect.w / img.rect.h;
-        assert!((ratio - 2.0).abs() < 0.05, "expected ~2.0 ratio, got {ratio}");
+        assert!(
+            (ratio - 2.0).abs() < 0.05,
+            "expected ~2.0 ratio, got {ratio}"
+        );
 
         // Standalone collapsed image has empty visual text and clicking it moves caret inside alt (`![Arch`).
         let rec_img = cache.last_hit_blocks[2];
@@ -5018,8 +5175,9 @@ mod tests {
             active_find: None,
             image_status: None,
         };
-        let scene_out =
-            cache.build_editor_scene(&blocks, &style, &vp_out, |r| doc[r.start..r.end].to_string());
+        let scene_out = cache.build_editor_scene(&blocks, &style, &vp_out, |r| {
+            doc[r.start..r.end].to_string()
+        });
         assert!(scene_out.table_buttons.is_empty());
 
         // 2. Inside Center-aligned column ("| a | b | c |" at 'b') -> 10 buttons emitted cleanly above table
@@ -5085,8 +5243,9 @@ mod tests {
             view: &ime_view,
             ..vp_out
         };
-        let scene_ime =
-            cache.build_editor_scene(&blocks, &style, &vp_ime, |r| doc[r.start..r.end].to_string());
+        let scene_ime = cache.build_editor_scene(&blocks, &style, &vp_ime, |r| {
+            doc[r.start..r.end].to_string()
+        });
         assert!(scene_ime.table_buttons.is_empty());
 
         let sel_view = EditorViewState {
@@ -5098,8 +5257,9 @@ mod tests {
             view: &sel_view,
             ..vp_out
         };
-        let scene_sel =
-            cache.build_editor_scene(&blocks, &style, &vp_sel, |r| doc[r.start..r.end].to_string());
+        let scene_sel = cache.build_editor_scene(&blocks, &style, &vp_sel, |r| {
+            doc[r.start..r.end].to_string()
+        });
         assert!(scene_sel.table_buttons.is_empty());
 
         let src_view = EditorViewState {
@@ -5111,8 +5271,9 @@ mod tests {
             view: &src_view,
             ..vp_out
         };
-        let scene_src =
-            cache.build_editor_scene(&blocks, &style, &vp_src, |r| doc[r.start..r.end].to_string());
+        let scene_src = cache.build_editor_scene(&blocks, &style, &vp_src, |r| {
+            doc[r.start..r.end].to_string()
+        });
         assert!(scene_src.table_buttons.is_empty());
     }
 }

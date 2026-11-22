@@ -11,7 +11,9 @@ fn print_help() {
     println!("Usage:");
     println!("  vellmark <file.md>                                  Inspect/open Markdown file");
     println!("  vellmark export <file.md> -o <out.html> [--raw]     Export Markdown to HTML");
-    println!("  vellmark export <file.md> -o <out.html> --theme <light|dark|academic|github|theme.css>");
+    println!(
+        "  vellmark export <file.md> -o <out.html> --theme <light|dark|academic|github|theme.css>"
+    );
 }
 
 fn main() -> ExitCode {
@@ -116,10 +118,11 @@ fn resolve_builtin_theme(name: &str) -> Option<BuiltinTheme> {
 fn resolve_theme_css(spec: &Path) -> Result<String, String> {
     if !spec.exists()
         && let Some(name) = spec.to_str()
-            && spec.components().count() == 1
-                && let Some(builtin) = resolve_builtin_theme(name) {
-                    return Ok(builtin.css_source().to_string());
-                }
+        && spec.components().count() == 1
+        && let Some(builtin) = resolve_builtin_theme(name)
+    {
+        return Ok(builtin.css_source().to_string());
+    }
     fs::read_to_string(spec).map_err(|e| format!("Failed to read theme {}: {e}", spec.display()))
 }
 
@@ -172,7 +175,11 @@ fn run_export(args: &[String]) -> ExitCode {
             eprintln!("Failed to write {}: {e}", out.display());
             return ExitCode::FAILURE;
         }
-        println!("Exported {} -> {}", opts.input_path.display(), out.display());
+        println!(
+            "Exported {} -> {}",
+            opts.input_path.display(),
+            out.display()
+        );
     } else {
         print!("{html_doc}");
     }
@@ -222,10 +229,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "vellmark-cli-test-{}-{uniq}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("vellmark-cli-test-{}-{uniq}", std::process::id()));
         fs::create_dir_all(&root).expect("create temp dir");
 
         let custom_css_path = root.join("custom.css");
@@ -237,7 +242,11 @@ mod tests {
         assert!(resolve_theme_css(&missing).is_err());
 
         let md_path = root.join("测试文档.md");
-        fs::write(&md_path, "# 标题\n\n<script>alert(1)</script>\n正文 **加粗**").expect("write md");
+        fs::write(
+            &md_path,
+            "# 标题\n\n<script>alert(1)</script>\n正文 **加粗**",
+        )
+        .expect("write md");
 
         let safe_html = export_document(&md_path, Some(Path::new("dark")), HtmlExportMode::Safe)
             .expect("safe export");

@@ -702,7 +702,10 @@ impl EditorContext<'_> {
             .to_string();
 
         let lead_nl = if range.start > 0
-            && self.buffer.slice_to_string(ByteRange::new(range.start - 1, range.start)) != "\n"
+            && self
+                .buffer
+                .slice_to_string(ByteRange::new(range.start - 1, range.start))
+                != "\n"
         {
             nl
         } else {
@@ -816,7 +819,9 @@ impl EditorContext<'_> {
         if *self.mode == ViewMode::Wysiwyg && self.is_offset_inside_fenced_code_block(line_start) {
             return;
         }
-        let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
+        let line = self
+            .buffer
+            .slice_to_string(ByteRange::new(line_start, line_end));
         let old_prefix_len = heading_prefix_len(&line).unwrap_or(0);
         let new_prefix = if level == 0 || level > 6 {
             String::new()
@@ -854,7 +859,9 @@ impl EditorContext<'_> {
         if *self.mode == ViewMode::Wysiwyg && self.is_offset_inside_fenced_code_block(line_start) {
             return false;
         }
-        let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
+        let line = self
+            .buffer
+            .slice_to_string(ByteRange::new(line_start, line_end));
         let Some((indent, marker_len)) = list_prefix_parts(&line) else {
             return false;
         };
@@ -950,7 +957,9 @@ impl EditorContext<'_> {
             if ch == ' ' {
                 let (line_start, line_end, _) = self.current_line_content_bounds();
                 if self.selection.head == line_end {
-                    let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
+                    let line = self
+                        .buffer
+                        .slice_to_string(ByteRange::new(line_start, line_end));
                     if let Some(rel) = block_line_syntax_escape_offset(&line)
                         && !self.is_offset_inside_fenced_code_block(line_start)
                     {
@@ -960,7 +969,9 @@ impl EditorContext<'_> {
                 }
             } else if matches!(ch, '*' | '`' | '~') {
                 let (line_start, line_end, _) = self.current_line_content_bounds();
-                let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
+                let line = self
+                    .buffer
+                    .slice_to_string(ByteRange::new(line_start, line_end));
                 let caret_in_line = self.selection.head.saturating_sub(line_start);
                 let escapes = detect_inline_conversion_escapes(&line, caret_in_line, ch);
                 if !escapes.is_empty() && !self.is_offset_inside_fenced_code_block(line_start) {
@@ -1006,25 +1017,29 @@ impl EditorContext<'_> {
 
         let caret = self.selection.head;
         let (line_start, line_end, _) = self.current_line_content_bounds();
-        let line = self.buffer.slice_to_string(ByteRange::new(line_start, line_end));
+        let line = self
+            .buffer
+            .slice_to_string(ByteRange::new(line_start, line_end));
 
         if *self.mode == ViewMode::Wysiwyg {
             // PRD 4.1.1 G #8: Backspace at start of empty code block content line converts code block to empty paragraph
-            if caret == line_start && line.is_empty()
-                && let Some(fence_range) = self.enclosing_empty_code_fence_range(line_start) {
-                    let sel_before = *self.selection;
-                    let sel_after = Selection::caret(fence_range.start);
-                    self.undo.apply_edit(
-                        self.buffer,
-                        fence_range,
-                        "",
-                        sel_before,
-                        sel_after,
-                        EditKind::Structural,
-                    );
-                    *self.selection = sel_after;
-                    return;
-                }
+            if caret == line_start
+                && line.is_empty()
+                && let Some(fence_range) = self.enclosing_empty_code_fence_range(line_start)
+            {
+                let sel_before = *self.selection;
+                let sel_after = Selection::caret(fence_range.start);
+                self.undo.apply_edit(
+                    self.buffer,
+                    fence_range,
+                    "",
+                    sel_before,
+                    sel_after,
+                    EditKind::Structural,
+                );
+                *self.selection = sel_after;
+                return;
+            }
 
             let has_structural_prefix = heading_prefix_len(&line)
                 .is_some_and(|prefix_len| caret == line_start || caret == line_start + prefix_len)
@@ -1038,74 +1053,76 @@ impl EditorContext<'_> {
             if has_structural_prefix && !self.is_offset_inside_fenced_code_block(line_start) {
                 // PRD 4.1.1 C & G #2: Backspace at start of heading text (either at `line_start` or right after `## `)
                 if let Some(prefix_len) = heading_prefix_len(&line)
-                    && (caret == line_start || caret == line_start + prefix_len) {
-                        let sel_before = *self.selection;
-                        let sel_after = Selection::caret(line_start);
-                        self.undo.apply_edit(
-                            self.buffer,
-                            ByteRange::new(line_start, line_start + prefix_len),
-                            "",
-                            sel_before,
-                            sel_after,
-                            EditKind::Structural,
-                        );
-                        *self.selection = sel_after;
-                        return;
-                    }
+                    && (caret == line_start || caret == line_start + prefix_len)
+                {
+                    let sel_before = *self.selection;
+                    let sel_after = Selection::caret(line_start);
+                    self.undo.apply_edit(
+                        self.buffer,
+                        ByteRange::new(line_start, line_start + prefix_len),
+                        "",
+                        sel_before,
+                        sel_after,
+                        EditKind::Structural,
+                    );
+                    *self.selection = sel_after;
+                    return;
+                }
 
                 // PRD 4.1.1 C: Backspace at start of list item content
                 if let Some((indent_bytes, marker_bytes)) = list_prefix_parts(&line)
-                    && caret == line_start + indent_bytes + marker_bytes {
-                        let sel_before = *self.selection;
-                        if indent_bytes >= 2 {
-                            // Nested item -> outdent by 2 spaces
-                            let sel_after = Selection::caret(caret - 2);
-                            self.undo.apply_edit(
-                                self.buffer,
-                                ByteRange::new(line_start, line_start + 2),
-                                "",
-                                sel_before,
-                                sel_after,
-                                EditKind::Structural,
-                            );
-                            *self.selection = sel_after;
-                        } else {
-                            // Top-level list item -> strip list marker, convert to paragraph in place
-                            let sel_after = Selection::caret(line_start);
-                            self.undo.apply_edit(
-                                self.buffer,
-                                ByteRange::new(line_start, line_start + indent_bytes + marker_bytes),
-                                "",
-                                sel_before,
-                                sel_after,
-                                EditKind::Structural,
-                            );
-                            *self.selection = sel_after;
-                        }
-                        return;
-                    }
-
-                // PRD 4.1.1 C: Backspace at start of blockquote content demotes one quote level (`> ‸text` -> `text`, `> > ‸text` -> `> text`)
-                if let Some((content_start, strip_rel_range)) =
-                    blockquote_demote_parts(&line)
-                    && caret == line_start + content_start {
-                        let sel_before = *self.selection;
-                        let del_range = ByteRange::new(
-                            line_start + strip_rel_range.start,
-                            line_start + strip_rel_range.end,
-                        );
-                        let sel_after = Selection::caret(caret - del_range.len());
+                    && caret == line_start + indent_bytes + marker_bytes
+                {
+                    let sel_before = *self.selection;
+                    if indent_bytes >= 2 {
+                        // Nested item -> outdent by 2 spaces
+                        let sel_after = Selection::caret(caret - 2);
                         self.undo.apply_edit(
                             self.buffer,
-                            del_range,
+                            ByteRange::new(line_start, line_start + 2),
                             "",
                             sel_before,
                             sel_after,
                             EditKind::Structural,
                         );
                         *self.selection = sel_after;
-                        return;
+                    } else {
+                        // Top-level list item -> strip list marker, convert to paragraph in place
+                        let sel_after = Selection::caret(line_start);
+                        self.undo.apply_edit(
+                            self.buffer,
+                            ByteRange::new(line_start, line_start + indent_bytes + marker_bytes),
+                            "",
+                            sel_before,
+                            sel_after,
+                            EditKind::Structural,
+                        );
+                        *self.selection = sel_after;
                     }
+                    return;
+                }
+
+                // PRD 4.1.1 C: Backspace at start of blockquote content demotes one quote level (`> ‸text` -> `text`, `> > ‸text` -> `> text`)
+                if let Some((content_start, strip_rel_range)) = blockquote_demote_parts(&line)
+                    && caret == line_start + content_start
+                {
+                    let sel_before = *self.selection;
+                    let del_range = ByteRange::new(
+                        line_start + strip_rel_range.start,
+                        line_start + strip_rel_range.end,
+                    );
+                    let sel_after = Selection::caret(caret - del_range.len());
+                    self.undo.apply_edit(
+                        self.buffer,
+                        del_range,
+                        "",
+                        sel_before,
+                        sel_after,
+                        EditKind::Structural,
+                    );
+                    *self.selection = sel_after;
+                    return;
+                }
             }
         }
 
@@ -1148,7 +1165,9 @@ impl EditorContext<'_> {
         self.abort_ime_preedit();
         let (line_start, content_end, line_end) = self.current_line_content_bounds();
         if *self.mode == ViewMode::Wysiwyg {
-            let line = self.buffer.slice_to_string(ByteRange::new(line_start, content_end));
+            let line = self
+                .buffer
+                .slice_to_string(ByteRange::new(line_start, content_end));
             let is_list = list_prefix_parts(&line).is_some();
             let has_pipe = line.contains('|');
             if (is_list || has_pipe) && !self.is_offset_inside_fenced_code_block(line_start) {
@@ -1198,7 +1217,9 @@ impl EditorContext<'_> {
     pub fn shift_tab(&mut self) {
         self.abort_ime_preedit();
         let (line_start, content_end, _) = self.current_line_content_bounds();
-        let line = self.buffer.slice_to_string(ByteRange::new(line_start, content_end));
+        let line = self
+            .buffer
+            .slice_to_string(ByteRange::new(line_start, content_end));
         let list_parts = list_prefix_parts(&line);
         let maybe_table = *self.mode == ViewMode::Wysiwyg && line.contains('|');
         if (list_parts.is_none() && !maybe_table)
@@ -1233,13 +1254,14 @@ impl EditorContext<'_> {
                 let pipes = unescaped_pipe_offsets(&line);
                 let rel_caret = self.selection.head.saturating_sub(line_start);
                 if let Some(cell_idx) = current_table_cell_index(&pipes, rel_caret)
-                    && cell_idx > 0 {
-                        let prev_pipe = pipes[cell_idx - 1];
-                        let next_pipe = pipes[cell_idx];
-                        let cell_slice = &line[prev_pipe + 1..next_pipe];
-                        let target_rel = prev_pipe + 1 + table_cell_caret_offset(cell_slice);
-                        *self.selection = Selection::caret(line_start + target_rel);
-                    }
+                    && cell_idx > 0
+                {
+                    let prev_pipe = pipes[cell_idx - 1];
+                    let next_pipe = pipes[cell_idx];
+                    let cell_slice = &line[prev_pipe + 1..next_pipe];
+                    let target_rel = prev_pipe + 1 + table_cell_caret_offset(cell_slice);
+                    *self.selection = Selection::caret(line_start + target_rel);
+                }
             }
         }
     }
@@ -1452,9 +1474,8 @@ impl EditorContext<'_> {
                     let empty_row = build_empty_table_row(cols);
                     let insertion = format!("{nl}{sep_row}{nl}{empty_row}");
                     let sel_before = *self.selection;
-                    let sel_after = Selection::caret(
-                        insert_pos + nl.len() + sep_row.len() + nl.len() + 2,
-                    );
+                    let sel_after =
+                        Selection::caret(insert_pos + nl.len() + sep_row.len() + nl.len() + 2);
                     self.undo.apply_edit(
                         self.buffer,
                         ByteRange::empty(insert_pos),
@@ -1469,48 +1490,49 @@ impl EditorContext<'_> {
 
                 // PRD 4.1.1 C: BlockQuote Enter continuation, nested outdent, or empty exit
                 if let Some((content_start, strip_rel_range)) = blockquote_demote_parts(&line)
-                    && caret >= line_start + content_start {
-                        let sel_before = *self.selection;
-                        if line[content_start..].trim().is_empty() {
-                            let del_range = if strip_rel_range.start == 0 {
-                                ByteRange::new(line_start, content_end)
-                            } else {
-                                ByteRange::new(
-                                    line_start + strip_rel_range.start,
-                                    line_start + strip_rel_range.end,
-                                )
-                            };
-                            let sel_after = Selection::caret(del_range.start);
-                            self.undo.apply_edit(
-                                self.buffer,
-                                del_range,
-                                "",
-                                sel_before,
-                                sel_after,
-                                EditKind::Structural,
-                            );
-                            *self.selection = sel_after;
+                    && caret >= line_start + content_start
+                {
+                    let sel_before = *self.selection;
+                    if line[content_start..].trim().is_empty() {
+                        let del_range = if strip_rel_range.start == 0 {
+                            ByteRange::new(line_start, content_end)
                         } else {
-                            let le = self.dominant_line_ending();
-                            let prefix = &line[..content_start];
-                            let continuation = if prefix.ends_with(' ') {
-                                format!("{le}{prefix}")
-                            } else {
-                                format!("{le}{prefix} ")
-                            };
-                            let sel_after = Selection::caret(caret + continuation.len());
-                            self.undo.apply_edit(
-                                self.buffer,
-                                ByteRange::empty(caret),
-                                &continuation,
-                                sel_before,
-                                sel_after,
-                                EditKind::Structural,
-                            );
-                            *self.selection = sel_after;
-                        }
-                        return;
+                            ByteRange::new(
+                                line_start + strip_rel_range.start,
+                                line_start + strip_rel_range.end,
+                            )
+                        };
+                        let sel_after = Selection::caret(del_range.start);
+                        self.undo.apply_edit(
+                            self.buffer,
+                            del_range,
+                            "",
+                            sel_before,
+                            sel_after,
+                            EditKind::Structural,
+                        );
+                        *self.selection = sel_after;
+                    } else {
+                        let le = self.dominant_line_ending();
+                        let prefix = &line[..content_start];
+                        let continuation = if prefix.ends_with(' ') {
+                            format!("{le}{prefix}")
+                        } else {
+                            format!("{le}{prefix} ")
+                        };
+                        let sel_after = Selection::caret(caret + continuation.len());
+                        self.undo.apply_edit(
+                            self.buffer,
+                            ByteRange::empty(caret),
+                            &continuation,
+                            sel_before,
+                            sel_after,
+                            EditKind::Structural,
+                        );
+                        *self.selection = sel_after;
                     }
+                    return;
+                }
 
                 // PRD 4.1.1 B.1: ``` / ~~~ + Enter inserts companion closing fence in single SyntaxConversion tx
                 if caret == content_end {
@@ -1523,9 +1545,11 @@ impl EditorContext<'_> {
                             fence_len,
                         ) {
                             let indent = line.len() - line.trim_start_matches(' ').len();
-                            let le =
-                                LineEnding::detect_dominant_or(&full_text, self.preferred_line_ending)
-                                    .as_str();
+                            let le = LineEnding::detect_dominant_or(
+                                &full_text,
+                                self.preferred_line_ending,
+                            )
+                            .as_str();
                             let closer: String =
                                 std::iter::repeat_n(fence_ch as char, fence_len).collect();
                             let insertion = format!("{le}{le}{closer}");
@@ -1585,8 +1609,7 @@ impl EditorContext<'_> {
                 let after_fence = closing_fence_end - removed_len;
                 let sel_after = if after_fence == self.buffer.len_bytes() {
                     let nl = self.dominant_line_ending();
-                    self.buffer
-                        .replace_bytes(ByteRange::empty(after_fence), nl);
+                    self.buffer.replace_bytes(ByteRange::empty(after_fence), nl);
                     ops.push(EditOp {
                         range: ByteRange::empty(after_fence),
                         deleted: String::new(),
@@ -1998,12 +2021,8 @@ impl EditorContext<'_> {
                 let nl = detect_line_ending_str(full, self.preferred_line_ending);
                 let grid = ParsedTableGrid::from_context(full, ctx, nl);
                 let rendered = grid.render(true);
-                let caret_rel = table_line_cell_caret_in_rendered(
-                    &rendered,
-                    ctx.row_idx,
-                    cell_idx + 1,
-                    None,
-                );
+                let caret_rel =
+                    table_line_cell_caret_in_rendered(&rendered, ctx.row_idx, cell_idx + 1, None);
                 let sel_before = *self.selection;
                 let sel_after = Selection::caret(ctx.range.start + caret_rel);
                 self.undo.apply_edit(
@@ -2151,13 +2170,15 @@ impl EditorContext<'_> {
             *self.selection = Selection::caret(target);
             return;
         }
-        if let Some(prev_row) = ctx
-            .rows[..ctx.row_idx]
+        if let Some(prev_row) = ctx.rows[..ctx.row_idx]
             .iter()
             .rev()
             .find(|r| !r.is_delimiter && !r.cells.is_empty())
         {
-            let target_col = ctx.delim_cols.saturating_sub(1).min(prev_row.cells.len() - 1);
+            let target_col = ctx
+                .delim_cols
+                .saturating_sub(1)
+                .min(prev_row.cells.len() - 1);
             let target = cell_target_caret_offset(full, &prev_row.cells[target_col]);
             *self.selection = Selection::caret(target);
         }
@@ -2182,7 +2203,9 @@ impl EditorContext<'_> {
             }
             return Some(ByteRange::new(line_start, content_end));
         }
-        let line = self.buffer.slice_to_string(ByteRange::new(line_start, content_end));
+        let line = self
+            .buffer
+            .slice_to_string(ByteRange::new(line_start, content_end));
         if is_standalone_piped_header(&line) {
             let pipes = unescaped_pipe_offsets(&line);
             let rel_caret = self.selection.head.saturating_sub(line_start);
@@ -2216,7 +2239,11 @@ impl EditorContext<'_> {
             while l_end < bytes.len() && bytes[l_end] != b'\n' {
                 l_end += 1;
             }
-            let next_pos = if l_end < bytes.len() { l_end + 1 } else { l_end };
+            let next_pos = if l_end < bytes.len() {
+                l_end + 1
+            } else {
+                l_end
+            };
             let line = full[l_start..l_end].trim_end_matches('\r');
 
             if l_start == target_line_start {
@@ -2270,14 +2297,12 @@ impl EditorContext<'_> {
 
     fn ensure_fenced_code_blocks(&mut self) -> &[CachedFencedCodeBlock] {
         if self.buffer.cached_fenced_blocks().is_none() {
-            let blocks = if rope_prefix_contains_fence_marker(
-                self.buffer.rope(),
-                self.buffer.len_bytes(),
-            ) {
-                parse_fenced_code_blocks(&self.buffer.to_string())
-            } else {
-                Vec::new()
-            };
+            let blocks =
+                if rope_prefix_contains_fence_marker(self.buffer.rope(), self.buffer.len_bytes()) {
+                    parse_fenced_code_blocks(&self.buffer.to_string())
+                } else {
+                    Vec::new()
+                };
             self.buffer.set_cached_fenced_blocks(blocks);
         }
         self.buffer
@@ -2288,7 +2313,10 @@ impl EditorContext<'_> {
     /// Returns `Some((fence_char, fence_len))` if the line starting at `target_line_start` is inside
     /// the body of an unclosed fenced code block (` ``` ` or `~~~`, tracking fence character,
     /// minimum opening length, blockquote/list-item containers, YAML front matter, and LF/CRLF/CR lines).
-    fn enclosing_fenced_code_block(&mut self, target_line_start: ByteOffset) -> Option<(u8, usize)> {
+    fn enclosing_fenced_code_block(
+        &mut self,
+        target_line_start: ByteOffset,
+    ) -> Option<(u8, usize)> {
         if target_line_start == 0 {
             return None;
         }
@@ -2310,7 +2338,8 @@ impl EditorContext<'_> {
     }
 
     fn is_offset_inside_fenced_code_block(&mut self, target_line_start: ByteOffset) -> bool {
-        self.enclosing_fenced_code_block(target_line_start).is_some()
+        self.enclosing_fenced_code_block(target_line_start)
+            .is_some()
     }
 
     /// Returns `true` if inserting/replacing at `range` would write inside a fenced code block
@@ -2397,7 +2426,10 @@ impl EditorContext<'_> {
             return None;
         }
         let closing_fence_end = caret + after_eol_len + close_line.len();
-        Some((ByteRange::new(caret - trailing_empty_bytes, caret), closing_fence_end))
+        Some((
+            ByteRange::new(caret - trailing_empty_bytes, caret),
+            closing_fence_end,
+        ))
     }
 }
 
@@ -2593,7 +2625,13 @@ fn parse_fenced_code_blocks(full: &str) -> Vec<CachedFencedCodeBlock> {
                     next_line_span_any_eol(bytes, open_line_start);
                 let (fence_char, fence_len) =
                     extract_fence_delimiter(&full[block_start.min(open_line_end)..open_line_end]);
-                current = Some((open_line_start, block_end, open_line_next, fence_char, fence_len));
+                current = Some((
+                    open_line_start,
+                    block_end,
+                    open_line_next,
+                    fence_char,
+                    fence_len,
+                ));
             }
             pulldown_cmark::Event::Text(_) => {
                 if let Some((_, _, ref mut last_body_end, _, _)) = current {
@@ -2723,20 +2761,21 @@ fn block_line_syntax_escape_offset(line: &str) -> Option<ByteOffset> {
         return Some(0);
     }
     if let Some((indent, marker_len)) = list_prefix_parts(line)
-        && line.len() == indent + marker_len {
-            let marker = &line[indent..];
-            if marker.starts_with("- [") {
-                // `- [ ] ` -> `- \[ ] ` (escape before `[` per PRD 4.1.1 B.1)
-                return Some(indent + 2);
-            }
-            if matches!(marker, "- " | "* " | "+ ") {
-                return Some(indent);
-            }
-            if let Some(dot_rel) = marker.find(". ") {
-                // `1. ` -> `1\. `
-                return Some(indent + dot_rel);
-            }
+        && line.len() == indent + marker_len
+    {
+        let marker = &line[indent..];
+        if marker.starts_with("- [") {
+            // `- [ ] ` -> `- \[ ] ` (escape before `[` per PRD 4.1.1 B.1)
+            return Some(indent + 2);
         }
+        if matches!(marker, "- " | "* " | "+ ") {
+            return Some(indent);
+        }
+        if let Some(dot_rel) = marker.find(". ") {
+            // `1. ` -> `1\. `
+            return Some(indent + dot_rel);
+        }
+    }
     blockquote_trigger_offset(line)
 }
 
@@ -2754,11 +2793,7 @@ fn blockquote_trigger_offset(line: &str) -> Option<ByteOffset> {
         last_quote = Some(pos);
         pos += 2;
     }
-    if pos == line.len() {
-        last_quote
-    } else {
-        None
-    }
+    if pos == line.len() { last_quote } else { None }
 }
 
 /// Parse single or nested blockquote line prefix (`> `, `> > `, optional <=3 leading spaces).
@@ -2814,11 +2849,7 @@ fn thematic_break_escape_offset(line: &str) -> Option<ByteOffset> {
             return None;
         }
     }
-    if count >= 3 {
-        Some(indent)
-    } else {
-        None
-    }
+    if count >= 3 { Some(indent) } else { None }
 }
 
 /// Determine whether a newly typed opening fence line at `line_end` already pairs
@@ -2896,19 +2927,21 @@ fn detect_inline_conversion_escapes(
                     run += 1;
                 }
                 if let Some((open, open_len)) = open_backtick
-                    && run == open_len {
-                        let inner = &prefix[open + run..i];
-                        let is_fence = parse_opening_code_fence(line).is_some() && open <= 3 && run >= 3;
-                        if i + run == caret_in_line
-                            && typed_char == '`'
-                            && !is_fence
-                            && !inner.is_empty()
-                            && inner.chars().any(|c| !c.is_whitespace())
-                        {
-                            return vec![open];
-                        }
-                        open_backtick = None;
+                    && run == open_len
+                {
+                    let inner = &prefix[open + run..i];
+                    let is_fence =
+                        parse_opening_code_fence(line).is_some() && open <= 3 && run >= 3;
+                    if i + run == caret_in_line
+                        && typed_char == '`'
+                        && !is_fence
+                        && !inner.is_empty()
+                        && inner.chars().any(|c| !c.is_whitespace())
+                    {
+                        return vec![open];
                     }
+                    open_backtick = None;
+                }
                 i += run;
                 continue;
             }
@@ -3016,10 +3049,7 @@ fn detect_inline_conversion_escapes(
 }
 
 fn is_just_heading_trigger(line: &str) -> bool {
-    matches!(
-        line,
-        "# " | "## " | "### " | "#### " | "##### " | "###### "
-    )
+    matches!(line, "# " | "## " | "### " | "#### " | "##### " | "###### ")
 }
 
 fn heading_prefix_len(line: &str) -> Option<usize> {
@@ -3072,7 +3102,11 @@ fn collect_ordered_list_renumber_edits(
         while l_end < bytes.len() && bytes[l_end] != b'\n' {
             l_end += 1;
         }
-        let next_pos = if l_end < bytes.len() { l_end + 1 } else { l_end };
+        let next_pos = if l_end < bytes.len() {
+            l_end + 1
+        } else {
+            l_end
+        };
         let raw_line = &source[l_start..l_end];
         let s_line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         if s_line.trim().is_empty() {
@@ -3246,14 +3280,22 @@ impl ParsedTableGrid {
                 .map(|col| {
                     row.cells
                         .get(col)
-                        .map(|c| full_source[c.raw_range.start..c.raw_range.end].trim().to_string())
+                        .map(|c| {
+                            full_source[c.raw_range.start..c.raw_range.end]
+                                .trim()
+                                .to_string()
+                        })
                         .unwrap_or_default()
                 })
                 .collect();
             let extra_cells = if row.cells.len() > delim_cols {
                 row.cells[delim_cols..]
                     .iter()
-                    .map(|c| full_source[c.raw_range.start..c.raw_range.end].trim().to_string())
+                    .map(|c| {
+                        full_source[c.raw_range.start..c.raw_range.end]
+                            .trim()
+                            .to_string()
+                    })
                     .collect()
             } else {
                 Vec::new()
@@ -3751,10 +3793,7 @@ mod tests {
         let mut ed_quad = EditorController::from_str("````md\n```\n# comment\n````");
         ed_quad.set_caret("````md\n```\n# ".len());
         ed_quad.backspace();
-        assert_eq!(
-            ed_quad.buffer.to_string(),
-            "````md\n```\n#comment\n````"
-        );
+        assert_eq!(ed_quad.buffer.to_string(), "````md\n```\n#comment\n````");
     }
 
     #[test]
@@ -3840,7 +3879,10 @@ mod tests {
 
         // 1st Cmd/Ctrl+A -> selects code block body
         ed.select_all();
-        assert_eq!(ed.selection.range(), ByteRange::new(code_body_start, code_body_end));
+        assert_eq!(
+            ed.selection.range(),
+            ByteRange::new(code_body_start, code_body_end)
+        );
 
         // 2nd Cmd/Ctrl+A -> selects full document
         ed.select_all();
@@ -3884,7 +3926,8 @@ mod tests {
     fn test_p1_table_navigation_with_fullwidth_space_keeps_utf8_char_boundary() {
         // P1 #6: Full-width space `\u{3000}` is 3 bytes in UTF-8; Tab/Shift+Tab must land on a valid
         // UTF-8 char boundary so a subsequent Backspace never panics.
-        let mut ed = EditorController::from_str("| a |\u{3000}b |\n| --- | --- |\n| c |\u{3000}d |");
+        let mut ed =
+            EditorController::from_str("| a |\u{3000}b |\n| --- | --- |\n| c |\u{3000}d |");
         ed.set_caret(2); // inside `| a|`
         ed.tab();
         let caret = ed.selection.head;
@@ -3894,7 +3937,10 @@ mod tests {
 
         // Backspace removes the full 3-byte full-width space cleanly without panic
         ed.backspace();
-        assert_eq!(ed.buffer.to_string(), "| a |b |\n| --- | --- |\n| c |\u{3000}d |");
+        assert_eq!(
+            ed.buffer.to_string(),
+            "| a |b |\n| --- | --- |\n| c |\u{3000}d |"
+        );
 
         // Also test jumping forward across delimiter row to row 2, then Shift+Tab backward
         let row2_first_cell = ed.buffer.to_string().find("| c |").unwrap() + 2;
@@ -3954,14 +4000,16 @@ mod tests {
         // Verify ZERO bare LF (`\n` not preceded by `\r`)
         for (idx, b) in out.bytes().enumerate() {
             if b == b'\n' {
-                assert!(idx > 0 && out.as_bytes()[idx - 1] == b'\r', "found bare LF at {idx}");
+                assert!(
+                    idx > 0 && out.as_bytes()[idx - 1] == b'\r',
+                    "found bare LF at {idx}"
+                );
             }
         }
 
         // Mixed line-ending document with LF majority + minority CRLF must pick dominant LF (`\n`)
-        let mut mixed_lf_dom = EditorController::from_str(
-            "l1\nl2\nl3\n| a | b |\r\n| --- | --- |\r\n| 1 | 2 |",
-        );
+        let mut mixed_lf_dom =
+            EditorController::from_str("l1\nl2\nl3\n| a | b |\r\n| --- | --- |\r\n| 1 | 2 |");
         let col = mixed_lf_dom.buffer.to_string().rfind("2 |").unwrap();
         mixed_lf_dom.set_caret(col);
         mixed_lf_dom.tab();
@@ -3970,8 +4018,7 @@ mod tests {
             "l1\nl2\nl3\n| a | b |\r\n| --- | --- |\r\n| 1 | 2 |\n|  |  |"
         );
 
-        let mut mixed_lf_enter =
-            EditorController::from_str("l1\nl2\nl3\n| a | b |\r\nAfter");
+        let mut mixed_lf_enter = EditorController::from_str("l1\nl2\nl3\n| a | b |\r\nAfter");
         mixed_lf_enter.set_caret("l1\nl2\nl3\n| ".len());
         mixed_lf_enter.enter();
         assert_eq!(
@@ -3980,9 +4027,8 @@ mod tests {
         );
 
         // Mixed line-ending document with CRLF majority + minority LF must pick dominant CRLF (`\r\n`)
-        let mut mixed_crlf_dom = EditorController::from_str(
-            "l1\r\nl2\r\nl3\r\n| a | b |\n| --- | --- |\n| 1 | 2 |",
-        );
+        let mut mixed_crlf_dom =
+            EditorController::from_str("l1\r\nl2\r\nl3\r\n| a | b |\n| --- | --- |\n| 1 | 2 |");
         let col2 = mixed_crlf_dom.buffer.to_string().rfind("2 |").unwrap();
         mixed_crlf_dom.set_caret(col2);
         mixed_crlf_dom.tab();
@@ -4237,7 +4283,10 @@ mod tests {
         let before_third = fence_exit.buffer.to_string();
         assert_eq!(before_third, "```rust\r\nlet x = 1;\r\n\r\n\r\n```");
         fence_exit.enter();
-        assert_eq!(fence_exit.buffer.to_string(), "```rust\r\nlet x = 1;\r\n```\r\n");
+        assert_eq!(
+            fence_exit.buffer.to_string(),
+            "```rust\r\nlet x = 1;\r\n```\r\n"
+        );
         assert_strict_crlf(&fence_exit.buffer.to_string());
         fence_exit.undo();
         assert_eq!(fence_exit.buffer.to_string(), before_third);
@@ -4286,7 +4335,10 @@ mod tests {
         let mut fence_mid = EditorController::from_str("```rust\r\nAfter\r\n");
         fence_mid.set_caret("```rust".len());
         fence_mid.enter();
-        assert_eq!(fence_mid.buffer.to_string(), "```rust\r\n\r\n```\r\nAfter\r\n");
+        assert_eq!(
+            fence_mid.buffer.to_string(),
+            "```rust\r\n\r\n```\r\nAfter\r\n"
+        );
         assert_strict_crlf(&fence_mid.buffer.to_string());
 
         // Dominant CR document inserts `\r`
@@ -4330,7 +4382,8 @@ mod tests {
         // Mid-list Enter inserts incremented item and renumbers subsequent items (including 9 -> 10 digit growth),
         // skips deeper nested items cleanly, leaves separate list after blank line untouched,
         // and undoes/redoes atomically in one step.
-        let initial = "1. First\n2. Second\n  - nested\n3. Nine\n4. Ten\n\n1. Other list\n2. Untouched";
+        let initial =
+            "1. First\n2. Second\n  - nested\n3. Nine\n4. Ten\n\n1. Other list\n2. Untouched";
         let mut mid = EditorController::from_str(initial);
         mid.set_caret("1. First".len());
         mid.enter();
@@ -4357,7 +4410,10 @@ mod tests {
         let mut growth = EditorController::from_str(growth_init);
         growth.set_caret("8. Eight".len());
         growth.enter();
-        assert_eq!(growth.buffer.to_string(), "8. Eight\n9. \n10. Nine\n11. Ten");
+        assert_eq!(
+            growth.buffer.to_string(),
+            "8. Eight\n9. \n10. Nine\n11. Ten"
+        );
         growth.undo();
         assert_eq!(growth.buffer.to_string(), growth_init);
     }
@@ -4382,10 +4438,7 @@ mod tests {
         let mut hdr = EditorController::from_str("| a | b |");
         hdr.set_caret("| a | b |".len());
         hdr.enter();
-        assert_eq!(
-            hdr.buffer.to_string(),
-            "| a | b |\n| --- | --- |\n|  |  |"
-        );
+        assert_eq!(hdr.buffer.to_string(), "| a | b |\n| --- | --- |\n|  |  |");
 
         // Short GFM delimiter `|--|` inside a real table is skipped cleanly on Tab.
         let mut tbl = EditorController::from_str("| Header |\n|--|\n| cell |");
@@ -4422,7 +4475,10 @@ mod tests {
         let mut empty_pref = EditorController::with_line_ending("", LineEnding::CrLf);
         empty_pref.insert_text("Line1\nLine2");
         assert_eq!(empty_pref.buffer.to_string(), "Line1\r\nLine2");
-        assert_eq!(empty_pref.selection, Selection::caret("Line1\r\nLine2".len()));
+        assert_eq!(
+            empty_pref.selection,
+            Selection::caret("Line1\r\nLine2".len())
+        );
         assert_strict_crlf(&empty_pref.buffer.to_string());
 
         // 4. `ime_commit` normalizes embedded newlines, snaps both `ime_composition_selection` and active
@@ -4460,7 +4516,10 @@ mod tests {
         link.insert_link("https://example.com\n");
         assert_strict_crlf(&link.buffer.to_string());
         // Line breaks are illegal inside CommonMark destinations and are sanitized while keeping CRLF intact.
-        assert_eq!(link.buffer.to_string(), "click[](https://example.com)\r\nhere");
+        assert_eq!(
+            link.buffer.to_string(),
+            "click[](https://example.com)\r\nhere"
+        );
 
         // Selecting up to `\r|\n` midpoint snaps back to before `\r\n` without splitting CRLF.
         let mut link_sel = EditorController::from_str("click\r\nhere");
@@ -4489,7 +4548,10 @@ mod tests {
         assert!(!ed.align_current_table());
         // Single undo restores unaligned source.
         ed.undo();
-        assert_eq!(ed.buffer.to_string(), "| a | b |\n| - | - |\n| 1 | 2 | 3 |\n");
+        assert_eq!(
+            ed.buffer.to_string(),
+            "| a | b |\n| - | - |\n| 1 | 2 | 3 |\n"
+        );
 
         // Short body row pads to canonical delim_cols (3).
         let mut short_ed = EditorController::from_str("| a | b | c |\n| - | - | - |\n| 1 |\n");
@@ -4548,13 +4610,22 @@ mod tests {
         ed.set_caret(pos_1);
 
         ed.tab();
-        assert_eq!(ed.buffer.to_string(), "| a | b | c |\n| - | - | - |\n| 1 |  |  |\n");
+        assert_eq!(
+            ed.buffer.to_string(),
+            "| a | b | c |\n| - | - | - |\n| 1 |  |  |\n"
+        );
         ed.insert_char('2');
-        assert_eq!(ed.buffer.to_string(), "| a | b | c |\n| - | - | - |\n| 1 | 2 |  |\n");
+        assert_eq!(
+            ed.buffer.to_string(),
+            "| a | b | c |\n| - | - | - |\n| 1 | 2 |  |\n"
+        );
 
         ed.tab();
         ed.insert_char('3');
-        assert_eq!(ed.buffer.to_string(), "| a | b | c |\n| - | - | - |\n| 1 | 2 | 3 |\n");
+        assert_eq!(
+            ed.buffer.to_string(),
+            "| a | b | c |\n| - | - | - |\n| 1 | 2 | 3 |\n"
+        );
 
         // Tab at last canonical column appends a canonical 3-col empty row.
         ed.tab();
@@ -4593,7 +4664,10 @@ mod tests {
         );
         no_tail.undo();
         no_tail.undo();
-        assert_eq!(no_tail.buffer.to_string(), "| a | b | c |\n| - | - | - |\n| 1");
+        assert_eq!(
+            no_tail.buffer.to_string(),
+            "| a | b | c |\n| - | - | - |\n| 1"
+        );
 
         // Enter in short row (3-col table) inserts 3-col empty row; Enter in wide row (2-col table)
         // inserts 2-col empty row; Enter in header inserts below delimiter row.
@@ -4658,10 +4732,7 @@ mod tests {
         let mut ws_win = EditorController::from_str("doc");
         ws_win.set_selection(0, 3);
         ws_win.insert_link(r"C:\My Docs\a>b\");
-        assert_eq!(
-            ws_win.buffer.to_string(),
-            r"[doc](<C:\\My Docs\\a\>b\\>)"
-        );
+        assert_eq!(ws_win.buffer.to_string(), r"[doc](<C:\\My Docs\\a\>b\\>)");
 
         // 3. Destination with unbalanced parens escapes `(`, `)` cleanly without breaking `)`
         let mut lp = EditorController::from_str("text");
@@ -4769,8 +4840,7 @@ mod tests {
         );
 
         // 3. Row +/- and Column +/- operations (including auto_align = true and overflow preservation)
-        let mut grid_ed =
-            EditorController::from_str("| A | B |\n| --- | --- |\n| 1 | 2 | extra |");
+        let mut grid_ed = EditorController::from_str("| A | B |\n| --- | --- |\n| 1 | 2 | extra |");
         grid_ed.table_auto_align = true;
         grid_ed.set_caret(grid_ed.buffer.to_string().find('1').unwrap());
         assert!(grid_ed.insert_table_col_right());
@@ -4856,7 +4926,10 @@ mod tests {
         // Blockquote-nested fence: selection from inside across closing fence -> rejected; outside -> allowed
         let bq_src = "> ```md\n> code line\n> ```\nafter";
         let mut bq = EditorController::from_str(bq_src);
-        bq.set_selection(bq_src.find("code").unwrap(), bq_src.find("after").unwrap() + 2);
+        bq.set_selection(
+            bq_src.find("code").unwrap(),
+            bq_src.find("after").unwrap() + 2,
+        );
         assert!(!bq.insert_table(2, 2));
         assert_eq!(bq.buffer.to_string(), bq_src);
         bq.set_caret(bq_src.len());
@@ -4865,7 +4938,10 @@ mod tests {
         // Pure CR (`\r`) document: selection from inside across closing fence -> rejected; outside -> allowed
         let cr_src = "```md\rcode line\r```\rafter";
         let mut cr = EditorController::from_str(cr_src);
-        cr.set_selection(cr_src.find("code").unwrap(), cr_src.find("after").unwrap() + 2);
+        cr.set_selection(
+            cr_src.find("code").unwrap(),
+            cr_src.find("after").unwrap() + 2,
+        );
         assert!(!cr.insert_table(2, 2));
         assert_eq!(cr.buffer.to_string(), cr_src);
         cr.set_caret(cr_src.len());
@@ -4907,7 +4983,10 @@ mod tests {
             let after_start = cont_src.find("after").unwrap();
             // Cross-closing-fence selection from code body into `after` must be rejected
             ed_cont.set_selection(c_start, after_start + 2);
-            assert!(!ed_cont.insert_table(2, 2), "failed to block fence in: {cont_src}");
+            assert!(
+                !ed_cont.insert_table(2, 2),
+                "failed to block fence in: {cont_src}"
+            );
             assert_eq!(ed_cont.buffer.to_string(), cont_src);
             // Caret on `after` outside the list/fence succeeds
             ed_cont.set_caret(cont_src.len());
@@ -4955,7 +5034,11 @@ mod tests {
         ] {
             let mut ed_close = EditorController::from_str(doc);
             let code_pos = doc.find("code").unwrap();
-            assert!(!ed_close.ctx().range_intersects_fenced_code_block(ByteRange::empty(code_pos)));
+            assert!(
+                !ed_close
+                    .ctx()
+                    .range_intersects_fenced_code_block(ByteRange::empty(code_pos))
+            );
             assert!(ed_close.buffer.cached_fenced_blocks().is_some());
             let x_pos = doc.find(needle).unwrap();
             ed_close.set_caret(x_pos + 1);

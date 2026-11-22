@@ -63,7 +63,8 @@ pub const RECOVERY_DEGRADED_NOTICE: &str =
 
 /// Abstract native file/folder dialog backend (`osascript`/native dialog at runtime; deterministic mock in tests).
 pub trait SaveDialogBackend: Send + Sync {
-    fn pick_save_as_path(&self, current_path: Option<&Path>, default_name: &str) -> Option<PathBuf>;
+    fn pick_save_as_path(&self, current_path: Option<&Path>, default_name: &str)
+    -> Option<PathBuf>;
 
     /// Pick an existing Markdown/text document to open (`Cmd/Ctrl + O`).
     fn pick_open_path(&self, _current_dir: Option<&Path>) -> Option<PathBuf> {
@@ -81,7 +82,11 @@ pub trait SaveDialogBackend: Send + Sync {
 pub struct NoopSaveDialog;
 
 impl SaveDialogBackend for NoopSaveDialog {
-    fn pick_save_as_path(&self, _current_path: Option<&Path>, _default_name: &str) -> Option<PathBuf> {
+    fn pick_save_as_path(
+        &self,
+        _current_path: Option<&Path>,
+        _default_name: &str,
+    ) -> Option<PathBuf> {
         None
     }
 }
@@ -125,7 +130,11 @@ impl MemorySaveDialog {
 }
 
 impl SaveDialogBackend for MemorySaveDialog {
-    fn pick_save_as_path(&self, _current_path: Option<&Path>, _default_name: &str) -> Option<PathBuf> {
+    fn pick_save_as_path(
+        &self,
+        _current_path: Option<&Path>,
+        _default_name: &str,
+    ) -> Option<PathBuf> {
         self.next_path.lock().ok().and_then(|g| g.clone())
     }
 
@@ -192,7 +201,11 @@ fn run_osascript_pick(script: &str, args: &[&str]) -> Option<PathBuf> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn run_zenity_pick(extra_args: &[&str], current_path: Option<&Path>, fallback_name: Option<&str>) -> Option<PathBuf> {
+fn run_zenity_pick(
+    extra_args: &[&str],
+    current_path: Option<&Path>,
+    fallback_name: Option<&str>,
+) -> Option<PathBuf> {
     let mut cmd = Command::new("zenity");
     cmd.arg("--file-selection");
     for arg in extra_args {
@@ -215,7 +228,11 @@ fn run_zenity_pick(extra_args: &[&str], current_path: Option<&Path>, fallback_na
 pub struct NativeSaveDialog;
 
 impl SaveDialogBackend for NativeSaveDialog {
-    fn pick_save_as_path(&self, current_path: Option<&Path>, default_name: &str) -> Option<PathBuf> {
+    fn pick_save_as_path(
+        &self,
+        current_path: Option<&Path>,
+        default_name: &str,
+    ) -> Option<PathBuf> {
         #[cfg(target_os = "macos")]
         {
             let dir_arg = existing_default_dialog_dir(current_path)
@@ -235,7 +252,11 @@ impl SaveDialogBackend for NativeSaveDialog {
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            run_zenity_pick(&["--save", "--confirm-overwrite"], current_path, Some(default_name))
+            run_zenity_pick(
+                &["--save", "--confirm-overwrite"],
+                current_path,
+                Some(default_name),
+            )
         }
         #[cfg(not(unix))]
         {
@@ -459,9 +480,7 @@ fn is_valid_http_authority(authority: &str) -> bool {
                 .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
     }
     if let Some((host, port)) = host_port.rsplit_once(':') {
-        return !host.is_empty()
-            && !port.is_empty()
-            && port.bytes().all(|b| b.is_ascii_digit());
+        return !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
     }
     true
 }
@@ -839,42 +858,186 @@ struct PaletteCommandEntry {
 }
 
 const PALETTE_COMMANDS: &[PaletteCommandEntry] = &[
-    PaletteCommandEntry { id: PaletteCommandId::FileNew, label: "File: New Document", shortcut: "Cmd/Ctrl+N" },
-    PaletteCommandEntry { id: PaletteCommandId::FileOpen, label: "File: Open File...", shortcut: "Cmd/Ctrl+O" },
-    PaletteCommandEntry { id: PaletteCommandId::FileOpenFolder, label: "File: Open Folder...", shortcut: "Cmd/Ctrl+Shift+O" },
-    PaletteCommandEntry { id: PaletteCommandId::FileSave, label: "File: Save", shortcut: "Cmd/Ctrl+S" },
-    PaletteCommandEntry { id: PaletteCommandId::FileSaveAs, label: "File: Save As...", shortcut: "Cmd/Ctrl+Shift+S" },
-    PaletteCommandEntry { id: PaletteCommandId::ManageRecoveryBackups, label: "File: Manage Recovery & Safety Backups...", shortcut: "" },
-    PaletteCommandEntry { id: PaletteCommandId::ExportHtmlSafe, label: "Export: Standalone HTML (Safe Mode)...", shortcut: "" },
-    PaletteCommandEntry { id: PaletteCommandId::ExportHtmlRaw, label: "Export: Standalone HTML (Raw)...", shortcut: "" },
-    PaletteCommandEntry { id: PaletteCommandId::QuickOpen, label: "Go: Quick Open File...", shortcut: "Cmd/Ctrl+P" },
-    PaletteCommandEntry { id: PaletteCommandId::GlobalSearch, label: "Search: Find in Workspace...", shortcut: "Cmd/Ctrl+Shift+F" },
-    PaletteCommandEntry { id: PaletteCommandId::Find, label: "Edit: Find in Document", shortcut: "Cmd/Ctrl+F" },
-    PaletteCommandEntry { id: PaletteCommandId::FindAndReplace, label: "Edit: Find and Replace", shortcut: "Cmd+Opt+F / Ctrl+H" },
-    PaletteCommandEntry { id: PaletteCommandId::InsertTable, label: "Insert: Table...", shortcut: "Cmd/Ctrl+T" },
-    PaletteCommandEntry { id: PaletteCommandId::InsertCodeBlock, label: "Insert / Edit: Code Block", shortcut: "Cmd+Option+C" },
-    PaletteCommandEntry { id: PaletteCommandId::InsertLink, label: "Insert: Hyperlink...", shortcut: "Cmd/Ctrl+K" },
-    PaletteCommandEntry { id: PaletteCommandId::ToggleSourceMode, label: "View: Toggle Source / WYSIWYG Mode", shortcut: "Cmd/Ctrl+/" },
-    PaletteCommandEntry { id: PaletteCommandId::ToggleFocusMode, label: "View: Toggle Focus Mode", shortcut: "F8" },
-    PaletteCommandEntry { id: PaletteCommandId::ToggleTypewriterMode, label: "View: Toggle Typewriter Mode", shortcut: "F9" },
-    PaletteCommandEntry { id: PaletteCommandId::ToggleFullscreen, label: "View: Toggle Fullscreen", shortcut: "F11" },
-    PaletteCommandEntry { id: PaletteCommandId::ToggleSidebar, label: "View: Toggle Sidebar", shortcut: "Cmd/Ctrl+\\" },
-    PaletteCommandEntry { id: PaletteCommandId::ToggleTableAutoAlign, label: "Table: Toggle Auto-Align Source on Edit", shortcut: "" },
-    PaletteCommandEntry { id: PaletteCommandId::ToggleCodeLineNumbers, label: "Editor: Toggle Code Block Line Numbers", shortcut: "Cmd/Ctrl+Shift+L" },
-    PaletteCommandEntry { id: PaletteCommandId::ToggleNetworkImages, label: "Images: Toggle Allow Network Images", shortcut: "" },
-    PaletteCommandEntry { id: PaletteCommandId::ThemeFollowSystem, label: "Theme: Follow System Appearance", shortcut: "" },
-    PaletteCommandEntry { id: PaletteCommandId::ThemeLight, label: "Theme: Light", shortcut: "Cmd/Ctrl+Shift+T" },
-    PaletteCommandEntry { id: PaletteCommandId::ThemeDark, label: "Theme: Dark", shortcut: "" },
-    PaletteCommandEntry { id: PaletteCommandId::ThemeAcademic, label: "Theme: Academic", shortcut: "" },
-    PaletteCommandEntry { id: PaletteCommandId::ThemeGithub, label: "Theme: GitHub", shortcut: "" },
-    PaletteCommandEntry { id: PaletteCommandId::LoadCustomThemeCss, label: "Theme: Load Custom CSS File...", shortcut: "" },
-    PaletteCommandEntry { id: PaletteCommandId::ShowThemeDiagnostics, label: "Theme: Show Theme Diagnostics...", shortcut: "" },
-    PaletteCommandEntry { id: PaletteCommandId::ProseWidthNarrow, label: "Layout: Prose Width Compact (720px)", shortcut: "" },
-    PaletteCommandEntry { id: PaletteCommandId::ProseWidthBalanced, label: "Layout: Prose Width Balanced (860px)", shortcut: "" },
-    PaletteCommandEntry { id: PaletteCommandId::ProseWidthWide, label: "Layout: Prose Width Wide (1080px)", shortcut: "" },
-    PaletteCommandEntry { id: PaletteCommandId::ZoomIn, label: "View: Zoom In", shortcut: "Cmd/Ctrl+=" },
-    PaletteCommandEntry { id: PaletteCommandId::ZoomOut, label: "View: Zoom Out", shortcut: "Cmd/Ctrl+-" },
-    PaletteCommandEntry { id: PaletteCommandId::ZoomReset, label: "View: Reset Zoom (100%)", shortcut: "Cmd/Ctrl+0" },
+    PaletteCommandEntry {
+        id: PaletteCommandId::FileNew,
+        label: "File: New Document",
+        shortcut: "Cmd/Ctrl+N",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::FileOpen,
+        label: "File: Open File...",
+        shortcut: "Cmd/Ctrl+O",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::FileOpenFolder,
+        label: "File: Open Folder...",
+        shortcut: "Cmd/Ctrl+Shift+O",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::FileSave,
+        label: "File: Save",
+        shortcut: "Cmd/Ctrl+S",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::FileSaveAs,
+        label: "File: Save As...",
+        shortcut: "Cmd/Ctrl+Shift+S",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ManageRecoveryBackups,
+        label: "File: Manage Recovery & Safety Backups...",
+        shortcut: "",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ExportHtmlSafe,
+        label: "Export: Standalone HTML (Safe Mode)...",
+        shortcut: "",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ExportHtmlRaw,
+        label: "Export: Standalone HTML (Raw)...",
+        shortcut: "",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::QuickOpen,
+        label: "Go: Quick Open File...",
+        shortcut: "Cmd/Ctrl+P",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::GlobalSearch,
+        label: "Search: Find in Workspace...",
+        shortcut: "Cmd/Ctrl+Shift+F",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::Find,
+        label: "Edit: Find in Document",
+        shortcut: "Cmd/Ctrl+F",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::FindAndReplace,
+        label: "Edit: Find and Replace",
+        shortcut: "Cmd+Opt+F / Ctrl+H",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::InsertTable,
+        label: "Insert: Table...",
+        shortcut: "Cmd/Ctrl+T",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::InsertCodeBlock,
+        label: "Insert / Edit: Code Block",
+        shortcut: "Cmd+Option+C",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::InsertLink,
+        label: "Insert: Hyperlink...",
+        shortcut: "Cmd/Ctrl+K",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ToggleSourceMode,
+        label: "View: Toggle Source / WYSIWYG Mode",
+        shortcut: "Cmd/Ctrl+/",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ToggleFocusMode,
+        label: "View: Toggle Focus Mode",
+        shortcut: "F8",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ToggleTypewriterMode,
+        label: "View: Toggle Typewriter Mode",
+        shortcut: "F9",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ToggleFullscreen,
+        label: "View: Toggle Fullscreen",
+        shortcut: "F11",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ToggleSidebar,
+        label: "View: Toggle Sidebar",
+        shortcut: "Cmd/Ctrl+\\",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ToggleTableAutoAlign,
+        label: "Table: Toggle Auto-Align Source on Edit",
+        shortcut: "",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ToggleCodeLineNumbers,
+        label: "Editor: Toggle Code Block Line Numbers",
+        shortcut: "Cmd/Ctrl+Shift+L",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ToggleNetworkImages,
+        label: "Images: Toggle Allow Network Images",
+        shortcut: "",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ThemeFollowSystem,
+        label: "Theme: Follow System Appearance",
+        shortcut: "",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ThemeLight,
+        label: "Theme: Light",
+        shortcut: "Cmd/Ctrl+Shift+T",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ThemeDark,
+        label: "Theme: Dark",
+        shortcut: "",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ThemeAcademic,
+        label: "Theme: Academic",
+        shortcut: "",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ThemeGithub,
+        label: "Theme: GitHub",
+        shortcut: "",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::LoadCustomThemeCss,
+        label: "Theme: Load Custom CSS File...",
+        shortcut: "",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ShowThemeDiagnostics,
+        label: "Theme: Show Theme Diagnostics...",
+        shortcut: "",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ProseWidthNarrow,
+        label: "Layout: Prose Width Compact (720px)",
+        shortcut: "",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ProseWidthBalanced,
+        label: "Layout: Prose Width Balanced (860px)",
+        shortcut: "",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ProseWidthWide,
+        label: "Layout: Prose Width Wide (1080px)",
+        shortcut: "",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ZoomIn,
+        label: "View: Zoom In",
+        shortcut: "Cmd/Ctrl+=",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ZoomOut,
+        label: "View: Zoom Out",
+        shortcut: "Cmd/Ctrl+-",
+    },
+    PaletteCommandEntry {
+        id: PaletteCommandId::ZoomReset,
+        label: "View: Reset Zoom (100%)",
+        shortcut: "Cmd/Ctrl+0",
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -1189,9 +1352,7 @@ impl GuiController {
             Some(persistent.join("   |   "))
         };
         match (transient, persistent_joined) {
-            (Some(msg), Some(pers))
-                if !persistent.contains(&msg) && !pers.contains(msg) =>
-            {
+            (Some(msg), Some(pers)) if !persistent.contains(&msg) && !pers.contains(msg) => {
                 Some(format!("{msg}   |   {pers}"))
             }
             (Some(msg), _) => Some(msg.to_string()),
@@ -1450,7 +1611,9 @@ impl GuiController {
                 .active_tab()
                 .is_some_and(|t| t.session.state == DocState::Conflict);
         let diff_h = if show_diff {
-            (body_h * 0.36).clamp(110.0, 230.0).min((rem_h - 40.0).max(0.0))
+            (body_h * 0.36)
+                .clamp(110.0, 230.0)
+                .min((rem_h - 40.0).max(0.0))
         } else {
             0.0
         };
@@ -1495,7 +1658,8 @@ impl GuiController {
         if let Some(sb_rect) = layout.sidebar {
             self.build_sidebar(&mut chrome_layer, sb_rect);
         }
-        if let (Some(banner_rect), Some(kind)) = (layout.alert_banner, self.active_doc_banner_kind())
+        if let (Some(banner_rect), Some(kind)) =
+            (layout.alert_banner, self.active_doc_banner_kind())
         {
             self.build_doc_alert_banner(&mut chrome_layer, banner_rect, &kind);
         }
@@ -1602,7 +1766,10 @@ impl GuiController {
                     let total = tab.session.buffer.len_bytes();
                     let end = selection_range.end.min(total);
                     let start = selection_range.start.min(end);
-                    let sel_text = tab.session.buffer.slice_to_string(ByteRange::new(start, end));
+                    let sel_text = tab
+                        .session
+                        .buffer
+                        .slice_to_string(ByteRange::new(start, end));
                     let (w, c, _) = count_text_metrics(&sel_text);
                     (w, c)
                 };
@@ -1667,9 +1834,10 @@ impl GuiController {
                 image_status: Some(&status_resolver),
             };
             Some(tab.with_incremental_blocks(|blocks| {
-                self.shaper.build_editor_scene(blocks, &self.style, &vp, |r| {
-                    tab.session.buffer.slice_to_string(r)
-                })
+                self.shaper
+                    .build_editor_scene(blocks, &self.style, &vp, |r| {
+                        tab.session.buffer.slice_to_string(r)
+                    })
             }))
         } else {
             None
@@ -1678,7 +1846,9 @@ impl GuiController {
         let Some(mut scene) = scene_opt else {
             self.last_ime_cursor_area = None;
             let mut empty = DrawList::default();
-            empty.rects.push(SceneRect::solid(editor_rect, self.style.bg_color));
+            empty
+                .rects
+                .push(SceneRect::solid(editor_rect, self.style.bg_color));
             shape_ui_text_into(
                 self.shaper.font_system_mut(),
                 "No open document. Press Cmd/Ctrl+N to create one.",
@@ -1720,7 +1890,8 @@ impl GuiController {
                     if caret_top < tab.scroll_y + top_margin {
                         tab.scroll_y = (caret_top - top_margin).max(0.0);
                     } else if caret_bot > tab.scroll_y + editor_rect.h - bot_margin {
-                        tab.scroll_y = (caret_bot - editor_rect.h + bot_margin).clamp(0.0, max_scroll);
+                        tab.scroll_y =
+                            (caret_bot - editor_rect.h + bot_margin).clamp(0.0, max_scroll);
                     }
                 }
                 tab.scroll_y = tab.scroll_y.clamp(0.0, max_scroll);
@@ -1729,34 +1900,34 @@ impl GuiController {
                 false
             };
             self.pending_scroll_ensure_caret = false;
-            if need_reframe
-                && let Some(tab) = self.workbench.active_tab() {
-                    let rev = tab.session.buffer.revision();
-                    let src_len = tab.session.buffer.len_bytes();
-                    let vp2 = EditorViewport {
-                        doc_rect: editor_rect,
-                        content_left_x,
-                        content_width_px: max_w,
-                        scroll_y: tab.scroll_y,
-                        overscan_px: 220.0,
-                        scale_factor,
-                        source_rev: rev,
-                        source_len: src_len,
-                        view: &tab.view,
-                        focus_mode,
-                        show_caret,
-                        show_code_line_numbers,
-                        find_matches: &find_ranges,
-                        active_find,
-                        image_status: Some(&status_resolver),
-                    };
-                    scene = tab.with_incremental_blocks(|blocks| {
-                        self.shaper.build_editor_scene(blocks, &self.style, &vp2, |r| {
+            if need_reframe && let Some(tab) = self.workbench.active_tab() {
+                let rev = tab.session.buffer.revision();
+                let src_len = tab.session.buffer.len_bytes();
+                let vp2 = EditorViewport {
+                    doc_rect: editor_rect,
+                    content_left_x,
+                    content_width_px: max_w,
+                    scroll_y: tab.scroll_y,
+                    overscan_px: 220.0,
+                    scale_factor,
+                    source_rev: rev,
+                    source_len: src_len,
+                    view: &tab.view,
+                    focus_mode,
+                    show_caret,
+                    show_code_line_numbers,
+                    find_matches: &find_ranges,
+                    active_find,
+                    image_status: Some(&status_resolver),
+                };
+                scene = tab.with_incremental_blocks(|blocks| {
+                    self.shaper
+                        .build_editor_scene(blocks, &self.style, &vp2, |r| {
                             tab.session.buffer.slice_to_string(r)
                         })
-                    });
-                    self.last_ime_cursor_area = scene.ime_cursor_area;
-                }
+                });
+                self.last_ime_cursor_area = scene.ime_cursor_area;
+            }
         }
 
         // Scrollbar thumb indicator on right edge when document exceeds viewport height
@@ -1770,7 +1941,12 @@ impl GuiController {
                 .map(|t| (t.scroll_y / max_scroll).clamp(0.0, 1.0))
                 .unwrap_or(0.0);
             let thumb_y = editor_rect.y + scroll_frac * (editor_rect.h - thumb_h);
-            let sb_rect = Rect::new(editor_rect.x + editor_rect.w - 8.0, thumb_y + 2.0, 5.0, thumb_h - 4.0);
+            let sb_rect = Rect::new(
+                editor_rect.x + editor_rect.w - 8.0,
+                thumb_y + 2.0,
+                5.0,
+                thumb_h - 4.0,
+            );
             scene.draw.rects.push(
                 SceneRect::rounded(sb_rect, self.style.chrome.muted_text.with_alpha(95), 2.5)
                     .with_clip(Some(editor_rect)),
@@ -1830,7 +2006,17 @@ impl GuiController {
         };
         dl.rects
             .push(SceneRect::rounded(sb_btn, sb_bg, 5.0).with_border(1.0, chrome.border));
-        self.push_ui_text(dl, "|||", sb_btn.x + 7.0, sb_btn.y + 4.0, 11.5, 600, chrome.text, None, Some(bar));
+        self.push_ui_text(
+            dl,
+            "|||",
+            sb_btn.x + 7.0,
+            sb_btn.y + 4.0,
+            11.5,
+            600,
+            chrome.text,
+            None,
+            Some(bar),
+        );
         self.ui_hit_zones.push(UiHitZone {
             rect: sb_btn,
             action: UiAction::ToggleSidebar,
@@ -1928,8 +2114,9 @@ impl GuiController {
             pointer_cursor: true,
         });
 
-        dl.rects
-            .push(SceneRect::rounded(theme_rect, chrome.panel_bg, 5.0).with_border(1.0, chrome.border));
+        dl.rects.push(
+            SceneRect::rounded(theme_rect, chrome.panel_bg, 5.0).with_border(1.0, chrome.border),
+        );
         self.push_ui_text(
             dl,
             "Theme",
@@ -1973,7 +2160,9 @@ impl GuiController {
             if x + 64.0 > max_tabs_right {
                 break;
             }
-            let tab_w = (label.len() as f32 * 7.5 + 42.0).clamp(96.0, 200.0).min(max_tabs_right - x);
+            let tab_w = (label.len() as f32 * 7.5 + 42.0)
+                .clamp(96.0, 200.0)
+                .min(max_tabs_right - x);
             let tab_rect = Rect::new(x, 5.0, tab_w, 27.0);
             let bg = if is_active {
                 chrome.active_tab_bg
@@ -1986,11 +2175,20 @@ impl GuiController {
             );
             if is_active {
                 dl.rects.push(SceneRect::solid(
-                    Rect::new(tab_rect.x + 8.0, tab_rect.y + tab_rect.h - 2.0, tab_w - 16.0, 2.0),
+                    Rect::new(
+                        tab_rect.x + 8.0,
+                        tab_rect.y + tab_rect.h - 2.0,
+                        tab_w - 16.0,
+                        2.0,
+                    ),
                     chrome.accent,
                 ));
             }
-            let col = if is_active { chrome.text } else { chrome.muted_text };
+            let col = if is_active {
+                chrome.text
+            } else {
+                chrome.muted_text
+            };
             self.push_ui_text(
                 dl,
                 &label,
@@ -2032,8 +2230,19 @@ impl GuiController {
 
         let new_btn = Rect::new(x, 6.0, 24.0, 24.0);
         if new_btn.x + new_btn.w < max_tabs_right + 28.0 {
-            dl.rects.push(SceneRect::rounded(new_btn, chrome.panel_bg, 5.0));
-            self.push_ui_text(dl, "+", new_btn.x + 7.0, new_btn.y + 3.0, 14.0, 600, chrome.text, None, Some(bar));
+            dl.rects
+                .push(SceneRect::rounded(new_btn, chrome.panel_bg, 5.0));
+            self.push_ui_text(
+                dl,
+                "+",
+                new_btn.x + 7.0,
+                new_btn.y + 3.0,
+                14.0,
+                600,
+                chrome.text,
+                None,
+                Some(bar),
+            );
             self.ui_hit_zones.push(UiHitZone {
                 rect: new_btn,
                 action: UiAction::NewTab,
@@ -2065,7 +2274,11 @@ impl GuiController {
             let active = self.sidebar_section == sec;
             dl.rects.push(SceneRect::rounded(
                 btn,
-                if active { chrome.active_tab_bg } else { chrome.sidebar_bg },
+                if active {
+                    chrome.active_tab_bg
+                } else {
+                    chrome.sidebar_bg
+                },
                 4.0,
             ));
             self.push_ui_text(
@@ -2075,7 +2288,11 @@ impl GuiController {
                 btn.y + 3.0,
                 11.5,
                 if active { 600 } else { 400 },
-                if active { chrome.text } else { chrome.muted_text },
+                if active {
+                    chrome.text
+                } else {
+                    chrome.muted_text
+                },
                 Some(btn.w - 8.0),
                 Some(sb),
             );
@@ -2086,7 +2303,12 @@ impl GuiController {
             });
         }
 
-        let list_clip = Rect::new(sb.x, sb.y + header_h, sb.w - 1.0, (sb.h - header_h).max(10.0));
+        let list_clip = Rect::new(
+            sb.x,
+            sb.y + header_h,
+            sb.w - 1.0,
+            (sb.h - header_h).max(10.0),
+        );
         let mut row_y = sb.y + header_h + 6.0;
         let row_h = 24.0;
 
@@ -2160,7 +2382,12 @@ impl GuiController {
                 for (bw, label, action, is_danger) in [
                     (48.0, "+File", UiAction::OpenNewFilePrompt, false),
                     (38.0, "Ren", UiAction::OpenRenameFilePrompt, false),
-                    (42.0, del_label, UiAction::ArmOrConfirmDeleteFile, delete_armed),
+                    (
+                        42.0,
+                        del_label,
+                        UiAction::ArmOrConfirmDeleteFile,
+                        delete_armed,
+                    ),
                 ] {
                     let rect = Rect::new(btn_x, bar_y, bw, 22.0);
                     let bg = if is_danger {
@@ -2168,7 +2395,11 @@ impl GuiController {
                     } else {
                         chrome.panel_bg
                     };
-                    let border = if is_danger { chrome.danger } else { chrome.border };
+                    let border = if is_danger {
+                        chrome.danger
+                    } else {
+                        chrome.border
+                    };
                     dl.rects.push(
                         SceneRect::rounded(rect, bg, 4.0)
                             .with_border(1.0, border)
@@ -2181,7 +2412,11 @@ impl GuiController {
                         rect.y + 4.0,
                         11.0,
                         600,
-                        if is_danger { chrome.danger } else { chrome.text },
+                        if is_danger {
+                            chrome.danger
+                        } else {
+                            chrome.text
+                        },
                         Some(bw - 8.0),
                         Some(list_clip),
                     );
@@ -2425,10 +2660,8 @@ impl GuiController {
             bar_w,
             bar_h,
         );
-        dl.rects.push(
-            SceneRect::rounded(bar, chrome.panel_bg, 7.0)
-                .with_border(1.0, chrome.border),
-        );
+        dl.rects
+            .push(SceneRect::rounded(bar, chrome.panel_bg, 7.0).with_border(1.0, chrome.border));
         self.ui_hit_zones.push(UiHitZone {
             rect: bar,
             action: if self.replace_open && self.replace_focused {
@@ -2470,12 +2703,37 @@ impl GuiController {
             (None, t) if t > 0 => format!("{t}"),
             _ => String::new(),
         };
-        self.push_ui_text(dl, &count_text, count_x, bar.y + 11.0, 11.0, 500, chrome.muted_text, Some(44.0), Some(bar));
+        self.push_ui_text(
+            dl,
+            &count_text,
+            count_x,
+            bar.y + 11.0,
+            11.0,
+            500,
+            chrome.muted_text,
+            Some(44.0),
+            Some(bar),
+        );
 
         for (label, bw, active, action) in [
-            ("W", 26.0, self.find_options.whole_word, UiAction::ToggleFindWholeWord),
-            ("Aa", 26.0, self.find_options.case_sensitive, UiAction::ToggleFindCase),
-            (".*", 26.0, self.find_options.use_regex, UiAction::ToggleFindRegex),
+            (
+                "W",
+                26.0,
+                self.find_options.whole_word,
+                UiAction::ToggleFindWholeWord,
+            ),
+            (
+                "Aa",
+                26.0,
+                self.find_options.case_sensitive,
+                UiAction::ToggleFindCase,
+            ),
+            (
+                ".*",
+                26.0,
+                self.find_options.use_regex,
+                UiAction::ToggleFindRegex,
+            ),
             ("⇄", 26.0, self.replace_open, UiAction::ToggleReplaceRow),
             ("<", 24.0, false, UiAction::FindPrev),
             (">", 24.0, false, UiAction::FindNext),
@@ -2485,12 +2743,26 @@ impl GuiController {
             dl.rects.push(
                 SceneRect::rounded(
                     r,
-                    if active { chrome.accent.with_alpha(48) } else { chrome.tab_bar_bg },
+                    if active {
+                        chrome.accent.with_alpha(48)
+                    } else {
+                        chrome.tab_bar_bg
+                    },
                     4.0,
                 )
                 .with_border(1.0, if active { chrome.accent } else { chrome.border }),
             );
-            self.push_ui_text(dl, label, r.x + 6.0, r.y + 4.0, 11.5, 600, chrome.text, None, Some(bar));
+            self.push_ui_text(
+                dl,
+                label,
+                r.x + 6.0,
+                r.y + 4.0,
+                11.5,
+                600,
+                chrome.text,
+                None,
+                Some(bar),
+            );
             self.ui_hit_zones.push(UiHitZone {
                 rect: r,
                 action,
@@ -2559,10 +2831,8 @@ impl GuiController {
             bar_w,
             FIND_BAR_H,
         );
-        dl.rects.push(
-            SceneRect::rounded(bar, chrome.panel_bg, 7.0)
-                .with_border(1.0, chrome.accent),
-        );
+        dl.rects
+            .push(SceneRect::rounded(bar, chrome.panel_bg, 7.0).with_border(1.0, chrome.accent));
         self.ui_hit_zones.push(UiHitZone {
             rect: bar,
             action: UiAction::FocusLinkInput,
@@ -2873,9 +3143,8 @@ impl GuiController {
             bar_w,
             64.0,
         );
-        dl.rects.push(
-            SceneRect::rounded(modal, chrome.panel_bg, 8.0).with_border(1.0, chrome.accent),
-        );
+        dl.rects
+            .push(SceneRect::rounded(modal, chrome.panel_bg, 8.0).with_border(1.0, chrome.accent));
         self.ui_hit_zones.push(UiHitZone {
             rect: modal,
             action: UiAction::FocusSimplePromptInput,
@@ -2957,10 +3226,8 @@ impl GuiController {
         let modal_h = (48.0 + visible_rows as f32 * row_h).min((editor_rect.h - 24.0).max(80.0));
         let modal = Rect::new(modal_x, modal_y, modal_w, modal_h);
 
-        dl.rects.push(
-            SceneRect::rounded(modal, chrome.panel_bg, 8.0)
-                .with_border(1.0, chrome.accent),
-        );
+        dl.rects
+            .push(SceneRect::rounded(modal, chrome.panel_bg, 8.0).with_border(1.0, chrome.accent));
         self.ui_hit_zones.push(UiHitZone {
             rect: modal,
             action: focus_action.clone(),
@@ -2968,12 +3235,26 @@ impl GuiController {
         });
 
         let close_w = 24.0;
-        let close_rect = Rect::new(modal.x + modal.w - close_w - 8.0, modal.y + 8.0, close_w, 24.0);
-        dl.rects.push(
-            SceneRect::rounded(close_rect, chrome.tab_bar_bg, 4.0)
-                .with_border(1.0, chrome.border),
+        let close_rect = Rect::new(
+            modal.x + modal.w - close_w - 8.0,
+            modal.y + 8.0,
+            close_w,
+            24.0,
         );
-        self.push_ui_text(dl, "×", close_rect.x + 7.0, close_rect.y + 4.0, 12.0, 600, chrome.text, None, Some(modal));
+        dl.rects.push(
+            SceneRect::rounded(close_rect, chrome.tab_bar_bg, 4.0).with_border(1.0, chrome.border),
+        );
+        self.push_ui_text(
+            dl,
+            "×",
+            close_rect.x + 7.0,
+            close_rect.y + 4.0,
+            12.0,
+            600,
+            chrome.text,
+            None,
+            Some(modal),
+        );
         self.ui_hit_zones.push(UiHitZone {
             rect: close_rect,
             action: close_action,
@@ -2982,7 +3263,8 @@ impl GuiController {
 
         let input_right = if let Some((toggle_label, toggle_on, toggle_action)) = header_toggle {
             let toggle_w = (toggle_label.chars().count() as f32 * 7.2 + 12.0).max(28.0);
-            let toggle_rect = Rect::new(close_rect.x - toggle_w - 6.0, modal.y + 8.0, toggle_w, 24.0);
+            let toggle_rect =
+                Rect::new(close_rect.x - toggle_w - 6.0, modal.y + 8.0, toggle_w, 24.0);
             dl.rects.push(
                 SceneRect::rounded(
                     toggle_rect,
@@ -2993,7 +3275,14 @@ impl GuiController {
                     },
                     4.0,
                 )
-                .with_border(1.0, if toggle_on { chrome.accent } else { chrome.border }),
+                .with_border(
+                    1.0,
+                    if toggle_on {
+                        chrome.accent
+                    } else {
+                        chrome.border
+                    },
+                ),
             );
             self.push_ui_text(
                 dl,
@@ -3022,14 +3311,7 @@ impl GuiController {
             (input_right - (modal.x + 8.0)).max(120.0),
             26.0,
         );
-        self.draw_overlay_text_input(
-            dl,
-            input_rect,
-            query,
-            placeholder,
-            true,
-            focus_action,
-        );
+        self.draw_overlay_text_input(dl, input_rect, query, placeholder, true, focus_action);
 
         if rows.is_empty() {
             self.push_ui_text(
@@ -3082,7 +3364,11 @@ impl GuiController {
                 row_rect.y + 5.0,
                 12.0,
                 if is_sel { 600 } else { 400 },
-                if is_sel { chrome.text } else { chrome.muted_text },
+                if is_sel {
+                    chrome.text
+                } else {
+                    chrome.muted_text
+                },
                 Some((row_rect.w - 20.0 - badge_reserve).max(40.0)),
                 Some(modal),
             );
@@ -3180,15 +3466,47 @@ impl GuiController {
                         .to_string()
                 },
                 vec![
-                    ("Save As...", UiAction::SaveAsActive, chrome.panel_bg, chrome.border, chrome.text),
-                    ("Use Disk", UiAction::ResolveConflictUseTheirs, chrome.panel_bg, chrome.border, chrome.text),
-                    ("Keep Mine", UiAction::ResolveConflictKeepMine, chrome.danger.with_alpha(38), chrome.danger, chrome.text),
-                    ("Auto Merge", UiAction::ResolveConflictAutoMerge, chrome.accent.with_alpha(38), chrome.accent, chrome.text),
+                    (
+                        "Save As...",
+                        UiAction::SaveAsActive,
+                        chrome.panel_bg,
+                        chrome.border,
+                        chrome.text,
+                    ),
+                    (
+                        "Use Disk",
+                        UiAction::ResolveConflictUseTheirs,
+                        chrome.panel_bg,
+                        chrome.border,
+                        chrome.text,
+                    ),
+                    (
+                        "Keep Mine",
+                        UiAction::ResolveConflictKeepMine,
+                        chrome.danger.with_alpha(38),
+                        chrome.danger,
+                        chrome.text,
+                    ),
+                    (
+                        "Auto Merge",
+                        UiAction::ResolveConflictAutoMerge,
+                        chrome.accent.with_alpha(38),
+                        chrome.accent,
+                        chrome.text,
+                    ),
                     (
                         diff_label,
                         UiAction::ToggleConflictDiff,
-                        if self.conflict_diff_open { chrome.accent.with_alpha(55) } else { chrome.panel_bg },
-                        if self.conflict_diff_open { chrome.accent } else { chrome.border },
+                        if self.conflict_diff_open {
+                            chrome.accent.with_alpha(55)
+                        } else {
+                            chrome.panel_bg
+                        },
+                        if self.conflict_diff_open {
+                            chrome.accent
+                        } else {
+                            chrome.border
+                        },
                         chrome.text,
                     ),
                 ],
@@ -3207,9 +3525,27 @@ impl GuiController {
                     "File deleted or moved externally".to_string()
                 },
                 vec![
-                    ("Close Tab", UiAction::ForceCloseActiveMissing, chrome.panel_bg, chrome.border, chrome.text),
-                    ("Save As...", UiAction::SaveAsActive, chrome.panel_bg, chrome.border, chrome.text),
-                    ("Re-save", UiAction::ResaveMissingFile, chrome.danger.with_alpha(38), chrome.danger, chrome.text),
+                    (
+                        "Close Tab",
+                        UiAction::ForceCloseActiveMissing,
+                        chrome.panel_bg,
+                        chrome.border,
+                        chrome.text,
+                    ),
+                    (
+                        "Save As...",
+                        UiAction::SaveAsActive,
+                        chrome.panel_bg,
+                        chrome.border,
+                        chrome.text,
+                    ),
+                    (
+                        "Re-save",
+                        UiAction::ResaveMissingFile,
+                        chrome.danger.with_alpha(38),
+                        chrome.danger,
+                        chrome.text,
+                    ),
                 ],
             ),
             DocBannerKind::WriteError { error } => (
@@ -3217,8 +3553,20 @@ impl GuiController {
                 24,
                 format!("Auto-save write failed: {error}"),
                 vec![
-                    ("Save As...", UiAction::SaveAsActive, chrome.panel_bg, chrome.border, chrome.text),
-                    ("Retry", UiAction::RetrySaveActive, chrome.danger.with_alpha(38), chrome.danger, chrome.text),
+                    (
+                        "Save As...",
+                        UiAction::SaveAsActive,
+                        chrome.panel_bg,
+                        chrome.border,
+                        chrome.text,
+                    ),
+                    (
+                        "Retry",
+                        UiAction::RetrySaveActive,
+                        chrome.danger.with_alpha(38),
+                        chrome.danger,
+                        chrome.text,
+                    ),
                 ],
             ),
             DocBannerKind::RecoveryDegraded => (
@@ -3226,8 +3574,20 @@ impl GuiController {
                 24,
                 RECOVERY_DEGRADED_NOTICE.to_string(),
                 vec![
-                    ("Save As...", UiAction::SaveAsActive, chrome.panel_bg, chrome.border, chrome.text),
-                    ("Save Now", UiAction::SaveActiveNow, chrome.warning.with_alpha(38), chrome.warning, chrome.text),
+                    (
+                        "Save As...",
+                        UiAction::SaveAsActive,
+                        chrome.panel_bg,
+                        chrome.border,
+                        chrome.text,
+                    ),
+                    (
+                        "Save Now",
+                        UiAction::SaveActiveNow,
+                        chrome.warning.with_alpha(38),
+                        chrome.warning,
+                        chrome.text,
+                    ),
                 ],
             ),
             DocBannerKind::ReadOnlyEncoding { candidate } => (
@@ -3250,8 +3610,20 @@ impl GuiController {
                 18,
                 format!("{count} conflict backup copy(s) stored in history for this file"),
                 vec![
-                    ("×", UiAction::DismissConflictBackupNotice, chrome.panel_bg, chrome.border, chrome.muted_text),
-                    ("Clean Backups", UiAction::ClearConflictBackups, chrome.warning.with_alpha(34), chrome.warning, chrome.text),
+                    (
+                        "×",
+                        UiAction::DismissConflictBackupNotice,
+                        chrome.panel_bg,
+                        chrome.border,
+                        chrome.muted_text,
+                    ),
+                    (
+                        "Clean Backups",
+                        UiAction::ClearConflictBackups,
+                        chrome.warning.with_alpha(34),
+                        chrome.warning,
+                        chrome.text,
+                    ),
                 ],
             ),
         };
@@ -3273,16 +3645,7 @@ impl GuiController {
         let mut right_edge = banner.x + banner.w - 10.0;
         for (label, action, bg, border, fg) in buttons {
             right_edge = self.push_action_button(
-                dl,
-                right_edge,
-                btn_y,
-                btn_h,
-                label,
-                bg,
-                border,
-                fg,
-                action,
-                banner,
+                dl, right_edge, btn_y, btn_h, label, bg, border, fg, action, banner,
             );
         }
 
@@ -3302,15 +3665,23 @@ impl GuiController {
 
     fn build_conflict_diff_panel(&mut self, dl: &mut DrawList, diff_rect: Rect) {
         let chrome = self.style.chrome;
-        dl.rects.push(SceneRect::solid(diff_rect, chrome.tab_bar_bg));
+        dl.rects
+            .push(SceneRect::solid(diff_rect, chrome.tab_bar_bg));
         dl.rects.push(SceneRect::solid(
-            Rect::new(diff_rect.x, diff_rect.y + diff_rect.h - 1.0, diff_rect.w, 1.0),
+            Rect::new(
+                diff_rect.x,
+                diff_rect.y + diff_rect.h - 1.0,
+                diff_rect.w,
+                1.0,
+            ),
             chrome.border,
         ));
 
         let header_h = 24.0;
-        dl.rects
-            .push(SceneRect::solid(Rect::new(diff_rect.x, diff_rect.y, diff_rect.w, header_h), chrome.panel_bg));
+        dl.rects.push(SceneRect::solid(
+            Rect::new(diff_rect.x, diff_rect.y, diff_rect.w, header_h),
+            chrome.panel_bg,
+        ));
         dl.rects.push(SceneRect::solid(
             Rect::new(diff_rect.x, diff_rect.y + header_h - 1.0, diff_rect.w, 1.0),
             chrome.border,
@@ -3375,15 +3746,25 @@ impl GuiController {
             return;
         }
         let truncated = lines.len() > max_lines && max_lines > 1;
-        let visible_count = if truncated { max_lines - 1 } else { max_lines.min(lines.len()) };
+        let visible_count = if truncated {
+            max_lines - 1
+        } else {
+            max_lines.min(lines.len())
+        };
 
         for (i, line) in lines.iter().take(visible_count).enumerate() {
             let y = body_y + i as f32 * line_h;
             let (fg, bg_opt, weight) = match line.kind {
-                ConflictDiffKind::SectionHeader => (chrome.accent, Some(chrome.accent.with_alpha(18)), 600),
+                ConflictDiffKind::SectionHeader => {
+                    (chrome.accent, Some(chrome.accent.with_alpha(18)), 600)
+                }
                 ConflictDiffKind::Context => (chrome.muted_text, None, 400),
-                ConflictDiffKind::Mine => (chrome.warning, Some(chrome.warning.with_alpha(24)), 500),
-                ConflictDiffKind::Theirs => (chrome.success, Some(chrome.success.with_alpha(22)), 500),
+                ConflictDiffKind::Mine => {
+                    (chrome.warning, Some(chrome.warning.with_alpha(24)), 500)
+                }
+                ConflictDiffKind::Theirs => {
+                    (chrome.success, Some(chrome.success.with_alpha(22)), 500)
+                }
             };
             if let Some(bg) = bg_opt {
                 dl.rects.push(SceneRect::solid(
@@ -3458,7 +3839,12 @@ impl GuiController {
                 };
                 (format!("{st}{ro}"), col, eol, ime)
             }
-            None => ("No Document".to_string(), chrome.muted_text, String::new(), ""),
+            None => (
+                "No Document".to_string(),
+                chrome.muted_text,
+                String::new(),
+                "",
+            ),
         };
 
         let active_notice = self.active_status_notice();
@@ -3650,12 +4036,13 @@ impl GuiController {
 
     fn cancel_abandoned_tab_ime(&mut self, active_tab_id: Option<u64>) {
         if let ImeTarget::Tab(ime_tab_id) = self.ime_target
-            && (active_tab_id != Some(ime_tab_id) || self.has_focused_text_input()) {
-                if let Some(tab) = self.workbench.tabs.iter_mut().find(|t| t.id == ime_tab_id) {
-                    let _ = tab.edit(|ctx| ctx.ime_cancel());
-                }
-                self.ime_target = ImeTarget::None;
+            && (active_tab_id != Some(ime_tab_id) || self.has_focused_text_input())
+        {
+            if let Some(tab) = self.workbench.tabs.iter_mut().find(|t| t.id == ime_tab_id) {
+                let _ = tab.edit(|ctx| ctx.ime_cancel());
             }
+            self.ime_target = ImeTarget::None;
+        }
     }
 
     /// Handle OS IME lifecycle event (`Enabled`, `Preedit`, `Commit`, `Disabled`).
@@ -3701,9 +4088,7 @@ impl GuiController {
                 }
 
                 let target = match self.ime_target {
-                    ImeTarget::Tab(id)
-                        if self.workbench.tabs.iter().any(|tab| tab.id == id) =>
-                    {
+                    ImeTarget::Tab(id) if self.workbench.tabs.iter().any(|tab| tab.id == id) => {
                         ImeTarget::Tab(id)
                     }
                     t if self.overlay_target_still_open(t) => t,
@@ -3773,9 +4158,10 @@ impl GuiController {
                 let prev = self.ime_target;
                 self.ime_target = ImeTarget::None;
                 if let ImeTarget::Tab(target_id) = prev
-                    && let Some(tab) = self.workbench.tabs.iter_mut().find(|t| t.id == target_id) {
-                        let _ = tab.edit(|ctx| ctx.ime_cancel());
-                    }
+                    && let Some(tab) = self.workbench.tabs.iter_mut().find(|t| t.id == target_id)
+                {
+                    let _ = tab.edit(|ctx| ctx.ime_cancel());
+                }
                 if let Some(tab) = self.workbench.active_tab_mut() {
                     let _ = tab.edit(|ctx| ctx.ime_cancel());
                 }
@@ -3989,169 +4375,171 @@ impl GuiController {
         }
 
         // Primary shortcuts
-        if primary && !alt
-            && let Key::Character(ch) = logical_key {
-                let lower = ch.to_ascii_lowercase();
-                match lower.as_str() {
-                    "s" if shift => {
-                        self.save_as_active_tab();
-                        return true;
-                    }
-                    "s" => {
-                        self.save_active_tab();
-                        return true;
-                    }
-                    "o" if shift => {
-                        self.open_folder_dialog();
-                        return true;
-                    }
-                    "o" => {
-                        self.open_file_dialog();
-                        return true;
-                    }
-                    "p" if shift => {
-                        self.open_command_palette();
-                        return true;
-                    }
-                    "p" => {
-                        self.open_quick_open();
-                        return true;
-                    }
-                    "k" if shift && !cfg!(target_os = "macos") => {
-                        self.insert_or_pick_code_block();
-                        return true;
-                    }
-                    "k" => {
-                        self.open_link_prompt();
-                        return true;
-                    }
-                    "l" if shift => {
-                        self.execute_ui_action(UiAction::ToggleCodeLineNumbers);
-                        return true;
-                    }
-                    "n" => {
-                        self.close_confirm_armed = false;
-                        self.close_transient_prompts();
-                        self.flush_active_tab_before_switch();
-                        self.workbench.new_document();
-                        self.find_focused = false;
-                        self.pending_scroll_ensure_caret = true;
-                        self.set_notice("New Document");
-                        return true;
-                    }
-                    "w" => {
-                        self.close_confirm_armed = false;
-                        if let Some(id) = self.workbench.active_tab().map(|t| t.id) {
-                            self.close_tab_checked(id, "Unsaved changes — save first or keep open");
-                        }
-                        return true;
-                    }
-                    "z" => {
-                        self.close_confirm_armed = false;
-                        if let Some(tab) = self.workbench.active_tab_mut() {
-                            let act = if shift {
-                                EditorAction::Redo
-                            } else {
-                                EditorAction::Undo
-                            };
-                            let _ = tab.dispatch(act);
-                            self.pending_scroll_ensure_caret = true;
-                        }
-                        return true;
-                    }
-                    "b" => {
-                        self.dispatch_editor(EditorAction::ToggleBold);
-                        return true;
-                    }
-                    "i" => {
-                        self.dispatch_editor(EditorAction::ToggleItalic);
-                        return true;
-                    }
-                    "e" => {
-                        self.dispatch_editor(EditorAction::ToggleInlineCode);
-                        return true;
-                    }
-                    "x" if shift => {
-                        self.dispatch_editor(EditorAction::ToggleStrikethrough);
-                        return true;
-                    }
-                    "x" => {
-                        self.copy_selection(true);
-                        return true;
-                    }
-                    "c" => {
-                        self.copy_selection(false);
-                        return true;
-                    }
-                    "v" => {
-                        self.paste_clipboard();
-                        return true;
-                    }
-                    "a" => {
-                        if !self.has_focused_text_input() {
-                            self.dispatch_editor(EditorAction::SelectAll);
-                        }
-                        return true;
-                    }
-                    "f" if shift => {
-                        self.open_global_search();
-                        return true;
-                    }
-                    "f" => {
-                        self.open_find_bar(false);
-                        return true;
-                    }
-                    "h" if !shift => {
-                        self.open_find_bar(true);
-                        return true;
-                    }
-                    "/" => {
-                        self.dispatch_editor(EditorAction::ToggleSourceMode);
-                        self.preferred_caret_x = None;
-                        return true;
-                    }
-                    "\\" => {
-                        self.workbench.config.sidebar_visible = !self.workbench.config.sidebar_visible;
-                        self.persist_user_config();
-                        return true;
-                    }
-                    "t" if shift => {
-                        self.cycle_theme();
-                        return true;
-                    }
-                    "t" => {
-                        self.open_insert_table_prompt();
-                        return true;
-                    }
-                    "=" | "+" => {
-                        self.workbench.config.zoom_in();
-                        self.refresh_style();
-                        self.persist_user_config();
-                        self.set_notice(format!("Zoom {}%", self.workbench.config.zoom_percent));
-                        return true;
-                    }
-                    "-" => {
-                        self.workbench.config.zoom_out();
-                        self.refresh_style();
-                        self.persist_user_config();
-                        self.set_notice(format!("Zoom {}%", self.workbench.config.zoom_percent));
-                        return true;
-                    }
-                    "0" => {
-                        self.workbench.config.reset_zoom();
-                        self.refresh_style();
-                        self.persist_user_config();
-                        self.set_notice("Zoom 100%");
-                        return true;
-                    }
-                    "1" | "2" | "3" | "4" | "5" | "6" => {
-                        let lvl = lower.parse::<u8>().unwrap_or(1);
-                        self.dispatch_editor(EditorAction::SetHeadingLevel(lvl));
-                        return true;
-                    }
-                    _ => {}
+        if primary
+            && !alt
+            && let Key::Character(ch) = logical_key
+        {
+            let lower = ch.to_ascii_lowercase();
+            match lower.as_str() {
+                "s" if shift => {
+                    self.save_as_active_tab();
+                    return true;
                 }
+                "s" => {
+                    self.save_active_tab();
+                    return true;
+                }
+                "o" if shift => {
+                    self.open_folder_dialog();
+                    return true;
+                }
+                "o" => {
+                    self.open_file_dialog();
+                    return true;
+                }
+                "p" if shift => {
+                    self.open_command_palette();
+                    return true;
+                }
+                "p" => {
+                    self.open_quick_open();
+                    return true;
+                }
+                "k" if shift && !cfg!(target_os = "macos") => {
+                    self.insert_or_pick_code_block();
+                    return true;
+                }
+                "k" => {
+                    self.open_link_prompt();
+                    return true;
+                }
+                "l" if shift => {
+                    self.execute_ui_action(UiAction::ToggleCodeLineNumbers);
+                    return true;
+                }
+                "n" => {
+                    self.close_confirm_armed = false;
+                    self.close_transient_prompts();
+                    self.flush_active_tab_before_switch();
+                    self.workbench.new_document();
+                    self.find_focused = false;
+                    self.pending_scroll_ensure_caret = true;
+                    self.set_notice("New Document");
+                    return true;
+                }
+                "w" => {
+                    self.close_confirm_armed = false;
+                    if let Some(id) = self.workbench.active_tab().map(|t| t.id) {
+                        self.close_tab_checked(id, "Unsaved changes — save first or keep open");
+                    }
+                    return true;
+                }
+                "z" => {
+                    self.close_confirm_armed = false;
+                    if let Some(tab) = self.workbench.active_tab_mut() {
+                        let act = if shift {
+                            EditorAction::Redo
+                        } else {
+                            EditorAction::Undo
+                        };
+                        let _ = tab.dispatch(act);
+                        self.pending_scroll_ensure_caret = true;
+                    }
+                    return true;
+                }
+                "b" => {
+                    self.dispatch_editor(EditorAction::ToggleBold);
+                    return true;
+                }
+                "i" => {
+                    self.dispatch_editor(EditorAction::ToggleItalic);
+                    return true;
+                }
+                "e" => {
+                    self.dispatch_editor(EditorAction::ToggleInlineCode);
+                    return true;
+                }
+                "x" if shift => {
+                    self.dispatch_editor(EditorAction::ToggleStrikethrough);
+                    return true;
+                }
+                "x" => {
+                    self.copy_selection(true);
+                    return true;
+                }
+                "c" => {
+                    self.copy_selection(false);
+                    return true;
+                }
+                "v" => {
+                    self.paste_clipboard();
+                    return true;
+                }
+                "a" => {
+                    if !self.has_focused_text_input() {
+                        self.dispatch_editor(EditorAction::SelectAll);
+                    }
+                    return true;
+                }
+                "f" if shift => {
+                    self.open_global_search();
+                    return true;
+                }
+                "f" => {
+                    self.open_find_bar(false);
+                    return true;
+                }
+                "h" if !shift => {
+                    self.open_find_bar(true);
+                    return true;
+                }
+                "/" => {
+                    self.dispatch_editor(EditorAction::ToggleSourceMode);
+                    self.preferred_caret_x = None;
+                    return true;
+                }
+                "\\" => {
+                    self.workbench.config.sidebar_visible = !self.workbench.config.sidebar_visible;
+                    self.persist_user_config();
+                    return true;
+                }
+                "t" if shift => {
+                    self.cycle_theme();
+                    return true;
+                }
+                "t" => {
+                    self.open_insert_table_prompt();
+                    return true;
+                }
+                "=" | "+" => {
+                    self.workbench.config.zoom_in();
+                    self.refresh_style();
+                    self.persist_user_config();
+                    self.set_notice(format!("Zoom {}%", self.workbench.config.zoom_percent));
+                    return true;
+                }
+                "-" => {
+                    self.workbench.config.zoom_out();
+                    self.refresh_style();
+                    self.persist_user_config();
+                    self.set_notice(format!("Zoom {}%", self.workbench.config.zoom_percent));
+                    return true;
+                }
+                "0" => {
+                    self.workbench.config.reset_zoom();
+                    self.refresh_style();
+                    self.persist_user_config();
+                    self.set_notice("Zoom 100%");
+                    return true;
+                }
+                "1" | "2" | "3" | "4" | "5" | "6" => {
+                    let lvl = lower.parse::<u8>().unwrap_or(1);
+                    self.dispatch_editor(EditorAction::SetHeadingLevel(lvl));
+                    return true;
+                }
+                _ => {}
             }
+        }
 
         // Focused overlay / modal input handling (Quick Open -> Link Prompt -> Find bar)
         if self.handle_overlay_key_press(logical_key, text, primary, shift, mods.control_key()) {
@@ -4238,21 +4626,23 @@ impl GuiController {
                 true
             }
             _ => {
-                if !primary && !mods.control_key()
-                    && let Some(txt) = text {
-                        let clean: String = txt.chars().filter(|c| !c.is_control()).collect();
-                        if !clean.is_empty() {
-                            self.preferred_caret_x = None;
-                            if clean.chars().count() == 1 {
-                                self.dispatch_editor(EditorAction::InsertChar(
-                                    clean.chars().next().expect("1 char"),
-                                ));
-                            } else {
-                                self.dispatch_editor(EditorAction::InsertText(clean));
-                            }
-                            return true;
+                if !primary
+                    && !mods.control_key()
+                    && let Some(txt) = text
+                {
+                    let clean: String = txt.chars().filter(|c| !c.is_control()).collect();
+                    if !clean.is_empty() {
+                        self.preferred_caret_x = None;
+                        if clean.chars().count() == 1 {
+                            self.dispatch_editor(EditorAction::InsertChar(
+                                clean.chars().next().expect("1 char"),
+                            ));
+                        } else {
+                            self.dispatch_editor(EditorAction::InsertText(clean));
                         }
+                        return true;
                     }
+                }
                 false
             }
         }
@@ -4348,7 +4738,8 @@ impl GuiController {
         if let Some(kind) = self.inspect_modal {
             if kind == InspectModalKind::RecoveryBackups
                 && (matches!(logical_key, Key::Named(NamedKey::Delete))
-                    || ((primary || ctrl) && matches!(logical_key, Key::Named(NamedKey::Backspace))))
+                    || ((primary || ctrl)
+                        && matches!(logical_key, Key::Named(NamedKey::Backspace))))
             {
                 self.delete_selected_recovery_backup();
                 return true;
@@ -4529,12 +4920,7 @@ impl GuiController {
     }
 
     /// Handle left mouse press with keyboard modifier state (supports `Cmd/Ctrl + Click` link navigation, PRD V-06).
-    pub fn handle_pointer_down_with_mods(
-        &mut self,
-        x: f32,
-        y: f32,
-        mods: ModifiersState,
-    ) -> bool {
+    pub fn handle_pointer_down_with_mods(&mut self, x: f32, y: f32, mods: ModifiersState) -> bool {
         self.reset_blink();
         self.pointer_pos = (x, y);
 
@@ -4602,13 +4988,22 @@ impl GuiController {
         let mut changed = false;
         if self.dragging_selection
             && let Some(EditorHitTarget::Text(offset)) = self.shaper.hit_test(x, y)
-                && let Some(tab) = self.workbench.active_tab_mut() {
-                    let anchor = tab.session.buffer.snap_out_of_crlf(tab.view.selection.anchor);
-                    let safe_offset = tab.session.buffer.snap_out_of_crlf(offset);
-                    let _ = tab.edit(|ctx| ctx.set_selection(anchor, safe_offset));
-                    changed = true;
-                }
-        let icon = if let Some(zone) = self.ui_hit_zones.iter().rev().find(|z| z.rect.contains(x, y)) {
+            && let Some(tab) = self.workbench.active_tab_mut()
+        {
+            let anchor = tab
+                .session
+                .buffer
+                .snap_out_of_crlf(tab.view.selection.anchor);
+            let safe_offset = tab.session.buffer.snap_out_of_crlf(offset);
+            let _ = tab.edit(|ctx| ctx.set_selection(anchor, safe_offset));
+            changed = true;
+        }
+        let icon = if let Some(zone) = self
+            .ui_hit_zones
+            .iter()
+            .rev()
+            .find(|z| z.rect.contains(x, y))
+        {
             if zone.pointer_cursor {
                 CursorIcon::Pointer
             } else {
@@ -4718,12 +5113,13 @@ impl GuiController {
                     .as_ref()
                     .and_then(|m| m.outline.get(idx).cloned());
                 if let Some(item) = item_opt
-                    && let Some(tab) = self.workbench.active_tab_mut() {
-                        tab.jump_to_outline_item(&item);
-                        self.pending_scroll_ensure_caret = true;
-                        self.find_focused = false;
-                        self.close_transient_prompts();
-                    }
+                    && let Some(tab) = self.workbench.active_tab_mut()
+                {
+                    tab.jump_to_outline_item(&item);
+                    self.pending_scroll_ensure_caret = true;
+                    self.find_focused = false;
+                    self.close_transient_prompts();
+                }
                 true
             }
             UiAction::OpenWorkspaceFile(path) => {
@@ -4775,10 +5171,7 @@ impl GuiController {
                             self.ime_target = ImeTarget::None;
                             self.preferred_caret_x = None;
                             self.pending_scroll_ensure_caret = true;
-                            let name = path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("file");
+                            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
                             self.set_notice(format!("Opened {name}"));
                         }
                         Err(e) => self.set_notice(format!("Open failed: {e}")),
@@ -4920,7 +5313,9 @@ impl GuiController {
                         }
                         Ok(false) => {}
                         Err(e) => {
-                            self.set_notice(format!("Cannot close tab: {e} — please Save As first"));
+                            self.set_notice(format!(
+                                "Cannot close tab: {e} — please Save As first"
+                            ));
                         }
                     }
                 }
@@ -5695,7 +6090,11 @@ impl GuiController {
         match self.clipboard.write(&payload.markdown, Some(&payload.html)) {
             Ok(()) => {
                 self.clipboard_text = payload.markdown;
-                self.set_notice(if cut { "Cut selection" } else { "Copied Markdown" });
+                self.set_notice(if cut {
+                    "Cut selection"
+                } else {
+                    "Copied Markdown"
+                });
             }
             Err(err) => {
                 self.set_notice(format!("Clipboard error: {err}"));
@@ -5714,9 +6113,8 @@ impl GuiController {
             .html
             .as_deref()
             .is_some_and(|h| !h.trim().is_empty());
-        let has_image = !self.has_focused_text_input()
-            && plain.is_empty()
-            && content.image_png.is_some();
+        let has_image =
+            !self.has_focused_text_input() && plain.is_empty() && content.image_png.is_some();
         if plain.is_empty() && !has_html && !has_image {
             return;
         }
@@ -5724,10 +6122,12 @@ impl GuiController {
             self.close_confirm_armed = false;
             let active_id = self.workbench.active_tab().map(|t| t.id);
             self.cancel_abandoned_tab_ime(active_id);
-            match self
-                .workbench
-                .paste_image_bytes_into_active(png, "pasted-image", "png", Some("image"))
-            {
+            match self.workbench.paste_image_bytes_into_active(
+                png,
+                "pasted-image",
+                "png",
+                Some("image"),
+            ) {
                 Ok(dest) => {
                     self.pending_scroll_ensure_caret = true;
                     let name = dest
@@ -5822,10 +6222,7 @@ impl GuiController {
                 self.ime_target = ImeTarget::None;
                 self.preferred_caret_x = None;
                 self.pending_scroll_ensure_caret = true;
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("file");
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
                 self.set_notice(format!("Opened {name}"));
             }
             Err(e) => self.set_notice(format!("Open failed: {e}")),
@@ -6215,7 +6612,9 @@ impl GuiController {
             PaletteCommandId::FileOpenFolder => self.open_folder_dialog(),
             PaletteCommandId::FileSave => self.save_active_tab(),
             PaletteCommandId::FileSaveAs => self.save_as_active_tab(),
-            PaletteCommandId::ExportHtmlSafe => self.export_active_html_dialog(HtmlExportMode::Safe),
+            PaletteCommandId::ExportHtmlSafe => {
+                self.export_active_html_dialog(HtmlExportMode::Safe)
+            }
             PaletteCommandId::ExportHtmlRaw => self.export_active_html_dialog(HtmlExportMode::Raw),
             PaletteCommandId::ManageRecoveryBackups => {
                 self.open_inspect_modal(InspectModalKind::RecoveryBackups);
@@ -6396,24 +6795,26 @@ impl GuiController {
 
     fn save_utf8_copy_dialog(&mut self) {
         self.close_confirm_armed = false;
-        let Some((tab_id, orig_path, content, default_name)) = self.workbench.active_tab().map(|t| {
-            let p = t.session.path.clone();
-            let default_name = match p.as_deref() {
-                Some(path) => {
-                    let stem = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("Untitled");
-                    match path.extension().and_then(|e| e.to_str()) {
-                        Some(ext) if !ext.is_empty() => format!("{stem}-utf8.{ext}"),
-                        _ => format!("{stem}-utf8.md"),
+        let Some((tab_id, orig_path, content, default_name)) =
+            self.workbench.active_tab().map(|t| {
+                let p = t.session.path.clone();
+                let default_name = match p.as_deref() {
+                    Some(path) => {
+                        let stem = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("Untitled");
+                        match path.extension().and_then(|e| e.to_str()) {
+                            Some(ext) if !ext.is_empty() => format!("{stem}-utf8.{ext}"),
+                            _ => format!("{stem}-utf8.md"),
+                        }
                     }
-                }
-                None => "Untitled-utf8.md".to_string(),
-            };
-            (t.id, p, t.session.buffer.to_string(), default_name)
-        }) else {
+                    None => "Untitled-utf8.md".to_string(),
+                };
+                (t.id, p, t.session.buffer.to_string(), default_name)
+            })
+        else {
             return;
         };
         let Some(dest) = self
@@ -6426,7 +6827,9 @@ impl GuiController {
         if let Some(orig) = orig_path.as_deref()
             && paths_share_underlying_file(orig, &dest)
         {
-            self.set_notice("Choose a new path — cannot overwrite original non-UTF-8 file directly");
+            self.set_notice(
+                "Choose a new path — cannot overwrite original non-UTF-8 file directly",
+            );
             return;
         }
         if let Some((other_idx, _, other_title)) =
@@ -6558,7 +6961,10 @@ impl GuiController {
             self.dispatch_global_search_worker();
             changed = true;
         }
-        let outcome = self.global_search_worker.as_ref().map(|w| w.drain_responses());
+        let outcome = self
+            .global_search_worker
+            .as_ref()
+            .map(|w| w.drain_responses());
         if let Some(outcome) = outcome {
             for resp in outcome.responses {
                 if self.global_search_open && resp.req_id == self.global_search_req_id {
@@ -6610,10 +7016,9 @@ impl GuiController {
                 self.ime_target = ImeTarget::None;
                 self.preferred_caret_x = None;
                 if let Some(tab) = self.workbench.active_tab_mut() {
-                    let safe = tab
-                        .session
-                        .buffer
-                        .snap_out_of_crlf(picked.line_byte_offset.min(tab.session.buffer.len_bytes()));
+                    let safe = tab.session.buffer.snap_out_of_crlf(
+                        picked.line_byte_offset.min(tab.session.buffer.len_bytes()),
+                    );
                     let _ = tab.edit(|ctx| ctx.set_caret(safe));
                 }
                 self.pending_scroll_ensure_caret = true;
@@ -6644,9 +7049,11 @@ impl GuiController {
     }
 
     fn target_for_workspace_entry(&self) -> Option<PathBuf> {
-        self.selected_workspace_path
-            .clone()
-            .or_else(|| self.workbench.active_tab().and_then(|t| t.session.path.clone()))
+        self.selected_workspace_path.clone().or_else(|| {
+            self.workbench
+                .active_tab()
+                .and_then(|t| t.session.path.clone())
+        })
     }
 
     fn open_new_file_prompt(&mut self) {
@@ -6779,7 +7186,9 @@ impl GuiController {
                                     self.pending_scroll_ensure_caret = true;
                                     self.set_notice(format!("Created {final_name}"));
                                 }
-                                Err(e) => self.set_notice(format!("Created {final_name} (open err: {e})")),
+                                Err(e) => {
+                                    self.set_notice(format!("Created {final_name} (open err: {e})"))
+                                }
                             }
                         }
                         Err(e) => self.set_notice(format!("Create failed: {e}")),
@@ -6822,7 +7231,11 @@ impl GuiController {
         self.workbench.config.focus_mode = !self.workbench.config.focus_mode;
         self.persist_user_config();
         let on = self.workbench.config.focus_mode;
-        self.set_notice(if on { "Focus Mode: ON" } else { "Focus Mode: OFF" });
+        self.set_notice(if on {
+            "Focus Mode: ON"
+        } else {
+            "Focus Mode: OFF"
+        });
     }
 
     pub fn toggle_typewriter_mode(&mut self) {
@@ -6843,7 +7256,11 @@ impl GuiController {
         self.workbench.config.fullscreen = !self.workbench.config.fullscreen;
         self.persist_user_config();
         let on = self.workbench.config.fullscreen;
-        self.set_notice(if on { "Fullscreen: ON" } else { "Fullscreen: OFF" });
+        self.set_notice(if on {
+            "Fullscreen: ON"
+        } else {
+            "Fullscreen: OFF"
+        });
     }
 
     /// Insert a fenced code block, or open the Code Language Picker if the caret is already inside one.
@@ -6976,10 +7393,7 @@ impl GuiController {
             match self.workbench.paste_image_into_active(path, alt) {
                 Ok(dest) => {
                     self.pending_scroll_ensure_caret = true;
-                    let name = dest
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("image");
+                    let name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("image");
                     self.set_notice(format!("Inserted image -> {name}"));
                 }
                 Err(e) => self.set_notice(format!("Image drop error: {e}")),
@@ -7316,10 +7730,11 @@ impl GuiController {
         let query = self.find_query.clone();
         let opts = self.find_options;
         if let Some(tab) = self.workbench.active_tab_mut()
-            && let Ok(Some(m)) = tab.find_prev(&query, true, opts) {
-                self.active_find_range = Some(m.range);
-                self.pending_scroll_ensure_caret = true;
-            }
+            && let Ok(Some(m)) = tab.find_prev(&query, true, opts)
+        {
+            self.active_find_range = Some(m.range);
+            self.pending_scroll_ensure_caret = true;
+        }
     }
 }
 
@@ -7556,23 +7971,21 @@ impl ApplicationHandler for VellmarkApp {
                 state,
                 button: MouseButton::Left,
                 ..
-            } => {
-                match state {
-                    ElementState::Pressed => {
-                        let (px, py) = self.controller.pointer_pos;
-                        if self
-                            .controller
-                            .handle_pointer_down_with_mods(px, py, self.modifiers)
-                        {
-                            self.sync_window_fullscreen();
-                            self.request_redraw();
-                        }
-                    }
-                    ElementState::Released => {
-                        self.controller.handle_pointer_up();
+            } => match state {
+                ElementState::Pressed => {
+                    let (px, py) = self.controller.pointer_pos;
+                    if self
+                        .controller
+                        .handle_pointer_down_with_mods(px, py, self.modifiers)
+                    {
+                        self.sync_window_fullscreen();
+                        self.request_redraw();
                     }
                 }
-            }
+                ElementState::Released => {
+                    self.controller.handle_pointer_up();
+                }
+            },
             WindowEvent::CursorMoved {
                 position: PhysicalPosition { x, y },
                 ..
@@ -7631,7 +8044,9 @@ impl ApplicationHandler for VellmarkApp {
         if self.controller.poll_background_maintenance() {
             self.request_redraw();
         }
-        self.controller.workbench.maybe_maintain_recovery_storage_async();
+        self.controller
+            .workbench
+            .maybe_maintain_recovery_storage_async();
         let now = Instant::now();
         if self.controller.tick_runtime_at(now) {
             self.request_redraw();
@@ -7703,7 +8118,11 @@ fn reserve_unique_untitled_path(dir: &Path, tab_id: u64) -> std::io::Result<Path
         if fs::symlink_metadata(&candidate).is_ok() {
             continue;
         }
-        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
             Ok(_) => return Ok(candidate),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -7844,9 +8263,7 @@ fn link_destination_at_offset(tab: &DocumentTab, offset: usize) -> Option<String
     tab.with_incremental_blocks(|blocks| {
         let block = blocks.iter().find(|b| b.range.contains_inclusive(offset))?;
         let span = block.inlines.iter().find(|s| {
-            s.kind == InlineKind::Link
-                && offset >= s.full_range.start
-                && offset < s.full_range.end
+            s.kind == InlineKind::Link && offset >= s.full_range.start && offset < s.full_range.end
         })?;
         let close = source.get(span.close_marker.start..span.close_marker.end)?;
         let inner = close.strip_prefix("](")?.strip_suffix(')')?;
@@ -7934,13 +8351,25 @@ mod tests {
     #[test]
     fn test_ime_lifecycle_preserves_buffer_until_commit_and_reports_cursor_area() {
         let mut gui = controller_with_doc("## Title\nHello world");
-        let caret = gui.workbench.active_tab().unwrap().session.buffer.len_bytes();
+        let caret = gui
+            .workbench
+            .active_tab()
+            .unwrap()
+            .session
+            .buffer
+            .len_bytes();
         gui.workbench
             .active_tab_mut()
             .unwrap()
             .edit(|ctx| ctx.set_caret(caret))
             .unwrap();
-        let rev_before = gui.workbench.active_tab().unwrap().session.buffer.revision();
+        let rev_before = gui
+            .workbench
+            .active_tab()
+            .unwrap()
+            .session
+            .buffer
+            .revision();
 
         gui.handle_ime_event(&Ime::Enabled);
         gui.handle_ime_event(&Ime::Preedit("zhongwen".to_string(), Some((8, 8))));
@@ -7989,7 +8418,13 @@ mod tests {
             .rect;
         assert!(gui.handle_pointer_down(jump_rect.x + 5.0, jump_rect.y + 5.0));
         let caret = gui.workbench.active_tab().unwrap().view.selection.head;
-        let doc = gui.workbench.active_tab().unwrap().session.buffer.to_string();
+        let doc = gui
+            .workbench
+            .active_tab()
+            .unwrap()
+            .session
+            .buffer
+            .to_string();
         assert!(doc[caret..].starts_with("Second Section"));
     }
 
@@ -8021,15 +8456,24 @@ mod tests {
         // Switch back to TabA and start composing
         assert!(gui.execute_ui_action(UiAction::SelectTab(0)));
         gui.handle_ime_event(&Ime::Preedit("zhongwen".to_string(), Some((8, 8))));
-        assert_eq!(gui.workbench.tabs[0].view.ime_preedit.as_deref(), Some("zhongwen"));
+        assert_eq!(
+            gui.workbench.tabs[0].view.ime_preedit.as_deref(),
+            Some("zhongwen")
+        );
 
         // Switch to TabB before IME commits
         assert!(gui.execute_ui_action(UiAction::SelectTab(1)));
-        assert_eq!(gui.workbench.active_tab().unwrap().id, gui.workbench.tabs[1].id);
+        assert_eq!(
+            gui.workbench.active_tab().unwrap().id,
+            gui.workbench.tabs[1].id
+        );
         gui.handle_ime_event(&Ime::Preedit(String::new(), None));
         gui.handle_ime_event(&Ime::Commit("中文".to_string()));
 
-        assert_eq!(gui.workbench.tabs[0].session.buffer.to_string(), "TabA 中文");
+        assert_eq!(
+            gui.workbench.tabs[0].session.buffer.to_string(),
+            "TabA 中文"
+        );
         assert_eq!(
             gui.workbench.tabs[1].session.buffer.to_string(),
             "TabB untouched"
@@ -8059,7 +8503,12 @@ mod tests {
         gui.handle_ime_event(&Ime::Commit("你".to_string()));
 
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "A你B"
         );
     }
@@ -8119,7 +8568,15 @@ mod tests {
         let mut gui = GuiController::with_clipboard(wb, Box::new(SharedClip(shared_clip.clone())));
 
         gui.copy_selection(true);
-        assert_eq!(gui.workbench.active_tab().unwrap().session.buffer.to_string(), "hello");
+        assert_eq!(
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
+            "hello"
+        );
         assert_eq!(shared_clip.get_content().text.as_deref(), Some("preserved"));
     }
 
@@ -8151,11 +8608,13 @@ mod tests {
         let mut gui = GuiController::with_clipboard(wb, Box::new(SharedClip(shared_clip.clone())));
         gui.copy_selection(false);
         assert_eq!(shared_clip.get_content().text.as_deref(), Some("**hello**"));
-        assert!(shared_clip
-            .get_content()
-            .html
-            .as_deref()
-            .is_some_and(|h| h.contains("<strong>hello</strong>")));
+        assert!(
+            shared_clip
+                .get_content()
+                .html
+                .as_deref()
+                .is_some_and(|h| h.contains("<strong>hello</strong>"))
+        );
 
         // External app puts rich HTML into clipboard -> Paste converts HTML to Markdown!
         shared_clip.set_content(ClipboardContent {
@@ -8163,21 +8622,28 @@ mod tests {
             html: Some("<h2>External Heading</h2>".to_string()),
             image_png: None,
         });
-        let end = gui.workbench.active_tab().unwrap().session.buffer.len_bytes();
+        let end = gui
+            .workbench
+            .active_tab()
+            .unwrap()
+            .session
+            .buffer
+            .len_bytes();
         gui.workbench
             .active_tab_mut()
             .unwrap()
             .edit(|ctx| ctx.set_caret(end))
             .unwrap();
         gui.paste_clipboard();
-        assert!(gui
-            .workbench
-            .active_tab()
-            .unwrap()
-            .session
-            .buffer
-            .to_string()
-            .contains("## External Heading"));
+        assert!(
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string()
+                .contains("## External Heading")
+        );
     }
 
     #[test]
@@ -8211,7 +8677,10 @@ mod tests {
             .clone()
             .expect("path assigned");
         assert_ne!(saved_path, existing);
-        assert_eq!(fs::read_to_string(&existing).unwrap(), "previous session note");
+        assert_eq!(
+            fs::read_to_string(&existing).unwrap(),
+            "previous session note"
+        );
         assert_eq!(fs::read_to_string(&saved_path).unwrap(), "new session note");
 
         let _ = fs::remove_dir_all(&dir);
@@ -8289,11 +8758,17 @@ mod tests {
         // Continuing non-empty preedit must stay bound to TabA until commit or explicit cancel
         gui.handle_ime_event(&Ime::Preedit("nihao".to_string(), Some((5, 5))));
         assert_eq!(gui.ime_target, ImeTarget::Tab(tab_a_id));
-        assert_eq!(gui.workbench.tabs[0].view.ime_preedit.as_deref(), Some("nihao"));
+        assert_eq!(
+            gui.workbench.tabs[0].view.ime_preedit.as_deref(),
+            Some("nihao")
+        );
         assert!(gui.workbench.tabs[1].view.ime_preedit.is_none());
 
         gui.handle_ime_event(&Ime::Commit("你好".to_string()));
-        assert_eq!(gui.workbench.tabs[0].session.buffer.to_string(), "TabA 你好");
+        assert_eq!(
+            gui.workbench.tabs[0].session.buffer.to_string(),
+            "TabA 你好"
+        );
         assert_eq!(
             gui.workbench.tabs[1].session.buffer.to_string(),
             "TabB untouched"
@@ -8339,7 +8814,12 @@ mod tests {
 
         gui.copy_selection(true);
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "hello world"
         );
         assert_eq!(
@@ -8348,10 +8828,11 @@ mod tests {
         );
         assert_eq!(gui.clipboard_text, "prior");
         assert_eq!(shared_clip.get_content().text.as_deref(), Some("prior"));
-        assert!(gui
-            .status_notice
-            .as_ref()
-            .is_some_and(|(n, _)| n.contains("Clipboard error")));
+        assert!(
+            gui.status_notice
+                .as_ref()
+                .is_some_and(|(n, _)| n.contains("Clipboard error"))
+        );
 
         gui.find_open = true;
         gui.find_focused = true;
@@ -8359,10 +8840,11 @@ mod tests {
         gui.copy_selection(true);
         assert_eq!(gui.find_query, "world");
         assert_eq!(gui.clipboard_text, "prior");
-        assert!(gui
-            .status_notice
-            .as_ref()
-            .is_some_and(|(n, _)| n.contains("Clipboard error")));
+        assert!(
+            gui.status_notice
+                .as_ref()
+                .is_some_and(|(n, _)| n.contains("Clipboard error"))
+        );
     }
 
     #[test]
@@ -8492,10 +8974,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(!gui.workbench.protected_snapshots_exceed_limit());
-        assert!(!gui
-            .active_status_notice()
-            .as_deref()
-            .is_some_and(|n| n.contains(PROTECTED_SNAPSHOT_LIMIT_NOTICE)));
+        assert!(
+            !gui.active_status_notice()
+                .as_deref()
+                .is_some_and(|n| n.contains(PROTECTED_SNAPSHOT_LIMIT_NOTICE))
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -8563,20 +9046,34 @@ mod tests {
         );
 
         // Toggle Diff off via banner button, then back on
-        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ToggleConflictDiff)));
+        assert!(click_hit_action(&mut gui, |a| matches!(
+            a,
+            UiAction::ToggleConflictDiff
+        )));
         assert!(!gui.conflict_diff_open);
-        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ToggleConflictDiff)));
+        assert!(click_hit_action(&mut gui, |a| matches!(
+            a,
+            UiAction::ToggleConflictDiff
+        )));
         assert!(gui.conflict_diff_open);
 
         // Click Auto Merge -> resolves disjoint changes, exits Conflict, leaves merged content
-        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ResolveConflictAutoMerge)));
+        assert!(click_hit_action(&mut gui, |a| matches!(
+            a,
+            UiAction::ResolveConflictAutoMerge
+        )));
         assert!(!gui.conflict_diff_open);
         assert_eq!(
             gui.workbench.active_tab().unwrap().session.state,
             DocState::Dirty
         );
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "mine1\nline2\ndisk3\n"
         );
         gui.save_active_tab();
@@ -8594,19 +9091,30 @@ mod tests {
         fs::write(&doc, "mine1\ndisk2\ndisk3\n").unwrap();
         assert!(gui.handle_focus_gained());
         gui.conflict_diff_open = false;
-        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ResolveConflictAutoMerge)));
+        assert!(click_hit_action(&mut gui, |a| matches!(
+            a,
+            UiAction::ResolveConflictAutoMerge
+        )));
         assert!(gui.conflict_diff_open);
         assert_eq!(
             gui.workbench.active_tab().unwrap().session.state,
             DocState::Conflict
         );
-        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ResolveConflictUseTheirs)));
+        assert!(click_hit_action(&mut gui, |a| matches!(
+            a,
+            UiAction::ResolveConflictUseTheirs
+        )));
         assert_eq!(
             gui.workbench.active_tab().unwrap().session.state,
             DocState::Clean
         );
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "mine1\ndisk2\ndisk3\n"
         );
 
@@ -8617,7 +9125,10 @@ mod tests {
         }
         fs::write(&doc, "external-v2\n").unwrap();
         assert!(gui.handle_focus_gained());
-        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ResolveConflictKeepMine)));
+        assert!(click_hit_action(&mut gui, |a| matches!(
+            a,
+            UiAction::ResolveConflictKeepMine
+        )));
         assert_eq!(
             gui.workbench.active_tab().unwrap().session.state,
             DocState::Clean
@@ -8627,11 +9138,11 @@ mod tests {
             gui.workbench.active_tab().unwrap().conflict_backup_count >= 1,
             "expected at least 1 conflict backup after resolutions"
         );
-        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ClearConflictBackups)));
-        assert_eq!(
-            gui.workbench.active_tab().unwrap().conflict_backup_count,
-            0
-        );
+        assert!(click_hit_action(&mut gui, |a| matches!(
+            a,
+            UiAction::ClearConflictBackups
+        )));
+        assert_eq!(gui.workbench.active_tab().unwrap().conflict_backup_count, 0);
 
         // Create another conflict so Save As... hit zone is rendered on the banner, then resolve via MemorySaveDialog
         {
@@ -8641,7 +9152,10 @@ mod tests {
         fs::write(&doc, "external-v3\n").unwrap();
         assert!(gui.handle_focus_gained());
         gui.set_save_dialog(Box::new(MemorySaveDialog::new(Some(save_as_doc.clone()))));
-        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::SaveAsActive)));
+        assert!(click_hit_action(&mut gui, |a| matches!(
+            a,
+            UiAction::SaveAsActive
+        )));
         assert_eq!(
             gui.workbench.active_tab().unwrap().session.path.as_deref(),
             Some(save_as_doc.as_path())
@@ -8650,14 +9164,19 @@ mod tests {
             gui.workbench.active_tab().unwrap().session.state,
             DocState::Clean
         );
-        assert!(fs::read_to_string(&save_as_doc)
-            .unwrap()
-            .contains("local-copy-"));
+        assert!(
+            fs::read_to_string(&save_as_doc)
+                .unwrap()
+                .contains("local-copy-")
+        );
 
         // Tab switch immediately flushes named Dirty document
         gui.workbench.new_document();
         let dirty_idx = 0usize;
-        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::SelectTab(i) if *i == dirty_idx)));
+        assert!(click_hit_action(
+            &mut gui,
+            |a| matches!(a, UiAction::SelectTab(i) if *i == dirty_idx)
+        ));
         {
             let tab = gui.workbench.active_tab_mut().unwrap();
             tab.edit(|ctx| {
@@ -8666,10 +9185,15 @@ mod tests {
             })
             .unwrap();
         }
-        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::SelectTab(1))));
-        assert!(fs::read_to_string(&save_as_doc)
-            .unwrap()
-            .starts_with("tab-switch-"));
+        assert!(click_hit_action(&mut gui, |a| matches!(
+            a,
+            UiAction::SelectTab(1)
+        )));
+        assert!(
+            fs::read_to_string(&save_as_doc)
+                .unwrap()
+                .starts_with("tab-switch-")
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -8715,12 +9239,21 @@ mod tests {
             gui.active_doc_banner_kind(),
             Some(DocBannerKind::WriteError { .. })
         ));
-        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::RetrySaveActive)));
+        assert!(click_hit_action(&mut gui, |a| matches!(
+            a,
+            UiAction::RetrySaveActive
+        )));
         assert_eq!(
             gui.workbench.active_tab().unwrap().session.state,
             DocState::Clean
         );
-        assert!(gui.workbench.active_tab().unwrap().last_write_error.is_none());
+        assert!(
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .last_write_error
+                .is_none()
+        );
         assert_eq!(fs::read_to_string(&doc).unwrap(), "focus-retry-start\n");
 
         // Deleting file triggers Missing banner; Re-save recreates original file; Close Tab removes it
@@ -8730,7 +9263,10 @@ mod tests {
             gui.active_doc_banner_kind(),
             Some(DocBannerKind::Missing { .. })
         ));
-        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ResaveMissingFile)));
+        assert!(click_hit_action(&mut gui, |a| matches!(
+            a,
+            UiAction::ResaveMissingFile
+        )));
         assert_eq!(
             gui.workbench.active_tab().unwrap().session.state,
             DocState::Clean
@@ -8740,7 +9276,10 @@ mod tests {
         fs::remove_file(&doc).unwrap();
         assert!(gui.handle_focus_gained());
         let deleted_id = gui.workbench.active_tab().unwrap().id;
-        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ForceCloseActiveMissing)));
+        assert!(click_hit_action(&mut gui, |a| matches!(
+            a,
+            UiAction::ForceCloseActiveMissing
+        )));
         assert!(!gui.workbench.tabs.iter().any(|t| t.id == deleted_id));
 
         let _ = fs::remove_dir_all(&dir);
@@ -8786,10 +9325,11 @@ mod tests {
             Some(doc_b.as_path())
         );
         assert_eq!(fs::read_to_string(&doc_b).unwrap(), "content B\n");
-        assert!(gui
-            .status_notice
-            .as_ref()
-            .is_some_and(|(msg, _)| msg.contains("already open")));
+        assert!(
+            gui.status_notice
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("already open"))
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -8830,7 +9370,10 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let deleted_child = dir.join("missing_subdir").join("file.md");
-        assert_eq!(existing_default_dialog_dir(Some(&deleted_child)), Some(dir.as_path()));
+        assert_eq!(
+            existing_default_dialog_dir(Some(&deleted_child)),
+            Some(dir.as_path())
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -8862,7 +9405,12 @@ mod tests {
         // Press Enter via GUI editor dispatch
         gui.dispatch_editor(EditorAction::Enter);
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "# Title\r\n\r\n\r\nBody line\r\n"
         );
 
@@ -8915,7 +9463,13 @@ mod tests {
             "# Title".len()
         );
         gui.delete_forward();
-        let after_del = gui.workbench.active_tab().unwrap().session.buffer.to_string();
+        let after_del = gui
+            .workbench
+            .active_tab()
+            .unwrap()
+            .session
+            .buffer
+            .to_string();
         assert_eq!(after_del, "# Title\r\n\r\nBody line\r\n");
 
         // Deleting the last `\r\n` in a CRLF file (`A\r\nB`) still preserves `CrLf` on next Enter + auto-save
@@ -8929,12 +9483,22 @@ mod tests {
             .unwrap();
         gui.dispatch_editor(EditorAction::Backspace);
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "AB"
         );
         gui.dispatch_editor(EditorAction::Enter);
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "A\r\nB"
         );
         let future2 = Instant::now() + Duration::from_secs(3);
@@ -9043,7 +9607,12 @@ mod tests {
         assert!(gui.handle_key_input(&Key::Character("o".into()), None, p_mod));
         assert_eq!(gui.workbench.tabs.len(), 1);
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "# Notes\n\nHello open dialog."
         );
 
@@ -9056,7 +9625,10 @@ mod tests {
             None,
             p_mod | ModifiersState::SHIFT
         ));
-        assert_eq!(gui.workbench.workspace_root.as_deref(), Some(docs_dir.as_path()));
+        assert_eq!(
+            gui.workbench.workspace_root.as_deref(),
+            Some(docs_dir.as_path())
+        );
         assert!(gui.workbench.file_tree.is_some());
         assert!(gui.workbench.config.sidebar_visible);
         assert_eq!(gui.sidebar_section, SidebarSection::Files);
@@ -9103,10 +9675,25 @@ mod tests {
         assert_eq!(gui.quick_open_matches.len(), 3);
 
         // Filter via keyboard + IME without touching active tab buffer
-        assert!(gui.handle_key_input(&Key::Character("a".into()), Some("a"), ModifiersState::empty()));
-        assert!(gui.handle_key_input(&Key::Character("r".into()), Some("r"), ModifiersState::empty()));
+        assert!(gui.handle_key_input(
+            &Key::Character("a".into()),
+            Some("a"),
+            ModifiersState::empty()
+        ));
+        assert!(gui.handle_key_input(
+            &Key::Character("r".into()),
+            Some("r"),
+            ModifiersState::empty()
+        ));
         gui.handle_ime_event(&Ime::Preedit("ch".to_string(), None));
-        assert!(gui.workbench.active_tab().unwrap().view.ime_preedit.is_none());
+        assert!(
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .view
+                .ime_preedit
+                .is_none()
+        );
         gui.handle_ime_event(&Ime::Preedit(String::new(), None));
         gui.handle_ime_event(&Ime::Commit("ch".to_string()));
         assert_eq!(gui.quick_open_query, "arch");
@@ -9124,7 +9711,12 @@ mod tests {
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
         assert!(!gui.quick_open_open);
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "# Arch"
         );
 
@@ -9142,13 +9734,22 @@ mod tests {
         }));
         assert!(!gui.quick_open_open);
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "Todo list"
         );
 
         // ArrowDown + Enter selection works
         assert!(gui.handle_key_input(&Key::Character("p".into()), None, p_mod));
-        assert!(gui.handle_key_input(&Key::Named(NamedKey::ArrowDown), None, ModifiersState::empty()));
+        assert!(gui.handle_key_input(
+            &Key::Named(NamedKey::ArrowDown),
+            None,
+            ModifiersState::empty()
+        ));
         assert_eq!(gui.quick_open_selected, 1);
         let expected_path = gui.quick_open_matches[1].path.clone();
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
@@ -9166,9 +9767,7 @@ mod tests {
         let p_mod = primary_test_mod();
 
         // 1. Non-URL clipboard does not prefill; IME commit + Esc cancels cleanly
-        gui.clipboard
-            .write("not a url just text", None)
-            .unwrap();
+        gui.clipboard.write("not a url just text", None).unwrap();
         gui.workbench
             .active_tab_mut()
             .unwrap()
@@ -9182,7 +9781,12 @@ mod tests {
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Escape), None, ModifiersState::empty()));
         assert!(!gui.link_prompt_open);
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "Click here please"
         );
 
@@ -9196,12 +9800,23 @@ mod tests {
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
         assert!(!gui.link_prompt_open);
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "Click [here](https://vellmark.dev) please"
         );
 
         // 3. Cmd+K at caret + typed/pasted URL + Insert button click places caret inside []
-        let end = gui.workbench.active_tab().unwrap().session.buffer.len_bytes();
+        let end = gui
+            .workbench
+            .active_tab()
+            .unwrap()
+            .session
+            .buffer
+            .len_bytes();
         gui.workbench
             .active_tab_mut()
             .unwrap()
@@ -9212,16 +9827,28 @@ mod tests {
         assert_eq!(gui.link_prompt_url, "");
         for ch in "https://".chars() {
             let s = ch.to_string();
-            assert!(gui.handle_key_input(&Key::Character(s.clone().into()), Some(&s), ModifiersState::empty()));
+            assert!(gui.handle_key_input(
+                &Key::Character(s.clone().into()),
+                Some(&s),
+                ModifiersState::empty()
+            ));
         }
         gui.clipboard.write("example.org", None).unwrap();
         assert!(gui.handle_key_input(&Key::Character("v".into()), None, p_mod));
         assert_eq!(gui.link_prompt_url, "https://example.org");
         let _ = gui.build_frame();
-        assert!(click_hit_action(&mut gui, |a| matches!(a, UiAction::ConfirmLinkPrompt)));
+        assert!(click_hit_action(&mut gui, |a| matches!(
+            a,
+            UiAction::ConfirmLinkPrompt
+        )));
         assert!(!gui.link_prompt_open);
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "Click [here](https://vellmark.dev) please[](https://example.org)"
         );
         assert_eq!(
@@ -9284,22 +9911,23 @@ Second duplicate body\n";
         let p_mod = primary_test_mod();
 
         // Helper: find screen pixel inside a given byte offset while link markers are collapsed
-        let caret_point_for_offset = |gui: &mut GuiController, caret_off: usize, collapse_off: usize| {
-            gui.workbench
-                .active_tab_mut()
-                .unwrap()
-                .edit(|ctx| ctx.set_caret(caret_off))
-                .unwrap();
-            let _ = gui.build_frame();
-            let rect = gui.last_ime_cursor_area.expect("caret rect");
-            gui.workbench
-                .active_tab_mut()
-                .unwrap()
-                .edit(|ctx| ctx.set_caret(collapse_off))
-                .unwrap();
-            let _ = gui.build_frame();
-            (rect.x + 8.0, rect.y + rect.h * 0.5)
-        };
+        let caret_point_for_offset =
+            |gui: &mut GuiController, caret_off: usize, collapse_off: usize| {
+                gui.workbench
+                    .active_tab_mut()
+                    .unwrap()
+                    .edit(|ctx| ctx.set_caret(caret_off))
+                    .unwrap();
+                let _ = gui.build_frame();
+                let rect = gui.last_ime_cursor_area.expect("caret rect");
+                gui.workbench
+                    .active_tab_mut()
+                    .unwrap()
+                    .edit(|ctx| ctx.set_caret(collapse_off))
+                    .unwrap();
+                let _ = gui.build_frame();
+                (rect.x + 8.0, rect.y + rect.h * 0.5)
+            };
 
         // Plain line does not trigger pointer cursor or link open on Cmd/Ctrl+Click
         let plain_off = intro_src.find("Plain line").unwrap() + 2;
@@ -9313,13 +9941,20 @@ Second duplicate body\n";
         let ext_off = intro_src.find("Vellmark").unwrap() + 2;
         let (ex, ey) = caret_point_for_offset(&mut gui, ext_off, 0);
         assert_eq!(
-            gui.handle_pointer_move_with_mods(ex, ey, ModifiersState::empty()).0,
+            gui.handle_pointer_move_with_mods(ex, ey, ModifiersState::empty())
+                .0,
             CursorIcon::Text
         );
-        assert_eq!(gui.handle_pointer_move_with_mods(ex, ey, p_mod).0, CursorIcon::Pointer);
+        assert_eq!(
+            gui.handle_pointer_move_with_mods(ex, ey, p_mod).0,
+            CursorIcon::Pointer
+        );
         assert!(gui.handle_pointer_down_with_mods(ex, ey, p_mod));
         assert!(!gui.dragging_selection);
-        assert_eq!(opener.opened_urls(), vec!["https://vellmark.dev".to_string()]);
+        assert_eq!(
+            opener.opened_urls(),
+            vec!["https://vellmark.dev".to_string()]
+        );
 
         // 2. Same-document heading anchor jump & duplicate GitHub slug disambiguation (-1)
         let a1_off = intro_src.find("Anchor First").unwrap() + 2;
@@ -9373,14 +10008,14 @@ Second duplicate body\n";
         // authorities as defense-in-depth (`https://x&calc`), and keeps query `&` & `%` intact.
         assert!(validate_native_open_target("https://example.com/search?q=1&b=2%203").is_ok());
         assert!(
-            validate_native_open_target("https://en.wikipedia.org/wiki/Rust_(programming_language)")
-                .is_ok()
+            validate_native_open_target(
+                "https://en.wikipedia.org/wiki/Rust_(programming_language)"
+            )
+            .is_ok()
         );
         assert!(validate_native_open_target("https://[::1]:8080/docs?x=1&y=2").is_ok());
         assert!(validate_native_open_target("mailto:test@example.com").is_ok());
-        assert!(
-            validate_native_open_target("mailto:test@example.com?subject=hi&body=bye").is_ok()
-        );
+        assert!(validate_native_open_target("mailto:test@example.com?subject=hi&body=bye").is_ok());
         assert!(validate_native_open_target("mailto:?subject=Hello&body=World").is_ok());
         assert!(validate_native_open_target("mailto:?subject=").is_ok());
         assert!(validate_native_open_target("mailto:o'connor@example.com").is_ok());
@@ -9405,10 +10040,22 @@ Second duplicate body\n";
             ("https://example.com\ncalc", "Invalid link target"),
             ("https://example.com\0", "Invalid link target"),
             ("https://x&calc", "Blocked unsafe or malformed external URL"),
-            ("http://evil.com&calc", "Blocked unsafe or malformed external URL"),
-            ("https://evil.com|calc", "Blocked unsafe or malformed external URL"),
-            ("https://example.com/a|b", "Blocked unsafe or malformed external URL"),
-            ("https://:8080/path", "Blocked unsafe or malformed external URL"),
+            (
+                "http://evil.com&calc",
+                "Blocked unsafe or malformed external URL",
+            ),
+            (
+                "https://evil.com|calc",
+                "Blocked unsafe or malformed external URL",
+            ),
+            (
+                "https://example.com/a|b",
+                "Blocked unsafe or malformed external URL",
+            ),
+            (
+                "https://:8080/path",
+                "Blocked unsafe or malformed external URL",
+            ),
             ("https://", "Blocked unsafe or malformed external URL"),
             ("http:foo", "Blocked unsafe or malformed external URL"),
             ("mailto:", "Blocked unsafe or malformed external URL"),
@@ -9416,7 +10063,10 @@ Second duplicate body\n";
             ("mailto:?abc", "Blocked unsafe or malformed external URL"),
             ("mailto:?&", "Blocked unsafe or malformed external URL"),
             ("mailto:?=foo", "Blocked unsafe or malformed external URL"),
-            ("mailto:?subject=100%", "Blocked unsafe or malformed external URL"),
+            (
+                "mailto:?subject=100%",
+                "Blocked unsafe or malformed external URL",
+            ),
             (
                 "mailto:?subject=Hello#fragment",
                 "Blocked unsafe or malformed external URL",
@@ -9453,16 +10103,31 @@ Second duplicate body\n";
                 "mailto:evil%2@example.com",
                 "Blocked unsafe or malformed external URL",
             ),
-            ("ftp://example.com/file", "Blocked unsupported URL scheme: ftp"),
-            ("smb://attacker/share", "Blocked unsupported URL scheme: smb"),
-            ("search-ms:displayname=evil", "Blocked unsupported URL scheme: search-ms"),
+            (
+                "ftp://example.com/file",
+                "Blocked unsupported URL scheme: ftp",
+            ),
+            (
+                "smb://attacker/share",
+                "Blocked unsupported URL scheme: smb",
+            ),
+            (
+                "search-ms:displayname=evil",
+                "Blocked unsupported URL scheme: search-ms",
+            ),
             ("ms-msdt:/id", "Blocked unsupported URL scheme: ms-msdt"),
             (
                 "javascript:alert(1)//http://example.com",
                 "Blocked unsupported URL scheme: javascript",
             ),
-            ("file:///tmp/secret.txt", "Blocked unsupported URL scheme: file"),
-            (r"C:\notes\payload.bat", "Blocked opening executable file directly"),
+            (
+                "file:///tmp/secret.txt",
+                "Blocked unsupported URL scheme: file",
+            ),
+            (
+                r"C:\notes\payload.bat",
+                "Blocked opening executable file directly",
+            ),
             ("/tmp/setup.exe", "Blocked opening executable file directly"),
         ] {
             assert_eq!(
@@ -9502,12 +10167,12 @@ Second duplicate body\n";
                 "javascript:alert(1)//http://x",
                 "Unsupported link scheme: javascript",
             ),
-            (
-                "https://x&calc",
-                "Blocked unsafe or malformed external URL",
-            ),
+            ("https://x&calc", "Blocked unsafe or malformed external URL"),
             ("mailto:?abc", "Blocked unsafe or malformed external URL"),
-            ("file://attacker/share/secret.md", "Blocked non-local file URI"),
+            (
+                "file://attacker/share/secret.md",
+                "Blocked non-local file URI",
+            ),
             ("run.bat", "Blocked opening executable file: run.bat"),
         ] {
             gui.open_resolved_link_destination(disallowed);
@@ -9567,7 +10232,13 @@ Second duplicate body\n";
                 ctx.insert_link(url);
             })
             .unwrap();
-            let md = gui.workbench.active_tab().unwrap().session.buffer.to_string();
+            let md = gui
+                .workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string();
             let html = vellmark_parser::render_markdown_to_html(&md);
             assert!(
                 html.contains("<a href="),
@@ -9654,21 +10325,33 @@ Second duplicate body\n";
         assert!(gui.workbench.config.show_code_line_numbers);
 
         // Click Language Picker pill -> search "py" -> Enter -> fence language becomes python.
-        assert!(gui.handle_pointer_down(lang_rect.x + lang_rect.w * 0.5, lang_rect.y + lang_rect.h * 0.5));
+        assert!(gui.handle_pointer_down(
+            lang_rect.x + lang_rect.w * 0.5,
+            lang_rect.y + lang_rect.h * 0.5
+        ));
         assert!(gui.code_lang_open);
-        assert!(gui.handle_key_input(&Key::Character("p".into()), Some("p"), ModifiersState::empty()));
-        assert!(gui.handle_key_input(&Key::Character("y".into()), Some("y"), ModifiersState::empty()));
+        assert!(gui.handle_key_input(
+            &Key::Character("p".into()),
+            Some("p"),
+            ModifiersState::empty()
+        ));
+        assert!(gui.handle_key_input(
+            &Key::Character("y".into()),
+            Some("y"),
+            ModifiersState::empty()
+        ));
         assert!(!gui.code_lang_matches.is_empty());
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
         assert!(!gui.code_lang_open);
-        assert!(gui
-            .workbench
-            .active_tab()
-            .unwrap()
-            .session
-            .buffer
-            .to_string()
-            .contains("```python\nfn main() {}"));
+        assert!(
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string()
+                .contains("```python\nfn main() {}")
+        );
     }
 
     #[test]
@@ -9689,27 +10372,53 @@ Second duplicate body\n";
         // Outside a code block: Cmd+Option+C inserts a fenced code block and places caret inside it.
         let code_mod = test_primary_modifier() | ModifiersState::ALT;
         assert!(gui.handle_key_input(&Key::Character("ç".into()), None, code_mod));
-        let md = gui.workbench.active_tab().unwrap().session.buffer.to_string();
-        assert!(md.contains("```"), "expected code fence inserted, got: {md}");
-        assert!(!gui.code_lang_open);
-
-        // Inside the newly created code block: Cmd+Option+C opens the Code Language Picker modal.
-        assert!(gui.handle_key_input(&Key::Character("c".into()), None, code_mod));
-        assert!(gui.code_lang_open);
-        assert!(gui.handle_key_input(&Key::Character("r".into()), Some("r"), ModifiersState::empty()));
-        assert!(gui.handle_key_input(&Key::Character("u".into()), Some("u"), ModifiersState::empty()));
-        assert!(gui.handle_key_input(&Key::Character("s".into()), Some("s"), ModifiersState::empty()));
-        assert!(gui.handle_key_input(&Key::Character("t".into()), Some("t"), ModifiersState::empty()));
-        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
-        assert!(!gui.code_lang_open);
-        assert!(gui
+        let md = gui
             .workbench
             .active_tab()
             .unwrap()
             .session
             .buffer
-            .to_string()
-            .contains("```rust\n"));
+            .to_string();
+        assert!(
+            md.contains("```"),
+            "expected code fence inserted, got: {md}"
+        );
+        assert!(!gui.code_lang_open);
+
+        // Inside the newly created code block: Cmd+Option+C opens the Code Language Picker modal.
+        assert!(gui.handle_key_input(&Key::Character("c".into()), None, code_mod));
+        assert!(gui.code_lang_open);
+        assert!(gui.handle_key_input(
+            &Key::Character("r".into()),
+            Some("r"),
+            ModifiersState::empty()
+        ));
+        assert!(gui.handle_key_input(
+            &Key::Character("u".into()),
+            Some("u"),
+            ModifiersState::empty()
+        ));
+        assert!(gui.handle_key_input(
+            &Key::Character("s".into()),
+            Some("s"),
+            ModifiersState::empty()
+        ));
+        assert!(gui.handle_key_input(
+            &Key::Character("t".into()),
+            Some("t"),
+            ModifiersState::empty()
+        ));
+        assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
+        assert!(!gui.code_lang_open);
+        assert!(
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string()
+                .contains("```rust\n")
+        );
     }
 
     #[test]
@@ -9743,18 +10452,20 @@ Second duplicate body\n";
         gui.paste_clipboard();
         let expected_asset = dir.join("assets").join("pasted-image.png");
         assert_eq!(fs::read(&expected_asset).unwrap(), png);
-        assert!(gui
-            .workbench
-            .active_tab()
-            .unwrap()
-            .session
-            .buffer
-            .to_string()
-            .contains("![image](./assets/pasted-image.png)"));
-        assert!(gui
-            .active_status_notice()
-            .as_deref()
-            .is_some_and(|n| n.contains("pasted-image.png")));
+        assert!(
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string()
+                .contains("![image](./assets/pasted-image.png)")
+        );
+        assert!(
+            gui.active_status_notice()
+                .as_deref()
+                .is_some_and(|n| n.contains("pasted-image.png"))
+        );
 
         // Pasting while a text overlay is focused must never import an image into assets.
         gui.find_open = true;
@@ -9800,14 +10511,15 @@ Second duplicate body\n";
         );
         let copied_asset = dir.join("assets").join("shot.png");
         assert_eq!(fs::read(&copied_asset).unwrap(), png);
-        assert!(gui
-            .workbench
-            .active_tab()
-            .unwrap()
-            .session
-            .buffer
-            .to_string()
-            .contains("![shot](./assets/shot.png)"));
+        assert!(
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string()
+                .contains("![shot](./assets/shot.png)")
+        );
 
         // Non-image Markdown drop still opens as a document tab.
         gui.handle_dropped_path(&other);
@@ -9831,15 +10543,29 @@ Second duplicate body\n";
         assert!(gui.insert_table_open);
         assert_eq!(gui.insert_table_input, "3x4");
         for _ in 0..3 {
-            assert!(gui.handle_key_input(&Key::Named(NamedKey::Backspace), None, ModifiersState::empty()));
+            assert!(gui.handle_key_input(
+                &Key::Named(NamedKey::Backspace),
+                None,
+                ModifiersState::empty()
+            ));
         }
         for ch in ["2", "x", "3"] {
-            assert!(gui.handle_key_input(&Key::Character(ch.into()), Some(ch), ModifiersState::empty()));
+            assert!(gui.handle_key_input(
+                &Key::Character(ch.into()),
+                Some(ch),
+                ModifiersState::empty()
+            ));
         }
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
         assert!(!gui.insert_table_open);
 
-        let doc = gui.workbench.active_tab().unwrap().session.buffer.to_string();
+        let doc = gui
+            .workbench
+            .active_tab()
+            .unwrap()
+            .session
+            .buffer
+            .to_string();
         let lines: Vec<&str> = doc.lines().collect();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].matches('|').count(), 4);
@@ -9849,22 +10575,44 @@ Second duplicate body\n";
         let add_row_rect = gui
             .ui_hit_zones
             .iter()
-            .find(|z| matches!(z.action, UiAction::TableToolbarAction(TableButtonKind::AddRowBelow)))
+            .find(|z| {
+                matches!(
+                    z.action,
+                    UiAction::TableToolbarAction(TableButtonKind::AddRowBelow)
+                )
+            })
             .map(|z| z.rect)
             .expect("expected +Row↓ table toolbar pill");
         assert!(gui.handle_pointer_down(add_row_rect.x + 2.0, add_row_rect.y + 2.0));
-        let doc_after_row = gui.workbench.active_tab().unwrap().session.buffer.to_string();
+        let doc_after_row = gui
+            .workbench
+            .active_tab()
+            .unwrap()
+            .session
+            .buffer
+            .to_string();
         assert_eq!(doc_after_row.lines().count(), doc.lines().count() + 1);
 
         let _ = gui.build_frame();
         let align_right_rect = gui
             .ui_hit_zones
             .iter()
-            .find(|z| matches!(z.action, UiAction::TableToolbarAction(TableButtonKind::AlignRight)))
+            .find(|z| {
+                matches!(
+                    z.action,
+                    UiAction::TableToolbarAction(TableButtonKind::AlignRight)
+                )
+            })
             .map(|z| z.rect)
             .expect("expected R alignment pill");
         assert!(gui.handle_pointer_down(align_right_rect.x + 2.0, align_right_rect.y + 2.0));
-        let doc_aligned = gui.workbench.active_tab().unwrap().session.buffer.to_string();
+        let doc_aligned = gui
+            .workbench
+            .active_tab()
+            .unwrap()
+            .session
+            .buffer
+            .to_string();
         let delim = doc_aligned.lines().nth(1).unwrap();
         assert!(delim.contains(":"));
 
@@ -9872,11 +10620,26 @@ Second duplicate body\n";
         let del_row_rect = gui
             .ui_hit_zones
             .iter()
-            .find(|z| matches!(z.action, UiAction::TableToolbarAction(TableButtonKind::DeleteRow)))
+            .find(|z| {
+                matches!(
+                    z.action,
+                    UiAction::TableToolbarAction(TableButtonKind::DeleteRow)
+                )
+            })
             .map(|z| z.rect)
             .expect("expected -Row pill");
         assert!(gui.handle_pointer_down(del_row_rect.x + 2.0, del_row_rect.y + 2.0));
-        assert!(gui.workbench.active_tab().unwrap().session.buffer.to_string().lines().count() < doc_after_row.lines().count());
+        assert!(
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string()
+                .lines()
+                .count()
+                < doc_after_row.lines().count()
+        );
 
         // Changing config.table_auto_align dynamically syncs into tab.view on dispatch_editor
         gui.workbench.config.table_auto_align = false;
@@ -9892,13 +10655,19 @@ Second duplicate body\n";
         gui.insert_table_input = "2x2".to_string();
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             code_doc
         );
-        assert!(gui
-            .status_notice
-            .as_ref()
-            .is_some_and(|(m, _)| m.contains("Cannot insert table")));
+        assert!(
+            gui.status_notice
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("Cannot insert table"))
+        );
     }
 
     #[test]
@@ -9928,7 +10697,11 @@ Second duplicate body\n";
 
         for ch in "CaseMatch".chars() {
             let s = ch.to_string();
-            assert!(gui.handle_key_input(&Key::Character(s.as_str().into()), Some(&s), ModifiersState::empty()));
+            assert!(gui.handle_key_input(
+                &Key::Character(s.as_str().into()),
+                Some(&s),
+                ModifiersState::empty()
+            ));
         }
         // Key input must stay non-blocking & debounced (not scanned synchronously per keystroke)
         assert!(gui.global_search_searching);
@@ -10009,7 +10782,12 @@ Second duplicate body\n";
         let recent_tab_rect = gui
             .ui_hit_zones
             .iter()
-            .find(|z| matches!(z.action, UiAction::SwitchSidebarSection(SidebarSection::Recent)))
+            .find(|z| {
+                matches!(
+                    z.action,
+                    UiAction::SwitchSidebarSection(SidebarSection::Recent)
+                )
+            })
             .map(|z| z.rect)
             .expect("expected Recent sidebar tab");
         assert!(gui.handle_pointer_down(recent_tab_rect.x + 2.0, recent_tab_rect.y + 2.0));
@@ -10025,7 +10803,16 @@ Second duplicate body\n";
             .expect("expected existing.md entry in Recent");
         assert!(gui.handle_pointer_down(recent_item_rect.x + 2.0, recent_item_rect.y + 2.0));
         assert_eq!(
-            fs::canonicalize(gui.workbench.active_tab().unwrap().session.path.as_ref().unwrap()).unwrap(),
+            fs::canonicalize(
+                gui.workbench
+                    .active_tab()
+                    .unwrap()
+                    .session
+                    .path
+                    .as_ref()
+                    .unwrap()
+            )
+            .unwrap(),
             canonical_existing
         );
 
@@ -10034,7 +10821,12 @@ Second duplicate body\n";
         let files_tab_rect = gui
             .ui_hit_zones
             .iter()
-            .find(|z| matches!(z.action, UiAction::SwitchSidebarSection(SidebarSection::Files)))
+            .find(|z| {
+                matches!(
+                    z.action,
+                    UiAction::SwitchSidebarSection(SidebarSection::Files)
+                )
+            })
             .map(|z| z.rect)
             .expect("expected Files sidebar tab");
         assert!(gui.handle_pointer_down(files_tab_rect.x + 2.0, files_tab_rect.y + 2.0));
@@ -10049,13 +10841,26 @@ Second duplicate body\n";
         assert!(gui.handle_pointer_down(new_btn_rect.x + 2.0, new_btn_rect.y + 2.0));
         for ch in "draft".chars() {
             let s = ch.to_string();
-            assert!(gui.handle_key_input(&Key::Character(s.as_str().into()), Some(&s), ModifiersState::empty()));
+            assert!(gui.handle_key_input(
+                &Key::Character(s.as_str().into()),
+                Some(&s),
+                ModifiersState::empty()
+            ));
         }
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
         let draft_path = dir.join("draft.md");
         assert!(draft_path.exists());
         assert_eq!(
-            fs::canonicalize(gui.workbench.active_tab().unwrap().session.path.as_ref().unwrap()).unwrap(),
+            fs::canonicalize(
+                gui.workbench
+                    .active_tab()
+                    .unwrap()
+                    .session
+                    .path
+                    .as_ref()
+                    .unwrap()
+            )
+            .unwrap(),
             fs::canonicalize(&draft_path).unwrap()
         );
 
@@ -10070,18 +10875,35 @@ Second duplicate body\n";
         assert!(gui.handle_pointer_down(ren_btn_rect.x + 2.0, ren_btn_rect.y + 2.0));
         assert_eq!(gui.file_prompt_input, "draft.md");
         for _ in 0..8 {
-            assert!(gui.handle_key_input(&Key::Named(NamedKey::Backspace), None, ModifiersState::empty()));
+            assert!(gui.handle_key_input(
+                &Key::Named(NamedKey::Backspace),
+                None,
+                ModifiersState::empty()
+            ));
         }
         for ch in "notes.md".chars() {
             let s = ch.to_string();
-            assert!(gui.handle_key_input(&Key::Character(s.as_str().into()), Some(&s), ModifiersState::empty()));
+            assert!(gui.handle_key_input(
+                &Key::Character(s.as_str().into()),
+                Some(&s),
+                ModifiersState::empty()
+            ));
         }
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
         let notes_path = dir.join("notes.md");
         assert!(!draft_path.exists());
         assert!(notes_path.exists());
         assert_eq!(
-            fs::canonicalize(gui.workbench.active_tab().unwrap().session.path.as_ref().unwrap()).unwrap(),
+            fs::canonicalize(
+                gui.workbench
+                    .active_tab()
+                    .unwrap()
+                    .session
+                    .path
+                    .as_ref()
+                    .unwrap()
+            )
+            .unwrap(),
             fs::canonicalize(&notes_path).unwrap()
         );
 
@@ -10236,7 +11058,12 @@ Second duplicate body\n";
         // Enter in Replace input replaces current/next match
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "baz foobar foo foo\n"
         );
         assert!(gui.active_find_range.is_some());
@@ -10251,7 +11078,12 @@ Second duplicate body\n";
             .expect("expected Replace All button");
         assert!(gui.handle_pointer_down(all_rect.x + 2.0, all_rect.y + 2.0));
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "baz foobar baz baz\n"
         );
 
@@ -10346,10 +11178,11 @@ Second duplicate body\n";
         );
 
         let _ = gui.build_frame();
-        assert!(gui
-            .ui_hit_zones
-            .iter()
-            .any(|z| matches!(z.action, UiAction::SelectCommandPaletteMatch(0))));
+        assert!(
+            gui.ui_hit_zones
+                .iter()
+                .any(|z| matches!(z.action, UiAction::SelectCommandPaletteMatch(0)))
+        );
 
         dialog.set_next_path(Some(export_path.clone()));
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
@@ -10376,7 +11209,11 @@ Second duplicate body\n";
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
         assert_eq!(gui.workbench.config.custom_theme_path, Some(css_path));
         assert_eq!(
-            gui.workbench.theme.variables.get("--accent").map(String::as_str),
+            gui.workbench
+                .theme
+                .variables
+                .get("--accent")
+                .map(String::as_str),
             Some("#ff5500")
         );
 
@@ -10415,7 +11252,10 @@ Second duplicate body\n";
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
         assert!(gui.workbench.config.custom_theme_path.is_none());
         assert_eq!(gui.workbench.config.theme, BuiltinTheme::Dark);
-        let dark_html = gui.workbench.export_active_html(HtmlExportMode::Safe).unwrap();
+        let dark_html = gui
+            .workbench
+            .export_active_html(HtmlExportMode::Safe)
+            .unwrap();
         assert!(!dark_html.contains("#ff5500"));
 
         let _ = fs::remove_dir_all(&dir);
@@ -10456,24 +11296,29 @@ Second duplicate body\n";
                 candidate: DetectedEncoding::Utf16LeBom
             })
         ));
-        assert_eq!(encoding_label(DetectedEncoding::Utf16LeBom), "UTF-16 LE BOM");
+        assert_eq!(
+            encoding_label(DetectedEncoding::Utf16LeBom),
+            "UTF-16 LE BOM"
+        );
 
         // Replace All must fail gracefully without modifying ReadOnly buffer
         gui.find_query = "Body".to_string();
         gui.replace_text = "Edited".to_string();
         gui.run_replace_all();
-        assert!(gui
-            .workbench
-            .active_tab()
-            .unwrap()
-            .session
-            .buffer
-            .to_string()
-            .contains("Body text."));
-        assert!(gui
-            .status_notice
-            .as_ref()
-            .is_some_and(|(msg, _)| msg.contains("Read-only")));
+        assert!(
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string()
+                .contains("Body text.")
+        );
+        assert!(
+            gui.status_notice
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("Read-only"))
+        );
 
         // Frame exposes Save UTF-8 Copy... button
         let _ = gui.build_frame();
@@ -10488,10 +11333,11 @@ Second duplicate body\n";
         dialog.set_next_path(Some(orig_path.clone()));
         assert!(gui.handle_pointer_down(copy_btn.x + 2.0, copy_btn.y + 2.0));
         assert_eq!(fs::read(&orig_path).unwrap(), utf16_bytes);
-        assert!(gui
-            .status_notice
-            .as_ref()
-            .is_some_and(|(msg, _)| msg.contains("Choose a new path")));
+        assert!(
+            gui.status_notice
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("Choose a new path"))
+        );
 
         // Refuses to overwrite a hard link aliasing the original non-UTF-8 inode
         let hardlink_path = dir.join("utf16-hardlink.md");
@@ -10500,10 +11346,11 @@ Second duplicate body\n";
         assert!(gui.handle_pointer_down(copy_btn.x + 2.0, copy_btn.y + 2.0));
         assert_eq!(fs::read(&orig_path).unwrap(), utf16_bytes);
         assert_eq!(fs::read(&hardlink_path).unwrap(), utf16_bytes);
-        assert!(gui
-            .status_notice
-            .as_ref()
-            .is_some_and(|(msg, _)| msg.contains("Choose a new path")));
+        assert!(
+            gui.status_notice
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("Choose a new path"))
+        );
 
         // Refuses to overwrite another already-open tab's file (even if its tab holds stale ReadOnly state)
         let other_ro_path = dir.join("other-ro.md");
@@ -10526,16 +11373,20 @@ Second duplicate body\n";
         assert!(gui.handle_pointer_down(copy_btn_again.x + 2.0, copy_btn_again.y + 2.0));
         assert_eq!(fs::read(&other_ro_path).unwrap(), other_utf16);
         assert_eq!(gui.workbench.active_tab_idx, Some(0));
-        assert!(gui
-            .status_notice
-            .as_ref()
-            .is_some_and(|(msg, _)| msg.contains("already open in tab")));
+        assert!(
+            gui.status_notice
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("already open in tab"))
+        );
 
         // Writing to a new path opens an editable UTF-8 tab while leaving original UTF-16LE file untouched
         dialog.set_next_path(Some(copy_path.clone()));
         assert!(gui.handle_pointer_down(copy_btn.x + 2.0, copy_btn.y + 2.0));
         assert_eq!(fs::read(&orig_path).unwrap(), utf16_bytes);
-        assert_eq!(fs::read_to_string(&copy_path).unwrap(), "# UTF16 Title\n\nBody text.\n");
+        assert_eq!(
+            fs::read_to_string(&copy_path).unwrap(),
+            "# UTF16 Title\n\nBody text.\n"
+        );
 
         let active = gui.workbench.active_tab().unwrap();
         assert_eq!(
@@ -10583,7 +11434,12 @@ Second duplicate body\n";
         assert!(gui.handle_pointer_down(rep_btn.x + 2.0, rep_btn.y + 2.0));
 
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "X\r\nY\r\nB\r\n"
         );
         assert!(gui.handle_key_input(&Key::Character("s".into()), None, p_mod));
@@ -10601,7 +11457,12 @@ Second duplicate body\n";
         gui.replace_text = "$0".to_string();
         gui.run_replace_all();
         assert_eq!(
-            gui.workbench.active_tab().unwrap().session.buffer.to_string(),
+            gui.workbench
+                .active_tab()
+                .unwrap()
+                .session
+                .buffer
+                .to_string(),
             "A\r\nB\r\nC\nD\r\n"
         );
 
@@ -10647,20 +11508,31 @@ Second duplicate body\n";
         let p_mod = primary_test_mod();
 
         // Recent file open is persisted to disk automatically
-        let loaded_recent = vellmark_core::RecentFilesList::load_from_file(&recent_path, 10).unwrap();
+        let loaded_recent =
+            vellmark_core::RecentFilesList::load_from_file(&recent_path, 10).unwrap();
         assert_eq!(loaded_recent.entries.len(), 1);
-        assert!(paths_share_underlying_file(&loaded_recent.entries[0], &doc_path));
+        assert!(paths_share_underlying_file(
+            &loaded_recent.entries[0],
+            &doc_path
+        ));
 
         // Load custom CSS via Command Palette -> persists config + updates style + records diagnostics
         dialog.set_next_open_path(Some(css_path.clone()));
         gui.execute_palette_command(PaletteCommandId::LoadCustomThemeCss);
         assert_eq!(
-            gui.workbench.theme.variables.get("--bg-color").map(String::as_str),
+            gui.workbench
+                .theme
+                .variables
+                .get("--bg-color")
+                .map(String::as_str),
             Some("#112233")
         );
         assert!(!gui.workbench.theme.diagnostics.is_empty());
         let saved_cfg = AppConfig::load_from_file(&config_path).unwrap();
-        assert_eq!(saved_cfg.custom_theme_path.as_deref(), Some(css_path.as_path()));
+        assert_eq!(
+            saved_cfg.custom_theme_path.as_deref(),
+            Some(css_path.as_path())
+        );
         assert!(!saved_cfg.follow_system_theme);
 
         // Zoom shortcut updates style & persists zoom_percent
@@ -10676,26 +11548,39 @@ Second duplicate body\n";
         .unwrap();
         let bg_before = gui.style.bg_color;
         assert_eq!(bg_before, vellmark_render::RgbaColor::rgb(0x11, 0x22, 0x33));
-        assert!(gui.tick_runtime_at(Instant::now() + EXTERNAL_POLL_INTERVAL + Duration::from_millis(50)));
+        assert!(
+            gui.tick_runtime_at(
+                Instant::now() + EXTERNAL_POLL_INTERVAL + Duration::from_millis(50)
+            )
+        );
         assert_eq!(
-            gui.workbench.theme.variables.get("--bg-color").map(String::as_str),
+            gui.workbench
+                .theme
+                .variables
+                .get("--bg-color")
+                .map(String::as_str),
             Some("#445566")
         );
-        assert_eq!(gui.style.bg_color, vellmark_render::RgbaColor::rgb(0x44, 0x55, 0x66));
+        assert_eq!(
+            gui.style.bg_color,
+            vellmark_render::RgbaColor::rgb(0x44, 0x55, 0x66)
+        );
         assert_ne!(gui.style.bg_color, bg_before);
-        assert!(gui
-            .status_notice
-            .as_ref()
-            .is_some_and(|(m, _)| m.contains("Hot-reloaded theme CSS")));
+        assert!(
+            gui.status_notice
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("Hot-reloaded theme CSS"))
+        );
 
         // Open Theme Diagnostics modal via Command Palette, filter rules, select row, and click Reload
         gui.execute_palette_command(PaletteCommandId::ShowThemeDiagnostics);
         assert_eq!(gui.inspect_modal, Some(InspectModalKind::ThemeDiagnostics));
         let _ = gui.build_frame();
-        assert!(gui
-            .ui_hit_zones
-            .iter()
-            .any(|z| matches!(z.action, UiAction::ReloadCustomTheme)));
+        assert!(
+            gui.ui_hit_zones
+                .iter()
+                .any(|z| matches!(z.action, UiAction::ReloadCustomTheme))
+        );
         assert!(gui.handle_key_input(
             &Key::Character("card".into()),
             Some("card"),
@@ -10703,10 +11588,11 @@ Second duplicate body\n";
         ));
         assert_eq!(gui.filtered_theme_diagnostic_indices().len(), 1);
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()));
-        assert!(gui
-            .status_notice
-            .as_ref()
-            .is_some_and(|(m, _)| m.contains("CSS [")));
+        assert!(
+            gui.status_notice
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("CSS ["))
+        );
 
         // Manual Reload button updates diagnostics and style when CSS is cleaned up
         fs::write(
@@ -10723,10 +11609,17 @@ Second duplicate body\n";
             .expect("expected Reload button in Theme Diagnostics modal");
         assert!(gui.handle_pointer_down(reload_btn.x + 2.0, reload_btn.y + 2.0));
         assert_eq!(
-            gui.workbench.theme.variables.get("--bg-color").map(String::as_str),
+            gui.workbench
+                .theme
+                .variables
+                .get("--bg-color")
+                .map(String::as_str),
             Some("#778899")
         );
-        assert_eq!(gui.style.bg_color, vellmark_render::RgbaColor::rgb(0x77, 0x88, 0x99));
+        assert_eq!(
+            gui.style.bg_color,
+            vellmark_render::RgbaColor::rgb(0x77, 0x88, 0x99)
+        );
         assert!(gui.workbench.theme.diagnostics.is_empty());
 
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Escape), None, ModifiersState::empty()));
@@ -10736,10 +11629,18 @@ Second duplicate body\n";
         assert!(gui.workbench.config.allow_network_images);
         gui.execute_palette_command(PaletteCommandId::ToggleNetworkImages);
         assert!(!gui.workbench.config.allow_network_images);
-        assert!(!AppConfig::load_from_file(&config_path).unwrap().allow_network_images);
+        assert!(
+            !AppConfig::load_from_file(&config_path)
+                .unwrap()
+                .allow_network_images
+        );
         gui.execute_palette_command(PaletteCommandId::ToggleNetworkImages);
         assert!(gui.workbench.config.allow_network_images);
-        assert!(AppConfig::load_from_file(&config_path).unwrap().allow_network_images);
+        assert!(
+            AppConfig::load_from_file(&config_path)
+                .unwrap()
+                .allow_network_images
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -10793,10 +11694,11 @@ Second duplicate body\n";
         gui.execute_palette_command(PaletteCommandId::ManageRecoveryBackups);
         assert_eq!(gui.inspect_modal, Some(InspectModalKind::RecoveryBackups));
         let _ = gui.build_frame();
-        assert!(gui
-            .ui_hit_zones
-            .iter()
-            .any(|z| matches!(z.action, UiAction::DeleteSelectedRecoveryBackup)));
+        assert!(
+            gui.ui_hit_zones
+                .iter()
+                .any(|z| matches!(z.action, UiAction::DeleteSelectedRecoveryBackup))
+        );
 
         // Select the mixed-EOL backup (may be at index 0 or 1 depending on sort order)
         let mixed_slot = gui
@@ -10814,9 +11716,15 @@ Second duplicate body\n";
         let restored_tab = gui.workbench.active_tab().unwrap();
         assert!(restored_tab.session.path.is_none());
         assert_eq!(restored_tab.session.state, DocState::Dirty);
-        assert_eq!(restored_tab.session.format.dominant_line_ending, LineEnding::CrLf);
+        assert_eq!(
+            restored_tab.session.format.dominant_line_ending,
+            LineEnding::CrLf
+        );
         assert_eq!(restored_tab.session.buffer.to_string(), "A\r\nB\nC\r\n");
-        assert_eq!(fs::read_to_string(&doc_path).unwrap(), "local conflict edits v2\n");
+        assert_eq!(
+            fs::read_to_string(&doc_path).unwrap(),
+            "local conflict edits v2\n"
+        );
 
         // Re-open modal: delete first backup via plain `Delete` (no modifier), then second via `Cmd/Ctrl + Backspace`
         gui.execute_palette_command(PaletteCommandId::ManageRecoveryBackups);
@@ -10824,10 +11732,11 @@ Second duplicate body\n";
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Delete), None, ModifiersState::empty()));
         assert_eq!(gui.inspect_recovery_backups.len(), 1);
         assert_eq!(gui.workbench.list_history_backups().len(), 1);
-        assert!(gui
-            .status_notice
-            .as_ref()
-            .is_some_and(|(m, _)| m.contains("Deleted recovery backup")));
+        assert!(
+            gui.status_notice
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("Deleted recovery backup"))
+        );
 
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Backspace), None, p_mod));
         assert!(gui.inspect_recovery_backups.is_empty());
@@ -10861,7 +11770,11 @@ Second duplicate body\n";
         assert!(!gui_a.workbench.config.sidebar_visible);
         assert!(gui_a.execute_ui_action(UiAction::OpenRecentFile(folder_a.clone())));
         assert!(gui_a.workbench.config.sidebar_visible);
-        assert!(AppConfig::load_from_file(&config_path).unwrap().sidebar_visible);
+        assert!(
+            AppConfig::load_from_file(&config_path)
+                .unwrap()
+                .sidebar_visible
+        );
 
         // Instance B starts with same persisted files, changes theme + zoom and opens b.md
         let mut wb_b = AppWorkbench::new(AppConfig::default(), None);
@@ -10881,9 +11794,18 @@ Second duplicate body\n";
         let recent_after_a_exit =
             vellmark_core::RecentFilesList::load_from_file(&recent_path, 10).unwrap();
         assert_eq!(recent_after_a_exit.entries.len(), 3);
-        assert!(paths_share_underlying_file(&recent_after_a_exit.entries[0], &file_b));
-        assert!(paths_share_underlying_file(&recent_after_a_exit.entries[1], &folder_a));
-        assert!(paths_share_underlying_file(&recent_after_a_exit.entries[2], &file_a));
+        assert!(paths_share_underlying_file(
+            &recent_after_a_exit.entries[0],
+            &file_b
+        ));
+        assert!(paths_share_underlying_file(
+            &recent_after_a_exit.entries[1],
+            &folder_a
+        ));
+        assert!(paths_share_underlying_file(
+            &recent_after_a_exit.entries[2],
+            &file_a
+        ));
 
         // Instance C (started before B opened b.md) opens c.md: must merge with disk rather than wiping b.md
         let mut wb_c = AppWorkbench::new(AppConfig::default(), None);
@@ -10892,10 +11814,22 @@ Second duplicate body\n";
         let recent_after_c_open =
             vellmark_core::RecentFilesList::load_from_file(&recent_path, 10).unwrap();
         assert_eq!(recent_after_c_open.entries.len(), 4);
-        assert!(paths_share_underlying_file(&recent_after_c_open.entries[0], &file_c));
-        assert!(paths_share_underlying_file(&recent_after_c_open.entries[1], &file_b));
-        assert!(paths_share_underlying_file(&recent_after_c_open.entries[2], &folder_a));
-        assert!(paths_share_underlying_file(&recent_after_c_open.entries[3], &file_a));
+        assert!(paths_share_underlying_file(
+            &recent_after_c_open.entries[0],
+            &file_c
+        ));
+        assert!(paths_share_underlying_file(
+            &recent_after_c_open.entries[1],
+            &file_b
+        ));
+        assert!(paths_share_underlying_file(
+            &recent_after_c_open.entries[2],
+            &folder_a
+        ));
+        assert!(paths_share_underlying_file(
+            &recent_after_c_open.entries[3],
+            &file_a
+        ));
 
         // Issue 1 repro: Instance D (started earlier with Light theme) modifies ONLY zoom & focus mode
         // AFTER Instance B saved Dark theme — D's save must merge fields and preserve B's Dark theme!
@@ -10944,10 +11878,11 @@ Second duplicate body\n";
         // First close attempt warns instead of silently losing settings.
         assert!(!gui.handle_close_requested());
         assert!(gui.close_confirm_armed);
-        assert!(gui
-            .status_notice
-            .as_ref()
-            .is_some_and(|(m, _)| m.contains("locked")));
+        assert!(
+            gui.status_notice
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("locked"))
+        );
 
         // Peer releases the lock before second close -> retry succeeds and persists before exit.
         let _ = cfg_lock.unlock();
@@ -10976,10 +11911,11 @@ Second duplicate body\n";
         let mut gui2 = GuiController::new(wb2);
         gui2.execute_palette_command(PaletteCommandId::ZoomIn);
         assert!(!gui2.handle_close_requested());
-        assert!(gui2
-            .status_notice
-            .as_ref()
-            .is_some_and(|(m, _)| m.contains("Unsaved changes") && m.contains("locked")));
+        assert!(
+            gui2.status_notice
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("Unsaved changes") && m.contains("locked"))
+        );
         assert!(gui2.handle_close_requested());
         let _ = cfg_lock2.unlock();
         drop(cfg_lock2);
