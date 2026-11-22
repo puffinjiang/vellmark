@@ -2948,44 +2948,32 @@ mod tests {
 
     #[test]
     fn test_open_folder_records_absolute_canonical_recent_path() {
-        let root = std::env::temp_dir().join(format!(
+        struct RemoveDirOnDrop(PathBuf);
+        impl Drop for RemoveDirOnDrop {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        // Keep the fixture relative to the test's working directory. Windows may put
+        // the system temp directory on a different drive.
+        let root = PathBuf::from(format!(
             "vellmark-wb-rel-folder-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
+        let _cleanup = RemoveDirOnDrop(root.clone());
         let notes = root.join("notes");
         let recent_path = root.join("recent-files.txt");
         fs::create_dir_all(&notes).unwrap();
         let canonical_notes = fs::canonicalize(&notes).unwrap();
 
-        // Build a thread-safe relative path from current_dir -> canonical_notes without mutating CWD
-        let cwd = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
-        let cwd_comps: Vec<_> = cwd.components().collect();
-        let target_comps: Vec<_> = canonical_notes.components().collect();
-        let common = cwd_comps
-            .iter()
-            .zip(target_comps.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-        let mut rel = PathBuf::new();
-        for _ in common..cwd_comps.len() {
-            rel.push("..");
-        }
-        for comp in &target_comps[common..] {
-            rel.push(comp.as_os_str());
-        }
-        assert!(
-            rel.is_relative(),
-            "expected relative path, got {}",
-            rel.display()
-        );
-        assert!(rel.is_dir());
-
         let mut wb = AppWorkbench::new(AppConfig::default(), None);
         wb.set_persistence_paths(None, Some(recent_path.clone()));
-        wb.open_folder(&rel).unwrap();
+        assert!(notes.is_relative());
+        wb.open_folder(&notes).unwrap();
 
         assert_eq!(wb.recent_files.entries.len(), 1);
         assert!(wb.recent_files.entries[0].is_absolute());
@@ -2993,8 +2981,6 @@ mod tests {
 
         let loaded = RecentFilesList::load_from_file(&recent_path, 10).unwrap();
         assert_eq!(loaded.entries, vec![canonical_notes]);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

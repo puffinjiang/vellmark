@@ -917,7 +917,7 @@ const PALETTE_COMMANDS: &[PaletteCommandEntry] = &[
     PaletteCommandEntry {
         id: PaletteCommandId::FindAndReplace,
         label: "Edit: Find and Replace",
-        shortcut: "Cmd+Opt+F / Ctrl+H",
+        shortcut: "Cmd+Option+F / Ctrl+H",
     },
     PaletteCommandEntry {
         id: PaletteCommandId::InsertTable,
@@ -927,7 +927,7 @@ const PALETTE_COMMANDS: &[PaletteCommandEntry] = &[
     PaletteCommandEntry {
         id: PaletteCommandId::InsertCodeBlock,
         label: "Insert / Edit: Code Block",
-        shortcut: "Cmd+Option+C",
+        shortcut: "Cmd+Option+C / Ctrl+Shift+K",
     },
     PaletteCommandEntry {
         id: PaletteCommandId::InsertLink,
@@ -4325,7 +4325,9 @@ impl GuiController {
             return true;
         }
 
-        // Code block / Table shortcuts (`Cmd+Option+C` / `Cmd+Option+T`)
+        // macOS-only Cmd+Option shortcuts (`Cmd+Option+C` / `Cmd+Option+T` / `Cmd+Option+F`).
+        // Unreachable on Linux/Windows because `primary` is `Ctrl` (so `primary && !ctrl` is false);
+        // non-macOS platforms use `Ctrl+Shift+K`, `Ctrl+T`, and `Ctrl+H` below.
         if primary && alt && !shift && !ctrl {
             if physical_key == Some(PhysicalKey::Code(KeyCode::KeyC))
                 || matches!(
@@ -10370,9 +10372,14 @@ Second duplicate body\n";
             .unwrap();
         let mut gui = GuiController::new(wb);
 
-        // Outside a code block: Cmd+Option+C inserts a fenced code block and places caret inside it.
-        let code_mod = test_primary_modifier() | ModifiersState::ALT;
-        assert!(gui.handle_key_input(&Key::Character("ç".into()), None, code_mod));
+        let (insert_key, picker_key, code_mod) = if cfg!(target_os = "macos") {
+            ("ç", "c", ModifiersState::SUPER | ModifiersState::ALT)
+        } else {
+            ("K", "k", ModifiersState::CONTROL | ModifiersState::SHIFT)
+        };
+
+        // Outside a code block, the platform shortcut inserts a fence and places the caret inside.
+        assert!(gui.handle_key_input(&Key::Character(insert_key.into()), None, code_mod));
         let md = gui
             .workbench
             .active_tab()
@@ -10386,8 +10393,8 @@ Second duplicate body\n";
         );
         assert!(!gui.code_lang_open);
 
-        // Inside the newly created code block: Cmd+Option+C opens the Code Language Picker modal.
-        assert!(gui.handle_key_input(&Key::Character("c".into()), None, code_mod));
+        // Inside the new code block, the same shortcut opens the language picker.
+        assert!(gui.handle_key_input(&Key::Character(picker_key.into()), None, code_mod));
         assert!(gui.code_lang_open);
         assert!(gui.handle_key_input(
             &Key::Character("r".into()),
@@ -11102,18 +11109,22 @@ Second duplicate body\n";
         gui.handle_ime_event(&Ime::Commit("!".to_string()));
         assert_eq!(gui.replace_text, "baz!");
 
-        // Escape closes Find & Replace cleanly; Cmd/Ctrl+Option+F re-opens it
+        // Escape closes Find & Replace; the platform shortcut reopens it.
         assert!(gui.handle_key_input(&Key::Named(NamedKey::Escape), None, ModifiersState::empty()));
         assert!(!gui.find_open);
         assert!(!gui.find_focused);
         assert!(!gui.replace_focused);
 
-        assert!(gui.handle_key_input_with_physical(
-            &Key::Character("ƒ".into()),
-            Some(PhysicalKey::Code(KeyCode::KeyF)),
-            None,
-            p_mod | ModifiersState::ALT,
-        ));
+        if cfg!(target_os = "macos") {
+            assert!(gui.handle_key_input_with_physical(
+                &Key::Character("ƒ".into()),
+                Some(PhysicalKey::Code(KeyCode::KeyF)),
+                None,
+                p_mod | ModifiersState::ALT,
+            ));
+        } else {
+            assert!(gui.handle_key_input(&Key::Character("h".into()), None, p_mod));
+        }
         assert!(gui.find_open);
         assert!(gui.replace_open);
     }
