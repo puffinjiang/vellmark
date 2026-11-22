@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -169,7 +170,7 @@ fn parse_dialog_stdout_path(stdout: &[u8]) -> Option<PathBuf> {
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "macos", test))]
 fn existing_default_dialog_dir(current_path: Option<&Path>) -> Option<&Path> {
     existing_dir_or_ancestor(current_path, true)
 }
