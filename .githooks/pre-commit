@@ -1,0 +1,67 @@
+#!/bin/sh
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+
+is_rust_related() {
+    case "$1" in
+        *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|themes/*.css|rust-toolchain|rust-toolchain.toml|rustfmt.toml|.rustfmt.toml|clippy.toml|.clippy.toml|.cargo/*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Treat renames as a deletion and an addition so both names are checked.
+staged_files="$(git -c core.quotepath=false diff --cached --name-only --no-renames)"
+if [ -z "$staged_files" ]; then
+    exit 0
+fi
+
+run_rust_checks=0
+while IFS= read -r path; do
+    if is_rust_related "$path"; then
+        run_rust_checks=1
+        break
+    fi
+done <<EOF
+$staged_files
+EOF
+
+if [ "$run_rust_checks" -eq 0 ]; then
+    printf '%s\n' 'Skipping Rust checks (no Rust/Cargo/theme files staged).'
+    exit 0
+fi
+
+if ! command -v cargo >/dev/null 2>&1 && [ -n "${HOME:-}" ] && [ -d "$HOME/.cargo/bin" ]; then
+    PATH="$HOME/.cargo/bin:$PATH"
+    export PATH
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+    printf '%s\n' 'pre-commit: cargo not found in PATH (install Rust or ensure ~/.cargo/bin is available).' >&2
+    exit 1
+fi
+
+unstaged_files="$(git -c core.quotepath=false diff --name-only --no-renames)"
+if [ -n "$unstaged_files" ]; then
+    while IFS= read -r path; do
+        if is_rust_related "$path"; then
+            printf '%s\n' 'Note: unstaged Rust/Cargo/theme changes exist; pre-commit checks the working tree.' >&2
+            break
+        fi
+    done <<EOF
+$unstaged_files
+EOF
+fi
+
+printf '%s\n' 'Checking Rust formatting...'
+cargo fmt --all -- --check
+
+printf '%s\n' 'Running Clippy...'
+cargo clippy --locked --workspace --all-targets -- -D warnings
+
+printf '%s\n' 'Running workspace tests...'
+cargo test --locked --workspace

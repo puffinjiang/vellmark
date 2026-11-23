@@ -1,0 +1,2 @@
+# Keep POSIX Git hooks with LF line endings even on Windows (core.autocrlf=true)
+.githooks/* text eol=lf

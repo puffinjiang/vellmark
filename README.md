@@ -43,6 +43,17 @@ cargo test --workspace
 cargo run -p vellmark-cli -- --help
 ```
 
+## 提交前检查
+
+首次克隆后，在仓库根目录启用纳入版本控制的 Git 钩子。
+
+```bash
+rustup component add rustfmt clippy
+git config --local core.hooksPath .githooks
+```
+
+每次提交前，当暂存区包含 Rust、Cargo 配置或内置主题 CSS 文件时，钩子会检查当前工作树的 Rust 格式、运行 Clippy（`--locked`）和工作区测试；纯文档或配置提交会自动跳过 Rust 检查。任一检查失败都会中止提交：格式检查失败时请运行 `cargo fmt --all` 并重新暂存，修改 `Cargo.toml` 依赖后请先运行 `cargo check` 更新并暂存 `Cargo.lock`。
+
 ## 开源协议
 
 本项目基于 [GPL-3.0](LICENSE) 协议开源。
