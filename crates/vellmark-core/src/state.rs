@@ -4558,9 +4558,25 @@ mod tests {
         let docs_dir = root.join("docs");
         fs::create_dir_all(&docs_dir).unwrap();
 
-        let note_a = docs_dir.join("a \"draft\"\\note.md");
+        // Windows forbids `"` in filesystem names; keep literal `"` + `\` on Unix and verify
+        // JSON escaping of both characters directly below on all platforms.
+        let note_a = if cfg!(windows) {
+            docs_dir.join("a 'draft'").join("note.md")
+        } else {
+            docs_dir.join("a \"draft\"\\note.md")
+        };
         fs::create_dir_all(note_a.parent().unwrap()).unwrap();
         fs::write(&note_a, "Original A").unwrap();
+
+        let synthetic_meta = RecoveryMeta {
+            source_path: Some(PathBuf::from("a \"draft\"\\note.md")),
+            draft_id: None,
+            updated_unix_secs: 42,
+        };
+        let meta_roundtrip =
+            deserialize_recovery_meta_json(&serialize_recovery_meta_json(&synthetic_meta))
+                .expect("recovery.meta JSON must round-trip quotes and backslashes");
+        assert_eq!(meta_roundtrip.source_path, synthetic_meta.source_path);
 
         let note_clean = docs_dir.join("clean.md");
         fs::write(&note_clean, "Clean").unwrap();
